@@ -1,6 +1,5 @@
 import { ArrowRightIcon, LogoIcon } from "@/components/icons";
 import { ButtonLink } from "@/components/button";
-import { InstallCopy } from "@/components/install-copy";
 import { pageMetadata } from "@/lib/page-metadata";
 
 export const metadata = pageMetadata("");
@@ -101,7 +100,6 @@ export default function HomePage() {
               Get started <ArrowRightIcon />
             </ButtonLink>
           </div>
-          <InstallCopy />
         </section>
 
         <section className="relative z-10 mx-auto grid w-[min(100%-3rem,var(--container-content))] grid-cols-1 gap-px overflow-hidden rounded-lg border border-border bg-border md:grid-cols-3">

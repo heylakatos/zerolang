@@ -64,7 +64,7 @@ export default async function DocsPage({ params }) {
   const groups = groupBySection(docs);
 
   return (
-    <div className="grid min-h-screen md:grid-cols-[15rem_minmax(0,1fr)] lg:grid-cols-[15rem_minmax(0,1fr)_14rem]">
+    <div className="grid min-h-screen grid-cols-1 md:grid-cols-[15rem_minmax(0,1fr)] lg:grid-cols-[15rem_minmax(0,1fr)_14rem]">
       <DocsSidebarShell groups={groups} activeSlug={doc.slug} currentTitle={doc.title} />
 
       <main className="mx-auto w-full max-w-[54rem] px-4 pb-[50vh] pt-6 md:px-12">
