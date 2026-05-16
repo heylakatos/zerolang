@@ -77,6 +77,18 @@ function hasAnsiControlBytes(text) {
   return /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/.test(text);
 }
 
+function machoHasLoadCommand(bytes, command) {
+  const ncmds = bytes.readUInt32LE(16);
+  let offset = 32;
+  for (let i = 0; i < ncmds; i++) {
+    const cmd = bytes.readUInt32LE(offset);
+    const cmdsize = bytes.readUInt32LE(offset + 4);
+    if (cmd === command) return true;
+    offset += cmdsize;
+  }
+  return false;
+}
+
 function removeInlineTests(path) {
   if (!existsSync(path)) return;
   const source = readFileSync(path, "utf8");
@@ -588,6 +600,7 @@ assertReleaseTargetContract(directMachOExeReport, {
 repeatBuildHash(["build", "--json", "--emit", "exe", "--backend", "zero-macho64", "--target", "darwin-arm64", "examples/direct-exe-return.0", "--out", directMachOExePath], directMachOExePath, `${directMachOExePath}.repeat`);
 assert.equal(directMachOExeBytes.readUInt32LE(0), 0xfeedfacf);
 assert.equal(directMachOExeBytes.readUInt32LE(12), 2);
+assert(machoHasLoadCommand(directMachOExeBytes, 0x1b)); // LC_UUID
 assert(directMachOExeBytes.includes(Buffer.from("/usr/lib/dyld")));
 assert(directMachOExeBytes.includes(Buffer.from("zero-direct")));
 const directCoffExePath = join(outDir, "direct-coff-exe-return");
