@@ -295,6 +295,7 @@ for (const fixture of [
   "conformance/native/pass/borrow-primitives.0",
   "conformance/native/pass/borrow-return-param-ref.0",
   "conformance/native/pass/borrow-assignment-same-origin.0",
+  "conformance/native/pass/borrow-shadowed-root-reassignment.0",
   "conformance/native/pass/allocator-primitives.0",
   "conformance/native/pass/std-mem-arena.0",
   "conformance/native/pass/std-mem-collections.0",
@@ -2586,6 +2587,8 @@ for (const [fixture, code] of [
   ["borrow-assignment-shorter-lived-root.0", /BOR002/],
   ["borrow-call-result-multiple-origins.0", /BOR001/],
   ["borrow-self-assignment-origin-tracking.0", /BOR001/],
+  ["generic-reference-borrow-origin.0", /BOR001/],
+  ["generic-reference-return-escape.0", /BOR002/],
   ["world-stream-used-as-value.0", /TYP001/],
 ]) {
   const result = await execFileAsync(zero, ["check", `conformance/native/fail/${fixture}`]).catch((error) => error);

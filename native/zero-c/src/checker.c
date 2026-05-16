@@ -8,15 +8,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct Scope Scope;
+
 typedef struct {
   char **roots;
+  Scope **root_scopes;
   bool *mutable_borrow;
   bool *local_storage;
   size_t len;
   size_t cap;
 } BorrowOrigins;
 
-typedef struct Scope {
+struct Scope {
   char **names;
   char **types;
   bool *mutable;
@@ -27,8 +30,8 @@ typedef struct Scope {
   size_t *mut_borrows;
   size_t len;
   size_t cap;
-  struct Scope *parent;
-} Scope;
+  Scope *parent;
+};
 
 typedef enum {
   META_VALUE_NUMBER,
@@ -68,10 +71,10 @@ static const ZTargetInfo *current_check_target = NULL;
 static MetaCacheEntry *meta_cache = NULL;
 static ZMetaCacheStats meta_stats = {0};
 
-static bool borrow_origins_add(BorrowOrigins *origins, const char *root, bool mut_borrow, bool local_storage) {
+static bool borrow_origins_add(BorrowOrigins *origins, const char *root, Scope *root_scope, bool mut_borrow, bool local_storage) {
   if (!origins || !root || !root[0]) return false;
   for (size_t i = 0; i < origins->len; i++) {
-    if (strcmp(origins->roots[i], root) == 0) {
+    if (strcmp(origins->roots[i], root) == 0 && origins->root_scopes[i] == root_scope) {
       origins->mutable_borrow[i] = origins->mutable_borrow[i] || mut_borrow;
       origins->local_storage[i] = origins->local_storage[i] || local_storage;
       return true;
@@ -80,10 +83,12 @@ static bool borrow_origins_add(BorrowOrigins *origins, const char *root, bool mu
   if (origins->len + 1 > origins->cap) {
     origins->cap = origins->cap == 0 ? 4 : origins->cap * 2;
     origins->roots = realloc(origins->roots, origins->cap * sizeof(char *));
+    origins->root_scopes = realloc(origins->root_scopes, origins->cap * sizeof(Scope *));
     origins->mutable_borrow = realloc(origins->mutable_borrow, origins->cap * sizeof(bool));
     origins->local_storage = realloc(origins->local_storage, origins->cap * sizeof(bool));
   }
   origins->roots[origins->len] = z_strdup(root);
+  origins->root_scopes[origins->len] = root_scope;
   origins->mutable_borrow[origins->len] = mut_borrow;
   origins->local_storage[origins->len] = local_storage;
   origins->len++;
@@ -94,7 +99,7 @@ static bool borrow_origins_add_all_as(BorrowOrigins *out, const BorrowOrigins *s
   bool added = false;
   if (!out || !source) return false;
   for (size_t i = 0; i < source->len; i++) {
-    if (borrow_origins_add(out, source->roots[i], mut_borrow, source->local_storage[i])) added = true;
+    if (borrow_origins_add(out, source->roots[i], source->root_scopes[i], mut_borrow, source->local_storage[i])) added = true;
   }
   return added;
 }
@@ -103,9 +108,11 @@ static void borrow_origins_free(BorrowOrigins *origins) {
   if (!origins) return;
   for (size_t i = 0; i < origins->len; i++) free(origins->roots[i]);
   free(origins->roots);
+  free(origins->root_scopes);
   free(origins->mutable_borrow);
   free(origins->local_storage);
   origins->roots = NULL;
+  origins->root_scopes = NULL;
   origins->mutable_borrow = NULL;
   origins->local_storage = NULL;
   origins->len = 0;
@@ -236,28 +243,39 @@ static bool scope_borrow_counts(Scope *scope, const char *name, size_t *shared, 
   return false;
 }
 
-static bool scope_adjust_borrow_count(Scope *scope, const char *name, bool mut_borrow, int delta) {
-  for (Scope *cursor = scope; cursor; cursor = cursor->parent) {
-    for (size_t i = 0; i < cursor->len; i++) {
-      if (strcmp(cursor->names[i], name) == 0) {
-        size_t *count = mut_borrow ? &cursor->mut_borrows[i] : &cursor->shared_borrows[i];
-        if (delta < 0) {
-          size_t amount = (size_t)(-delta);
-          *count = amount > *count ? 0 : *count - amount;
-        } else {
-          *count += (size_t)delta;
-        }
-        return true;
+static bool scope_adjust_borrow_count_in_scope(Scope *binding_scope, const char *name, bool mut_borrow, int delta) {
+  if (!binding_scope || !name) return false;
+  for (size_t i = 0; i < binding_scope->len; i++) {
+    if (strcmp(binding_scope->names[i], name) == 0) {
+      size_t *count = mut_borrow ? &binding_scope->mut_borrows[i] : &binding_scope->shared_borrows[i];
+      if (delta < 0) {
+        size_t amount = (size_t)(-delta);
+        *count = amount > *count ? 0 : *count - amount;
+      } else {
+        *count += (size_t)delta;
       }
+      return true;
     }
   }
   return false;
 }
 
+static bool scope_adjust_borrow_count(Scope *scope, const char *name, bool mut_borrow, int delta) {
+  for (Scope *cursor = scope; cursor; cursor = cursor->parent) {
+    if (scope_adjust_borrow_count_in_scope(cursor, name, mut_borrow, delta)) return true;
+  }
+  return false;
+}
+
+static bool scope_adjust_origin_borrow_count(Scope *lookup_scope, const char *name, Scope *root_scope, bool mut_borrow, int delta) {
+  if (root_scope && scope_adjust_borrow_count_in_scope(root_scope, name, mut_borrow, delta)) return true;
+  return scope_adjust_borrow_count(lookup_scope, name, mut_borrow, delta);
+}
+
 static void scope_clear_borrow_origins_at(Scope *lookup_scope, BorrowOrigins *origins) {
   if (!lookup_scope || !origins) return;
   for (size_t i = 0; i < origins->len; i++) {
-    scope_adjust_borrow_count(lookup_scope, origins->roots[i], origins->mutable_borrow[i], -1);
+    scope_adjust_origin_borrow_count(lookup_scope, origins->roots[i], origins->root_scopes[i], origins->mutable_borrow[i], -1);
   }
   borrow_origins_free(origins);
 }
@@ -269,8 +287,8 @@ static void scope_set_borrow_origins(Scope *scope, const char *name, const Borro
       if (strcmp(cursor->names[i], name) == 0) {
         scope_clear_borrow_origins_at(scope, &cursor->borrow_origins[i]);
         for (size_t origin_index = 0; origin_index < origins->len; origin_index++) {
-          borrow_origins_add(&cursor->borrow_origins[i], origins->roots[origin_index], origins->mutable_borrow[origin_index], origins->local_storage[origin_index]);
-          scope_adjust_borrow_count(scope, origins->roots[origin_index], origins->mutable_borrow[origin_index], 1);
+          borrow_origins_add(&cursor->borrow_origins[i], origins->roots[origin_index], origins->root_scopes[origin_index], origins->mutable_borrow[origin_index], origins->local_storage[origin_index]);
+          scope_adjust_origin_borrow_count(scope, origins->roots[origin_index], origins->root_scopes[origin_index], origins->mutable_borrow[origin_index], 1);
         }
         return;
       }
@@ -296,7 +314,7 @@ static bool scope_copy_borrow_origins(Scope *scope, const char *name, BorrowOrig
     for (size_t i = 0; i < cursor->len; i++) {
       if (strcmp(cursor->names[i], name) == 0) {
         for (size_t origin_index = 0; origin_index < cursor->borrow_origins[i].len; origin_index++) {
-          if (borrow_origins_add(out, cursor->borrow_origins[i].roots[origin_index], cursor->borrow_origins[i].mutable_borrow[origin_index], cursor->borrow_origins[i].local_storage[origin_index])) added = true;
+          if (borrow_origins_add(out, cursor->borrow_origins[i].roots[origin_index], cursor->borrow_origins[i].root_scopes[origin_index], cursor->borrow_origins[i].mutable_borrow[origin_index], cursor->borrow_origins[i].local_storage[origin_index])) added = true;
         }
         return added;
       }
@@ -307,10 +325,9 @@ static bool scope_copy_borrow_origins(Scope *scope, const char *name, BorrowOrig
 
 static void scope_free(Scope *scope) {
   for (size_t i = 0; i < scope->len; i++) {
-    if (scope->parent) {
-      for (size_t origin_index = 0; origin_index < scope->borrow_origins[i].len; origin_index++) {
-        scope_adjust_borrow_count(scope->parent, scope->borrow_origins[i].roots[origin_index], scope->borrow_origins[i].mutable_borrow[origin_index], -1);
-      }
+    Scope *lookup_scope = scope->parent ? scope->parent : scope;
+    for (size_t origin_index = 0; origin_index < scope->borrow_origins[i].len; origin_index++) {
+      scope_adjust_origin_borrow_count(lookup_scope, scope->borrow_origins[i].roots[origin_index], scope->borrow_origins[i].root_scopes[origin_index], scope->borrow_origins[i].mutable_borrow[origin_index], -1);
     }
   }
   for (size_t i = 0; i < scope->len; i++) {
@@ -927,7 +944,7 @@ static bool expr_borrow_origins(const Expr *expr, Scope *scope, BorrowOrigins *o
   if (expr->kind == EXPR_BORROW) {
     char root[128];
     if (!expr_root_ident(expr->left, root, sizeof(root))) return false;
-    return borrow_origins_add(origins, root, expr->mutable_borrow, borrow_expr_origin_is_local_storage(expr->left, scope, root));
+    return borrow_origins_add(origins, root, scope_binding_scope(scope, root), expr->mutable_borrow, borrow_expr_origin_is_local_storage(expr->left, scope, root));
   }
   if (expr->kind == EXPR_IDENT) {
     return scope_copy_borrow_origins(scope, expr->text, origins);
@@ -4259,6 +4276,58 @@ static bool check_lvalue_target(const Program *program, const Expr *target, Scop
   }
 }
 
+static bool generic_call_bindings_from_checked_call(const Program *program, const Function *callee, const Expr *call, Scope *scope, const char *return_type, GenericBinding **out_bindings, size_t *out_len) {
+  if (out_bindings) *out_bindings = NULL;
+  if (out_len) *out_len = 0;
+  if (!callee || !function_is_generic(callee) || !call || !out_bindings || !out_len) return false;
+
+  size_t binding_len = callee->type_params.len;
+  GenericBinding *bindings = calloc(binding_len, sizeof(GenericBinding));
+  for (size_t i = 0; i < binding_len; i++) bindings[i].name = callee->type_params.items[i].name;
+
+  const TypeArgVec *type_args = call_type_args(call);
+  if (type_args && type_args->len > 0) {
+    if (type_args->len != binding_len) {
+      free(bindings);
+      return false;
+    }
+    for (size_t i = 0; i < binding_len; i++) bindings[i].type = z_strdup(type_args->items[i].type);
+    *out_bindings = bindings;
+    *out_len = binding_len;
+    return true;
+  }
+
+  bool ok = true;
+  if (return_type && callee->return_type) {
+    ok = infer_generic_type_from_pattern(callee, callee->return_type, return_type, bindings, binding_len);
+  }
+  for (size_t i = 0; ok && i < callee->params.len && i < call->args.len; i++) {
+    ok = infer_generic_type_from_pattern(callee, callee->params.items[i].type, expr_type(program, call->args.items[i], scope), bindings, binding_len);
+  }
+  if (!ok) {
+    generic_bindings_free(bindings, binding_len);
+    free(bindings);
+    return false;
+  }
+  *out_bindings = bindings;
+  *out_len = binding_len;
+  return true;
+}
+
+static char *checked_call_param_type(const Program *program, const Function *callee, const Expr *call, Scope *scope, const char *return_type, size_t param_index) {
+  if (!callee || param_index >= callee->params.len) return z_strdup("Unknown");
+  const char *param_type = callee->params.items[param_index].type;
+  GenericBinding *bindings = NULL;
+  size_t binding_len = 0;
+  if (generic_call_bindings_from_checked_call(program, callee, call, scope, return_type, &bindings, &binding_len)) {
+    char *substituted = type_substitute_generic(param_type, bindings, binding_len);
+    generic_bindings_free(bindings, binding_len);
+    free(bindings);
+    return substituted;
+  }
+  return z_strdup(param_type ? param_type : "Unknown");
+}
+
 static bool call_result_borrow_origins(const Program *program, const Expr *expr, Scope *scope, BorrowOrigins *origins) {
   if (!program || !expr || expr->kind != EXPR_CALL || !expr->left || !origins) return false;
   const char *return_type = expr_type(program, expr, scope);
@@ -4292,22 +4361,25 @@ static bool call_result_borrow_origins(const Program *program, const Expr *expr,
 
   bool added = false;
   if (receiver && callee->params.len > 0) {
-    const char *param_type = callee->params.items[0].type;
+    char *param_type = checked_call_param_type(program, callee, expr, scope, return_type, 0);
     if (type_is_named_generic(param_type, "ref") || type_is_named_generic(param_type, "mutref")) {
       if (expr_borrow_origins_as(receiver, scope, origins, return_mut)) {
         added = true;
       } else {
         char root[128];
         if (expr_root_ident(receiver, root, sizeof(root)) && scope_has(scope, root)) {
-          if (borrow_origins_add(origins, root, return_mut, reference_source_origin_is_local_storage(scope, root))) added = true;
+          if (borrow_origins_add(origins, root, scope_binding_scope(scope, root), return_mut, reference_source_origin_is_local_storage(scope, root))) added = true;
         }
       }
     }
+    free(param_type);
   }
 
   for (size_t i = 0; i < expr->args.len && i + param_offset < callee->params.len; i++) {
-    const char *param_type = callee->params.items[i + param_offset].type;
-    if (!type_is_named_generic(param_type, "ref") && !type_is_named_generic(param_type, "mutref")) continue;
+    char *param_type = checked_call_param_type(program, callee, expr, scope, return_type, i + param_offset);
+    bool reference_param = type_is_named_generic(param_type, "ref") || type_is_named_generic(param_type, "mutref");
+    free(param_type);
+    if (!reference_param) continue;
     if (expr_borrow_origins_as(expr->args.items[i], scope, origins, return_mut)) added = true;
   }
   return added;
@@ -4343,7 +4415,7 @@ static bool update_borrow_assignment(const Program *program, const Expr *target,
   if (expr_reference_origins(program, value, scope, &origins)) {
     Scope *target_scope = scope_binding_scope(scope, target->text);
     for (size_t i = 0; i < origins.len; i++) {
-      Scope *root_scope = scope_binding_scope(scope, origins.roots[i]);
+      Scope *root_scope = origins.root_scopes[i] ? origins.root_scopes[i] : scope_binding_scope(scope, origins.roots[i]);
       if (target_scope && root_scope && !scope_is_ancestor_or_self(root_scope, target_scope)) {
         char actual[256];
         snprintf(actual, sizeof(actual), "reference to shorter-lived local '%s'", origins.roots[i]);
