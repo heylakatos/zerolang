@@ -171,6 +171,9 @@ describe("docs registry", () => {
     }
     const homePage = await readFile(join(docsSiteRoot, "app/page.jsx"), "utf8");
     assert.match(homePage, /Check, build, test, format, inspect, and document/);
+    assert.match(homePage, /InstallCopy/);
+    const installCopy = await readFile(join(docsSiteRoot, "components/install-copy.jsx"), "utf8");
+    assert.match(installCopy, /curl -fsSL https:\/\/zerolang\.ai\/install\.sh \| bash/);
     const packageJson = JSON.parse(await readFile(resolve(docsSiteRoot, "..", "package.json"), "utf8"));
     assert.match(packageJson.scripts["docs:build"], /docs-site/);
     assert.match(packageJson.scripts["docs:compiler"], /playground-wasm-smoke/);
