@@ -1738,6 +1738,32 @@ node -e 'const fs=require("fs"); const report=JSON.parse(fs.readFileSync(".zero/
 test ! -f .zero/native-test/direct-hello-darwin.o.c
 grep -q '"path":"direct-macho64-object"' .zero/native-test/direct-hello-darwin.json
 grep -q '"generatedCBytes": 0' .zero/native-test/direct-hello-darwin.json
+rm -f .zero/native-test/direct-std-args-darwin.o .zero/native-test/direct-std-args-darwin.o.c .zero/native-test/direct-std-args-darwin-linked .zero/native-test/direct-std-args-darwin-runtime.c .zero/native-test/direct-std-args-darwin-link.0 .zero/native-test/direct-std-args-darwin-link.o .zero/native-test/direct-std-args-darwin-link.json
+bin/zero build --json --emit obj --target darwin-arm64 conformance/native/pass/std-args.0 --out .zero/native-test/direct-std-args-darwin.o > .zero/native-test/direct-std-args-darwin.json
+node -e 'const fs=require("fs"); const b=fs.readFileSync(".zero/native-test/direct-std-args-darwin.o"); const save=Buffer.from([0xf4,0x57,0xbf,0xa9]); const seed=Buffer.from([0xf4,0x03,0x00,0xaa,0xf5,0x03,0x01,0xaa]); const restore=Buffer.from([0xf4,0x57,0xc1,0xa8]); if (b.readUInt32LE(0)!==0xfeedfacf || b.readUInt32LE(4)!==0x0100000c || !b.includes(save) || !b.includes(seed) || !b.includes(restore)) process.exit(1);'
+test ! -f .zero/native-test/direct-std-args-darwin.o.c
+grep -q '"path":"direct-macho64-object"' .zero/native-test/direct-std-args-darwin.json
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] && command -v cc >/dev/null 2>&1; then
+  cat > .zero/native-test/direct-std-args-darwin-link.0 <<'SOURCE'
+pub fun main(world: World) -> Void raises {
+    let first = std.args.get(1)
+    if first.has {
+        check world.out.write(first.value)
+    }
+}
+SOURCE
+  cat > .zero/native-test/direct-std-args-darwin-runtime.c <<'SOURCE'
+#include <unistd.h>
+int zero_world_write(int fd, const char *buf, unsigned len) {
+  ssize_t written = write(fd, buf, len);
+  return written < 0 || (unsigned long long)written != len;
+}
+SOURCE
+  bin/zero build --json --emit obj --target darwin-arm64 .zero/native-test/direct-std-args-darwin-link.0 --out .zero/native-test/direct-std-args-darwin-link.o > .zero/native-test/direct-std-args-darwin-link.json
+  cc .zero/native-test/direct-std-args-darwin-link.o .zero/native-test/direct-std-args-darwin-runtime.c -o .zero/native-test/direct-std-args-darwin-linked
+  direct_std_args_darwin_output="$(.zero/native-test/direct-std-args-darwin-linked agent-arg extra)"
+  test "$direct_std_args_darwin_output" = "agent-arg"
+fi
 rm -f .zero/native-test/direct-call-add-win.obj .zero/native-test/direct-call-add-win.obj.c
 bin/zero build --json --emit obj --target win32-x64.exe examples/direct-call-add.0 --out .zero/native-test/direct-call-add-win.obj > .zero/native-test/direct-call-add-win.json
 node -e 'const fs=require("fs"); const b=fs.readFileSync(".zero/native-test/direct-call-add-win.obj"); const reloc=b.readUInt32LE(20+24); const nreloc=b.readUInt16LE(20+32); if (b.readUInt16LE(0)!==0x8664 || b.readUInt16LE(2)!==1 || b.readUInt32LE(8)===0 || reloc===0 || nreloc<1 || b.readUInt16LE(reloc+8)!==4 || !b.includes(Buffer.from([0xe8])) || !b.includes(Buffer.concat([Buffer.from("main"),Buffer.from([0])])) || !b.includes(Buffer.concat([Buffer.from("add"),Buffer.from([0])]))) process.exit(1);'

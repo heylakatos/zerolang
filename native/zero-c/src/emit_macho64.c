@@ -308,6 +308,7 @@ typedef struct {
   size_t world_write_patch_cap;
   unsigned rodata_base_offset;
   bool pie_relative_data;
+  bool seed_main_process_args;
 } MachOEmitContext;
 
 static size_t macho_align(size_t value, size_t alignment) {
@@ -944,13 +945,14 @@ static unsigned macho_frame_size(const IrFunction *fun) {
   return (unsigned)macho_align(fun ? (fun->frame_bytes ? fun->frame_bytes : fun->local_len * 8) : 0, 16);
 }
 
-static void macho_emit_epilogue(ZBuf *text, unsigned frame_size) {
+static void macho_emit_epilogue(ZBuf *text, unsigned frame_size, bool restore_process_args) {
   if (frame_size > 0) macho_emit_add_sp_imm(text, 0x910003ffu, frame_size); // add sp, sp, #frame_size
   append_u32le(text, 0xa8c17bfdu); // ldp x29, x30, [sp], #16
+  if (restore_process_args) append_u32le(text, 0xa8c157f4u); // ldp x20, x21, [sp], #16
   append_u32le(text, 0xd65f03c0u); // ret
 }
 
-static bool macho_emit_instrs(ZBuf *text, const IrFunction *fun, const IrInstr *instrs, size_t len, unsigned frame_size, MachOEmitContext *ctx, ZDiag *diag);
+static bool macho_emit_instrs(ZBuf *text, const IrFunction *fun, const IrInstr *instrs, size_t len, unsigned frame_size, bool restore_process_args, MachOEmitContext *ctx, ZDiag *diag);
 
 static bool macho_emit_world_write(ZBuf *text, const IrFunction *fun, const IrInstr *instr, unsigned frame_size, MachOEmitContext *ctx, ZDiag *diag) {
   if (!instr || !instr->value) return macho_diag_at(diag, "direct AArch64 Mach-O World write requires bytes", instr ? instr->line : 1, instr ? instr->column : 1, "missing byte view");
@@ -997,7 +999,7 @@ static bool macho_emit_args_get_to_local(ZBuf *text, const IrFunction *fun, cons
   return true;
 }
 
-static bool macho_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, unsigned frame_size, MachOEmitContext *ctx, ZDiag *diag) {
+static bool macho_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, unsigned frame_size, bool restore_process_args, MachOEmitContext *ctx, ZDiag *diag) {
   if (instr->kind == IR_INSTR_WORLD_WRITE) {
     return macho_emit_world_write(text, fun, instr, frame_size, ctx, diag);
   }
@@ -1109,17 +1111,17 @@ static bool macho_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *i
   }
   if (instr->kind == IR_INSTR_RETURN) {
     if (instr->value && !macho_emit_value_to_reg(text, fun, instr->value, 0, frame_size, ctx, diag)) return false;
-    macho_emit_epilogue(text, frame_size);
+    macho_emit_epilogue(text, frame_size, restore_process_args);
     return true;
   }
   if (instr->kind == IR_INSTR_IF) {
     if (!macho_emit_value_to_reg(text, fun, instr->value, 0, frame_size, ctx, diag)) return false;
     size_t false_patch = macho_emit_cbz_w_placeholder(text, 0);
-    if (!macho_emit_instrs(text, fun, instr->then_instrs, instr->then_len, frame_size, ctx, diag)) return false;
+    if (!macho_emit_instrs(text, fun, instr->then_instrs, instr->then_len, frame_size, restore_process_args, ctx, diag)) return false;
     if (instr->else_len > 0) {
       size_t end_patch = macho_emit_b_placeholder(text);
       macho_patch_cond19(text, false_patch, text->len);
-      if (!macho_emit_instrs(text, fun, instr->else_instrs, instr->else_len, frame_size, ctx, diag)) return false;
+      if (!macho_emit_instrs(text, fun, instr->else_instrs, instr->else_len, frame_size, restore_process_args, ctx, diag)) return false;
       macho_patch_branch26(text, end_patch, text->len);
     } else {
       macho_patch_cond19(text, false_patch, text->len);
@@ -1130,7 +1132,7 @@ static bool macho_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *i
     size_t loop_start = text->len;
     if (!macho_emit_value_to_reg(text, fun, instr->value, 0, frame_size, ctx, diag)) return false;
     size_t false_patch = macho_emit_cbz_w_placeholder(text, 0);
-    if (!macho_emit_instrs(text, fun, instr->then_instrs, instr->then_len, frame_size, ctx, diag)) return false;
+    if (!macho_emit_instrs(text, fun, instr->then_instrs, instr->then_len, frame_size, restore_process_args, ctx, diag)) return false;
     size_t loop_patch = macho_emit_b_placeholder(text);
     macho_patch_branch26(text, loop_patch, loop_start);
     macho_patch_cond19(text, false_patch, text->len);
@@ -1141,9 +1143,9 @@ static bool macho_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *i
   return macho_diag_at(diag, "direct AArch64 Mach-O instruction kind is unsupported", instr->line, instr->column, actual);
 }
 
-static bool macho_emit_instrs(ZBuf *text, const IrFunction *fun, const IrInstr *instrs, size_t len, unsigned frame_size, MachOEmitContext *ctx, ZDiag *diag) {
+static bool macho_emit_instrs(ZBuf *text, const IrFunction *fun, const IrInstr *instrs, size_t len, unsigned frame_size, bool restore_process_args, MachOEmitContext *ctx, ZDiag *diag) {
   for (size_t i = 0; i < len; i++) {
-    if (!macho_emit_instr(text, fun, &instrs[i], frame_size, ctx, diag)) return false;
+    if (!macho_emit_instr(text, fun, &instrs[i], frame_size, restore_process_args, ctx, diag)) return false;
   }
   return true;
 }
@@ -1181,14 +1183,20 @@ static bool macho_emit_function_text(ZBuf *text, const IrFunction *fun, MachOEmi
   }
 
   unsigned frame_size = macho_frame_size(fun);
+  bool seed_process_args = ctx && ctx->seed_main_process_args && fun->is_exported && fun->name && strcmp(fun->name, "main") == 0;
+  if (seed_process_args) append_u32le(text, 0xa9bf57f4u); // stp x20, x21, [sp, #-16]!
   append_u32le(text, 0xa9bf7bfdu); // stp x29, x30, [sp, #-16]!
   append_u32le(text, 0x910003fdu); // mov x29, sp
   if (frame_size > 0) macho_emit_add_sp_imm(text, 0xd10003ffu, frame_size); // sub sp, sp, #frame_size
+  if (seed_process_args) {
+    macho_emit_mov_x(text, 20, 0);
+    macho_emit_mov_x(text, 21, 1);
+  }
   for (size_t i = 0; i < fun->param_count; i++) {
     macho_emit_store_local_w(text, fun, (unsigned)i, (unsigned)i, 0, frame_size);
   }
-  if (!macho_emit_instrs(text, fun, fun->instrs, fun->instr_len, frame_size, ctx, diag)) return false;
-  if (fun->instr_len == 0 || fun->instrs[fun->instr_len - 1].kind != IR_INSTR_RETURN) macho_emit_epilogue(text, frame_size);
+  if (!macho_emit_instrs(text, fun, fun->instrs, fun->instr_len, frame_size, seed_process_args, ctx, diag)) return false;
+  if (fun->instr_len == 0 || fun->instrs[fun->instr_len - 1].kind != IR_INSTR_RETURN) macho_emit_epilogue(text, frame_size, seed_process_args);
   return true;
 }
 
@@ -1255,7 +1263,8 @@ bool z_emit_macho64_object_from_ir(const IrProgram *program, ZBuf *out, ZDiag *d
     .program = program,
     .function_offsets = offsets,
     .function_count = program->function_len,
-    .rodata_base_offset = rodata_base_offset
+    .rodata_base_offset = rodata_base_offset,
+    .seed_main_process_args = true
   };
   for (size_t i = 0; i < program->function_len; i++) {
     const IrFunction *fun = &program->functions[i];
