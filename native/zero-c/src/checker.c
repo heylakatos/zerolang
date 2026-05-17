@@ -472,18 +472,6 @@ static void scope_set_value_provenance_path(Scope *scope, const char *name, cons
   }
 }
 
-static void scope_clear_value_provenance(Scope *scope, const char *name) {
-  if (!scope || !name) return;
-  for (Scope *cursor = scope; cursor; cursor = cursor->parent) {
-    for (size_t i = 0; i < cursor->len; i++) {
-      if (strcmp(cursor->names[i], name) == 0) {
-        scope_clear_value_provenance_at(&cursor->value_provenance[i]);
-        return;
-      }
-    }
-  }
-}
-
 static void scope_clear_value_provenance_path(Scope *scope, const char *name, const char *path) {
   ValueProvenance empty = {0};
   scope_set_value_provenance_path(scope, name, path, &empty);
@@ -5396,6 +5384,31 @@ static bool update_borrow_assignment(const Program *program, const Expr *target,
   return true;
 }
 
+typedef struct {
+  bool active;
+  char root[128];
+  char path[256];
+  ValueProvenance previous;
+} AssignmentProvenanceSnapshot;
+
+static void assignment_provenance_snapshot_clear(const Expr *target, Scope *scope, AssignmentProvenanceSnapshot *snapshot) {
+  if (!snapshot) return;
+  *snapshot = (AssignmentProvenanceSnapshot){0};
+  if (!target || !scope) return;
+  if (!expr_binding_path(target, snapshot->root, sizeof(snapshot->root), snapshot->path, sizeof(snapshot->path))) return;
+  if (!scope_has(scope, snapshot->root)) return;
+  snapshot->active = true;
+  scope_copy_value_provenance(scope, snapshot->root, &snapshot->previous);
+  scope_clear_value_provenance_path(scope, snapshot->root, snapshot->path);
+}
+
+static void assignment_provenance_snapshot_restore(Scope *scope, AssignmentProvenanceSnapshot *snapshot) {
+  if (!snapshot || !snapshot->active) return;
+  scope_set_value_provenance(scope, snapshot->root, &snapshot->previous);
+  value_provenance_free(&snapshot->previous);
+  snapshot->active = false;
+}
+
 static size_t function_return_provenance_depth = 0;
 
 static char *return_provenance_type_text(const char *type, GenericBinding *bindings, size_t binding_len) {
@@ -5797,24 +5810,13 @@ static bool check_stmt(const Program *program, const Function *fun, const Stmt *
     char expected[128];
     if (!check_lvalue_target(program, target, scope, diag, expected, sizeof(expected))) return false;
     if (!check_assignment_not_borrowed(target, scope, diag)) return false;
-    ValueProvenance previous_provenance = {0};
-    bool restore_reference_provenance = target && target->kind == EXPR_IDENT &&
-      (type_is_named_generic(expected, "ref") || type_is_named_generic(expected, "mutref"));
-    if (restore_reference_provenance) {
-      scope_copy_value_provenance(scope, target->text, &previous_provenance);
-      scope_clear_value_provenance(scope, target->text);
-    }
+    AssignmentProvenanceSnapshot provenance_snapshot = {0};
+    assignment_provenance_snapshot_clear(target, scope, &provenance_snapshot);
     if (!check_expr_expected(program, stmt->expr, scope, diag, expected)) {
-      if (restore_reference_provenance) {
-        scope_set_value_provenance(scope, target->text, &previous_provenance);
-        value_provenance_free(&previous_provenance);
-      }
+      assignment_provenance_snapshot_restore(scope, &provenance_snapshot);
       return false;
     }
-    if (restore_reference_provenance) {
-      scope_set_value_provenance(scope, target->text, &previous_provenance);
-      value_provenance_free(&previous_provenance);
-    }
+    assignment_provenance_snapshot_restore(scope, &provenance_snapshot);
     const char *actual = expr_type(program, stmt->expr, scope);
     if (!types_compatible(expected, actual)) {
       return set_diag_detail(diag, 3006, "assignment type does not match binding", stmt->line, stmt->column, expected, actual, "assign a compatible value");
