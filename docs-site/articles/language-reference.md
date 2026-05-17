@@ -690,10 +690,12 @@ fun write_x(point: mutref<Point>, value: i32) -> Void {
 `&mut` requires a mutable lvalue root, and assignment through `ref<T>` is
 rejected.
 
-The current native checker tracks simple lexical borrow conflicts, rejects
-assignment while a value is borrowed, and rejects returning references to local
-bindings. Borrows lower to direct address expressions; there is no borrow
-registry or runtime alias metadata.
+The current native checker tracks lexical borrow conflicts and references stored
+inside values, returned from calls, or merged through control flow. It rejects
+assignment while a reachable reference is live, rejects returning references to
+local bindings, and rejects storing callee-local references into caller-owned
+`mutref` storage. Borrows lower to direct address expressions; there is no
+borrow registry or runtime alias metadata.
 
 ## Imports And Standard Library
 
