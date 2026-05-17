@@ -1,0 +1,7 @@
+pub fun main() -> Void {
+    let value = bad()
+}
+
+fun bad() -> ref<i32> {
+    return missing
+}

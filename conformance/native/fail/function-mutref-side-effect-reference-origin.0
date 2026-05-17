@@ -1,0 +1,15 @@
+shape Holder {
+    value: ref<i32>,
+}
+
+fun replace(holder: mutref<Holder>, next: ref<i32>) -> Void {
+    holder.value = next
+}
+
+pub fun main() -> Void {
+    let mut x = 1
+    let y = 2
+    let mut holder = Holder { value: &y }
+    replace(&mut holder, &x)
+    x = 3
+}

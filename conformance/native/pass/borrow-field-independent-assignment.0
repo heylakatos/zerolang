@@ -1,0 +1,15 @@
+shape Pair {
+    left: i32,
+    right: i32,
+}
+
+pub fun main() -> Void {
+    let mut pair = Pair { left: 1, right: 2 }
+    let left = &pair.left
+    pair.right = 3
+
+    let mut second = Pair { left: 4, right: 5 }
+    let second_left = &mut second.left
+    second.right = 6
+    let second_right = &mut second.right
+}

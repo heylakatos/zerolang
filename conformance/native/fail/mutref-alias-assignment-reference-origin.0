@@ -1,0 +1,14 @@
+shape Holder {
+    value: ref<i32>,
+}
+
+pub fun main() -> Void {
+    let mut next = 1
+    let mut old = 2
+    let mut holder = Holder { value: &old }
+    if true {
+        let selected = &mut holder
+        selected.value = &next
+    }
+    next = 3
+}

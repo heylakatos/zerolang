@@ -1,0 +1,13 @@
+shape Holder {
+    value: ref<i32>,
+}
+
+pub fun main() -> Void {
+    let old = 1
+    let mut holder = Holder { value: &old }
+    let selected = &mut holder
+    if true {
+        let inner = 2
+        selected.value = &inner
+    }
+}

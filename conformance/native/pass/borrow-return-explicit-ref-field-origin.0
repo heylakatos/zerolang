@@ -1,0 +1,22 @@
+shape Box {
+    value: ref<i32>,
+}
+
+fun get(box: ref<Box>) -> ref<i32> {
+    return box.value
+}
+
+fun getMut(box: mutref<Box>) -> ref<i32> {
+    return box.value
+}
+
+pub fun main() -> Void {
+    let mut x = 1
+    let y = 2
+    let z = 3
+    let mut box = Box { value: &x }
+    let current = get(&box)
+    box.value = &y
+    let other = getMut(&mut box)
+    box.value = &z
+}

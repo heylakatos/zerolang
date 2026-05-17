@@ -1,0 +1,19 @@
+shape Holder {
+    value: ref<i32>,
+
+    fun replace(self: mutref<Self>, next: ref<i32>) -> Void {
+        self.value = next
+    }
+
+    fun replaceVia(self: mutref<Self>, next: ref<i32>) -> Void {
+        self.replace(next)
+    }
+}
+
+pub fun main() -> Void {
+    let mut x = 1
+    let y = 2
+    let mut holder = Holder { value: &y }
+    holder.replaceVia(&x)
+    x = 3
+}

@@ -1,0 +1,7 @@
+pub fun make() -> [1]ref<i32> {
+    let x = 1
+    return [&x]
+}
+
+pub fun main() -> Void {
+}

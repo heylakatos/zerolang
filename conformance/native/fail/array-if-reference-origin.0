@@ -1,0 +1,9 @@
+pub fun main(flag: Bool) -> Void {
+    let mut x = 1
+    let y = 2
+    let mut refs = [&x]
+    if flag {
+        refs = [&y]
+    }
+    x = 3
+}

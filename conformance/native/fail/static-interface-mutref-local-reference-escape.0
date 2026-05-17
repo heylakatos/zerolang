@@ -1,0 +1,22 @@
+interface Storer<T> {
+    fun store(self: mutref<T>, next: ref<i32>) -> Void
+}
+
+shape Holder {
+    value: ref<i32>,
+
+    fun store(self: mutref<Self>, next: ref<i32>) -> Void {
+        self.value = next
+    }
+}
+
+fun storeLocal<T: Storer<T>>(holder: mutref<T>) -> Void {
+    let local = 1
+    T.store(holder, &local)
+}
+
+pub fun main() -> Void {
+    let fallback = 0
+    let mut holder = Holder { value: &fallback }
+    storeLocal<Holder>(&mut holder)
+}

@@ -1,0 +1,15 @@
+shape Box {
+    value: ref<i32>,
+}
+
+fun make(value: ref<i32>) -> Box {
+    return Box { value: value }
+}
+
+pub fun leak() -> Box {
+    let x = 1
+    return make(&x)
+}
+
+pub fun main() -> Void {
+}

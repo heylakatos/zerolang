@@ -1,0 +1,14 @@
+shape Point {
+    x: i32,
+    y: i32,
+}
+
+fun field(point: ref<Point>) -> ref<i32> {
+    let alias = point
+    return &alias.x
+}
+
+pub fun main() -> Void {
+    let point = Point { x: 1, y: 2 }
+    let current = field(&point)
+}

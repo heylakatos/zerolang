@@ -1,0 +1,22 @@
+enum Mode {
+    keep,
+    replace,
+}
+
+shape Box {
+    value: ref<i32>,
+}
+
+pub fun main(mode: Mode) -> Void {
+    let mut x = 1
+    let y = 2
+    let mut box: Box = Box { value: &x }
+    match mode {
+        .keep {
+        }
+        .replace {
+            box = Box { value: &y }
+        }
+    }
+    x = 3
+}
