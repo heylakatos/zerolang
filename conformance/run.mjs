@@ -1231,6 +1231,22 @@ assert.equal(missingImportBody.diagnostics[0].code, "IMP001");
 assert.match(missingImportBody.diagnostics[0].message, /unknown package-local import/);
 assert.equal(missingImportBody.diagnostics[0].fixSafety, "requires-human-review");
 
+const importLineMapJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/import-line-map"]).catch((error) => error);
+assert.notEqual(importLineMapJson.code, 0);
+const importLineMapBody = JSON.parse(importLineMapJson.stdout);
+assert.equal(importLineMapBody.diagnostics[0].code, "PAR100");
+assert.equal(importLineMapBody.diagnostics[0].path, "conformance/check/fail/import-line-map/src/main.0");
+assert.equal(importLineMapBody.diagnostics[0].line, 4);
+assert.equal(importLineMapBody.diagnostics[0].column, 1);
+
+const importedLineMapJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/imported-line-map"]).catch((error) => error);
+assert.notEqual(importedLineMapJson.code, 0);
+const importedLineMapBody = JSON.parse(importedLineMapJson.stdout);
+assert.equal(importedLineMapBody.diagnostics[0].code, "TYP003");
+assert.equal(importedLineMapBody.diagnostics[0].path, "conformance/check/fail/imported-line-map/src/helper.0");
+assert.equal(importedLineMapBody.diagnostics[0].line, 2);
+assert.equal(importedLineMapBody.diagnostics[0].column, 5);
+
 const importCycleJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/import-cycle"]).catch((error) => error);
 assert.notEqual(importCycleJson.code, 0);
 const importCycleBody = JSON.parse(importCycleJson.stdout);

@@ -3178,16 +3178,23 @@ static bool compile_input(const char *input_path, const ZTargetInfo *target, Sou
   phase_started = now_ms();
   TokenVec tokens = z_tokenize(input->source, diag);
   if (diag->code != 0) {
+    z_map_source_diag(input, diag);
     z_free_tokens(&tokens);
     return false;
   }
   *program = z_parse(&tokens, diag);
   z_free_tokens(&tokens);
   input->parse_ms = now_ms() - phase_started;
-  if (diag->code != 0) return false;
+  if (diag->code != 0) {
+    z_map_source_diag(input, diag);
+    return false;
+  }
   z_set_check_target(target);
   phase_started = now_ms();
-  if (!z_check_program(program, diag)) return false;
+  if (!z_check_program(program, diag)) {
+    z_map_source_diag(input, diag);
+    return false;
+  }
   input->check_ms = now_ms() - phase_started;
   return true;
 }
@@ -8346,6 +8353,7 @@ int main(int argc, char **argv) {
     diag.path = token_input.source_file;
     TokenVec tokens = z_tokenize(token_input.source, &diag);
     if (diag.code != 0) {
+      z_map_source_diag(&token_input, &diag);
       if (command.json) print_diag_json(diag.path ? diag.path : command.input, &diag);
       else print_diag(diag.path ? diag.path : command.input, &diag);
       z_free_tokens(&tokens);
@@ -8389,6 +8397,7 @@ int main(int argc, char **argv) {
     Program parsed = {0};
     if (diag.code == 0) parsed = z_parse(&tokens, &diag);
     if (diag.code != 0) {
+      z_map_source_diag(&parse_input, &diag);
       if (command.json) print_diag_json(diag.path ? diag.path : command.input, &diag);
       else print_diag(diag.path ? diag.path : command.input, &diag);
       z_free_program(&parsed);
@@ -8607,6 +8616,7 @@ int main(int argc, char **argv) {
     bool emitted_wasm = z_emit_wasm_from_ir(&ir, &wasm, &diag);
     input.codegen_ms = now_ms() - phase_started;
     if (!emitted_wasm) {
+      z_map_source_diag(&input, &diag);
       if (!diag.path) diag.path = input.source_file;
       if (command.json) print_diag_json(input.source_file, &diag);
       else print_diag(input.source_file, &diag);
@@ -8668,6 +8678,7 @@ int main(int argc, char **argv) {
     else if (strcmp(emitter, "zero-coff-x64") == 0) emitted_object = z_emit_coff_x64_object_from_ir(&ir, &object, &diag);
     input.codegen_ms = now_ms() - phase_started;
     if (!emitted_object) {
+      z_map_source_diag(&input, &diag);
       if (!diag.path) diag.path = input.source_file;
       if (command.json) print_diag_json(input.source_file, &diag);
       else print_diag(input.source_file, &diag);
@@ -8745,6 +8756,7 @@ int main(int argc, char **argv) {
     else emitted_exe = z_emit_elf64_exe_from_ir(&ir, &exe, &diag);
     input.codegen_ms = now_ms() - phase_started;
     if (!emitted_exe) {
+      z_map_source_diag(&input, &diag);
       if (!diag.path) diag.path = input.source_file;
       if (command.json) print_diag_json(input.source_file, &diag);
       else print_diag(input.source_file, &diag);
