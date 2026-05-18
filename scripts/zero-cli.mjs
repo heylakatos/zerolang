@@ -662,6 +662,7 @@ function buildSelfHostReport({ command, loaded, target, emit, driver, artifactPa
       ...base,
       ok: true,
       diagnostics: [],
+      targetReadiness: selfHostTargetReadiness({ target, sourceFile: loaded.sourceFile, requiresCapabilities }),
       compilerPhases: selfHostCompilerPhases(command),
     };
   }
@@ -918,6 +919,82 @@ function selfHostSubsetBackend(target) {
 function selfHostObjectEmissionPath(target) {
   if (target === "linux-musl-x64") return "direct-elf64-metadata";
   return "direct-wasm";
+}
+
+function selfHostTargetReadinessFacts(target) {
+  if (target === "linux-musl-x64") {
+    return {
+      objectFormat: "elf",
+      arch: "x86_64",
+      abi: "musl",
+      status: "native-exe",
+      backend: "zero-elf64-exe",
+    };
+  }
+  if (target === "wasm32-wasi") {
+    return {
+      objectFormat: "wasm",
+      arch: "wasm32",
+      abi: "wasi",
+      status: "wasm-module",
+      backend: "none",
+    };
+  }
+  return {
+    objectFormat: "wasm",
+    arch: "wasm32",
+    abi: "emscripten",
+    status: "wasm-module",
+    backend: "none",
+  };
+}
+
+function selfHostTargetReadiness({ target, sourceFile, requiresCapabilities }) {
+  const emit = "exe";
+  const facts = selfHostTargetReadinessFacts(target);
+  const sourceSubsetCompatible = !requiresCapabilities.some((capability) => ["fs", "time", "rand", "net", "proc", "web"].includes(capability));
+  const ready = target === "linux-musl-x64" && sourceSubsetCompatible;
+  const actual = `target=${target} objectFormat=${facts.objectFormat} arch=${facts.arch} abi=${facts.abi} status=${facts.status}`;
+  return {
+    schemaVersion: 1,
+    ok: ready,
+    languageOk: true,
+    buildable: ready,
+    target,
+    emit,
+    objectFormat: facts.objectFormat,
+    backend: facts.backend,
+    stage: ready ? "ready" : "select",
+    diagnostics: ready
+      ? []
+      : [
+          {
+            severity: "error",
+            code: "CGEN004",
+            message: `direct backend does not support target '${target}' for --emit ${emit}`,
+            path: sourceFile,
+            line: 1,
+            column: 1,
+            length: 1,
+            expected: "direct target with matching object format and architecture",
+            actual,
+            help: "direct executable backend is not implemented for this target/backend pair; use --emit obj for direct target objects or choose a supported direct executable target",
+            fixSafety: "requires-human-review",
+            repair: {
+              id: "choose-supported-direct-backend",
+              summary: "Use zero targets --json to choose a direct-supported target, or request --emit obj when only object emission exists.",
+            },
+            backendBlocker: {
+              target,
+              objectFormat: facts.objectFormat,
+              backend: facts.backend,
+              stage: "select",
+              unsupportedFeature: actual,
+            },
+            related: [],
+          },
+        ],
+  };
 }
 
 function selfHostUsedStdlibHelpers(sourceBytes) {
