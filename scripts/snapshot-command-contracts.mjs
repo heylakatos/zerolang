@@ -1465,6 +1465,22 @@ const targetDeniedCapability = json(["check", "--json", "--target", "wasm32-web"
 assert.equal(targetDeniedCapability.diagnostics[0].code, "TAR002");
 assert.equal(targetDeniedCapability.diagnostics[0].repair.id, "choose-target-with-required-capability");
 assert.equal(targetDeniedCapability.generatedCBytes ?? 0, 0);
+const backendBlockedReadiness = json(["check", "--json", "--emit", "obj", "--target", "linux-musl-x64", "conformance/agent-surface/fixtures/owned-drop-direct-backend-unsupported.0"]).body;
+assert.equal(backendBlockedReadiness.ok, true);
+assert.equal(backendBlockedReadiness.diagnostics.length, 0);
+assert.equal(backendBlockedReadiness.targetReadiness.ok, false);
+assert.equal(backendBlockedReadiness.targetReadiness.buildable, false);
+assert.equal(backendBlockedReadiness.targetReadiness.languageOk, true);
+assert.equal(backendBlockedReadiness.targetReadiness.emit, "obj");
+assert.equal(backendBlockedReadiness.targetReadiness.target, "linux-musl-x64");
+assert.equal(backendBlockedReadiness.targetReadiness.diagnostics[0].code, "CGEN004");
+assert.deepEqual(backendBlockedReadiness.targetReadiness.diagnostics[0].backendBlocker, {
+  target: "linux-musl-x64",
+  objectFormat: "elf",
+  backend: "zero-elf64",
+  stage: "lower",
+  unsupportedFeature: "owned<Tracked>",
+});
 
 const routes = json(["routes", "--json", "examples/web/hello"]).body;
 assert.equal(routes.schemaVersion, 1);

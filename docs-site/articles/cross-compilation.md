@@ -16,6 +16,18 @@ the target does not provide that capability.
 bin/zero check --json --target wasm32-web conformance/native/fail/std-fs-target-unsupported.0
 ```
 
+For agent planning, `check --json` can also report whether a selected direct
+artifact is expected to build without emitting it:
+
+```sh
+bin/zero check --json --emit obj --target linux-musl-x64 conformance/agent-surface/fixtures/owned-drop-direct-backend-unsupported.0
+```
+
+The top-level result stays about language validity. The nested
+`targetReadiness` object reports target buildability and carries structured
+backend blockers such as `target`, `objectFormat`, `backend`, `stage`, and
+`unsupportedFeature`.
+
 ## Direct Artifacts
 
 Supported executable builds use Zero's direct target emitters. Unsupported

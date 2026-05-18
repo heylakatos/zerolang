@@ -541,6 +541,30 @@ const agentSurfaceOwnedDropCheck = await execFileAsync(zero, ["check", "--json",
 const agentSurfaceOwnedDropCheckBody = JSON.parse(agentSurfaceOwnedDropCheck.stdout);
 assert.equal(agentSurfaceOwnedDropCheckBody.ok, true);
 
+const agentSurfaceOwnedDropReadiness = await execFileAsync(zero, [
+  "check",
+  "--json",
+  "--emit",
+  "obj",
+  "--target",
+  "linux-musl-x64",
+  "conformance/agent-surface/fixtures/owned-drop-direct-backend-unsupported.0",
+]);
+const agentSurfaceOwnedDropReadinessBody = JSON.parse(agentSurfaceOwnedDropReadiness.stdout);
+assert.equal(agentSurfaceOwnedDropReadinessBody.ok, true);
+assert.equal(agentSurfaceOwnedDropReadinessBody.diagnostics.length, 0);
+assert.equal(agentSurfaceOwnedDropReadinessBody.targetReadiness.ok, false);
+assert.equal(agentSurfaceOwnedDropReadinessBody.targetReadiness.buildable, false);
+assert.equal(agentSurfaceOwnedDropReadinessBody.targetReadiness.languageOk, true);
+assert.equal(agentSurfaceOwnedDropReadinessBody.targetReadiness.diagnostics[0].code, "CGEN004");
+assert.deepEqual(agentSurfaceOwnedDropReadinessBody.targetReadiness.diagnostics[0].backendBlocker, {
+  target: "linux-musl-x64",
+  objectFormat: "elf",
+  backend: "zero-elf64",
+  stage: "lower",
+  unsupportedFeature: "owned<Tracked>",
+});
+
 async function assertAgentSurfaceOwnedDropUnsupported(target, emit, outName, expectedPattern, expectedObjectFormat, expectedBackend, options = {}) {
   const nativeTarget = options.nativeTarget ?? true;
   const extraArgs = options.extraArgs ?? [];

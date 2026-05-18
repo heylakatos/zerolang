@@ -1972,6 +1972,12 @@ static void append_package_cache_audit_json(ZBuf *buf, const SourceInput *input,
 
 static void append_self_host_routing_json(ZBuf *buf, const char *command_name, const char *emit_kind, const Program *program, const CapabilitySummary *caps, const ZTargetInfo *target);
 static void append_target_capability_facts_json(ZBuf *buf, const ZTargetInfo *target, const CapabilitySummary *caps);
+static void append_target_readiness_json(ZBuf *buf, SourceInput *input, const Program *program, const ZTargetInfo *target, const Command *command);
+static const char *emit_kind_name(EmitKind emit);
+static void append_backend_blocker_json(ZBuf *buf, const ZBackendBlocker *blocker);
+static void complete_backend_blocker_diag(ZDiag *diag, const ZTargetInfo *target, const Command *command, const char *emit_kind, const char *stage);
+static void init_direct_backend_diag(ZDiag *diag, const Command *command, const SourceInput *input, const ZTargetInfo *target, const char *emit_kind, const char *reason);
+static const char *direct_emit_emitter(const ZTargetInfo *target, const Command *command, const char *emit_kind);
 static void append_used_stdlib_helpers_json(ZBuf *buf, const HelperUseSummary *helpers);
 static void append_runtime_shims_json(ZBuf *buf, const char *emitted_symbol_text, const CapabilitySummary *caps);
 static const Function *find_program_function(const Program *program, const char *name);
@@ -2015,7 +2021,7 @@ static void append_compile_time_json(ZBuf *buf, const Program *program, const So
   free(manifest);
 }
 
-static void print_check_json_success(const char *path, const SourceInput *input, const Program *program, const ZTargetInfo *target) {
+static void print_check_json_success(const char *path, SourceInput *input, const Program *program, const ZTargetInfo *target, const Command *command) {
   ZBuf buf;
   zbuf_init(&buf);
   zbuf_append(&buf, "{\n  \"schemaVersion\": 1,\n  \"ok\": true,\n  \"sourceFile\": ");
@@ -2034,6 +2040,8 @@ static void print_check_json_success(const char *path, const SourceInput *input,
   append_hash_json(&buf, "manifestHash", fnv1a_text(manifest ? manifest : ""));
   zbuf_append(&buf, "\n  },\n  \"compileTime\": ");
   append_compile_time_json(&buf, program, input, target);
+  zbuf_append(&buf, ",\n  \"targetReadiness\": ");
+  append_target_readiness_json(&buf, input, program, target, command);
   zbuf_append(&buf, ",\n  \"compilerPhases\": ");
   append_compiler_phases_json(&buf, input);
   zbuf_append(&buf, ",\n  \"compilerCaches\": ");
@@ -3216,8 +3224,8 @@ static void print_command_help(const char *command) {
     printf("Flags:\n");
     printf("  --all    remove broader .zero generated state while preserving .zero/bin\n");
   } else if (strcmp(command, "check") == 0) {
-    printf("Usage: zero check [--json] [--target <target>] <file.0|project|zero.json>\n\n");
-    printf("Parse and typecheck Zero source without emitting artifacts.\n");
+    printf("Usage: zero check [--json] [--target <target>] [--emit exe|obj|wasm] <file.0|project|zero.json>\n\n");
+    printf("Parse and typecheck Zero source without emitting artifacts. JSON output includes target readiness for the selected emit kind.\n");
   } else if (strcmp(command, "build") == 0) {
     printf("Usage: zero build [--json] [--emit exe|obj|wasm] [--target <target>] [--profile debug|dev|release-fast|release-small|tiny|audit] [--release <profile>] [--out <file>] <input>\n\n");
     printf("Build direct native, object, or WebAssembly artifacts.\n\n");
@@ -3439,6 +3447,17 @@ static bool parse_command(int argc, char **argv, Command *command) {
          strcmp(command->command, "doctor") == 0 ||
          strcmp(command->command, "clean") == 0 ||
          strcmp(command->command, "targets") == 0;
+}
+
+static const char *emit_kind_name(EmitKind emit) {
+  switch (emit) {
+    case EMIT_OBJ: return "obj";
+    case EMIT_WASM: return "wasm";
+    case EMIT_C: return "c";
+    case EMIT_EXE:
+    default:
+      return "exe";
+  }
 }
 
 static long long now_ms(void);
@@ -8277,6 +8296,192 @@ static void append_self_host_routing_json(ZBuf *buf, const char *command_name, c
   zbuf_append(buf, ",\"policy\":\"removed\",\"explicitDirectFallback\":\"never-c-bridge\"}}");
 }
 
+static void apply_ir_metrics_to_input(SourceInput *input, const IrProgram *ir) {
+  if (!input || !ir) return;
+  input->lowered_ir_bytes = ir->mir_bytes;
+  input->direct_function_count = ir->direct_function_count;
+  input->direct_export_count = ir->direct_export_count;
+  input->direct_stack_bytes = ir->direct_stack_bytes;
+  input->direct_max_frame_bytes = ir->direct_max_frame_bytes;
+  input->direct_readonly_data_bytes = ir->direct_readonly_data_bytes;
+  input->direct_allocator_helper_count = ir->direct_allocator_helper_count;
+  input->direct_buffer_helper_count = ir->direct_buffer_helper_count;
+  input->direct_runtime_helper_count = ir->direct_runtime_helper_count;
+  input->direct_host_runtime_import_count = ir->direct_host_runtime_import_count;
+  input->direct_http_runtime_import_count = ir->direct_http_runtime_import_count;
+}
+
+static const char *target_backend_expected(const ZTargetInfo *target) {
+  const char *format = target && target->object_format ? target->object_format : "";
+  const char *arch = target && target->arch ? target->arch : "";
+  if (strcmp(format, "wasm") == 0) return "direct wasm MVP subset";
+  if (strcmp(format, "macho") == 0) return "direct AArch64 Mach-O object MVP subset";
+  if (strcmp(format, "coff") == 0) return "direct COFF x64 object MVP subset";
+  if (strcmp(format, "elf") == 0 && strcmp(arch, "aarch64") == 0) return "direct AArch64 ELF object MVP subset";
+  if (strcmp(format, "elf") == 0) return "direct ELF64 object MVP subset";
+  return "direct target with matching object format and architecture";
+}
+
+static const char *target_backend_help(const ZTargetInfo *target, const IrProgram *ir) {
+  const char *format = target && target->object_format ? target->object_format : "";
+  const char *arch = target && target->arch ? target->arch : "";
+  if (strcmp(format, "wasm") == 0) {
+    return ir && ir->mir_help[0] ? ir->mir_help : "restrict this program to direct-wasm-supported features";
+  }
+  if (strcmp(format, "macho") == 0 || (strcmp(format, "elf") == 0 && strcmp(arch, "aarch64") == 0)) {
+    return "choose a supported direct target or restrict this program to exported no-parameter functions returning small integer literals";
+  }
+  if (strcmp(format, "coff") == 0) return "reduce the program to primitive direct-backend constructs or choose a supported direct target";
+  return "choose a supported direct target or restrict this program to exported primitive integer arithmetic functions";
+}
+
+static void init_lowering_backend_diag(ZDiag *diag, const SourceInput *input, const ZTargetInfo *target, const Command *command, const IrProgram *ir) {
+  memset(diag, 0, sizeof(*diag));
+  diag->code = 4004;
+  diag->path = input ? input->source_file : NULL;
+  diag->line = ir && ir->mir_line > 0 ? ir->mir_line : 1;
+  diag->column = ir && ir->mir_column > 0 ? ir->mir_column : 1;
+  diag->length = 1;
+  snprintf(diag->message, sizeof(diag->message), "%s", ir && ir->mir_message[0] ? ir->mir_message : "direct backend lowering failed");
+  snprintf(diag->expected, sizeof(diag->expected), "%s", target_backend_expected(target));
+  snprintf(diag->actual, sizeof(diag->actual), "%s", ir && ir->mir_actual[0] ? ir->mir_actual : "unsupported construct");
+  snprintf(diag->help, sizeof(diag->help), "%s", target_backend_help(target, ir));
+  if (ir) z_diag_set_backend_blocker(diag, &ir->backend_blocker);
+  complete_backend_blocker_diag(diag, target, command, emit_kind_name(command ? command->emit : EMIT_EXE), "lower");
+}
+
+static bool requested_exe_backend_matches(const Command *command, const char *emitter) {
+  if (!command || !command->backend || !command->backend[0]) return true;
+  return (strcmp(command->backend, "zero-elf64") == 0 && strcmp(emitter, "zero-elf64-exe") == 0) ||
+         (strcmp(command->backend, "zero-elf-aarch64") == 0 && strcmp(emitter, "zero-elf-aarch64-exe") == 0) ||
+         (strcmp(command->backend, "zero-macho64") == 0 && strcmp(emitter, "zero-macho64-exe") == 0) ||
+         (strcmp(command->backend, "zero-coff-x64") == 0 && strcmp(emitter, "zero-coff-x64-exe") == 0);
+}
+
+static bool target_readiness_select_diag(const Command *command, const SourceInput *input, const Program *program, const ZTargetInfo *target, const IrProgram *ir, ZDiag *diag) {
+  EmitKind emit = command ? command->emit : EMIT_EXE;
+  const char *emit_kind = emit_kind_name(emit);
+  if (emit == EMIT_WASM) {
+    const char *emitter = z_direct_object_emitter(target);
+    if (emitter && strcmp(emitter, "zero-wasm") == 0) return true;
+    init_direct_backend_diag(diag, command, input, target, emit_kind, "use --target wasm32-wasi or --target wasm32-web for direct no-stdlib wasm modules");
+    return false;
+  }
+  if (emit == EMIT_OBJ) {
+    const char *emitter = z_direct_object_emitter(target);
+    if (emitter && strcmp(emitter, "none") != 0 && strcmp(emitter, "zero-wasm") != 0) return true;
+    init_direct_backend_diag(diag, command, input, target, emit_kind, z_direct_backend_reason(target));
+    return false;
+  }
+  if (emit == EMIT_C) {
+    init_direct_backend_diag(diag, command, input, target, emit_kind, "use --emit exe, --emit obj, or --emit wasm for target readiness");
+    return false;
+  }
+
+  if (ir && ir_needs_zero_runtime_object(ir)) {
+    RuntimeImportAudit audit = runtime_import_audit_from_ir(ir);
+    bool needs_http_runtime = runtime_import_audit_uses_http_provider(&audit);
+    const char *object_emitter = z_direct_object_emitter(target);
+    bool runtime_object_emitter_supported = object_emitter && (strcmp(object_emitter, "zero-macho64") == 0 || strcmp(object_emitter, "zero-elf64") == 0);
+    if (!runtime_object_emitter_supported) {
+      init_direct_backend_diag(diag, command, input, target, emit_kind, "runtime helpers currently require the Mach-O or ELF64 object link plan");
+      return false;
+    }
+    if (needs_http_runtime && !z_target_is_host(target)) {
+      init_direct_backend_diag(diag, command, input, target, emit_kind, "HTTP runtime provider is host-only for direct executable links");
+      return false;
+    }
+    return true;
+  }
+
+  const char *emitter = z_direct_exe_emitter(target);
+  bool supported_exe = emitter && strcmp(emitter, "none") != 0 && requested_exe_backend_matches(command, emitter);
+  CapabilitySummary caps = program_capabilities(program);
+  bool default_direct_exe = supported_exe && (!command || !command->backend) && self_host_subset_compatible(program, &caps);
+  bool requested_direct_exe = supported_exe && command && command->backend && command->backend[0];
+  if (default_direct_exe || requested_direct_exe) return true;
+  init_direct_backend_diag(diag, command, input, target, emit_kind, "direct executable backend is not implemented for this target/backend pair; use --emit obj for direct target objects or choose a supported direct executable target");
+  return false;
+}
+
+static const char *target_readiness_backend(const ZTargetInfo *target, const Command *command) {
+  EmitKind emit = command ? command->emit : EMIT_EXE;
+  if (emit == EMIT_OBJ || emit == EMIT_WASM) return z_direct_object_emitter(target);
+  if (emit == EMIT_EXE) {
+    if (command && command->backend && command->backend[0]) return command->backend;
+    return z_direct_exe_emitter(target);
+  }
+  return "none";
+}
+
+static void append_target_readiness_diagnostic_json(ZBuf *buf, const char *path, const ZDiag *diag) {
+  zbuf_append(buf, "{\"severity\":\"error\",\"code\":");
+  append_json_string(buf, diag_code(diag->code));
+  zbuf_append(buf, ",\"message\":");
+  append_json_string(buf, diag->message);
+  zbuf_append(buf, ",\"path\":");
+  append_json_string(buf, diag->path ? diag->path : path);
+  zbuf_appendf(buf, ",\"line\":%d,\"column\":%d,\"length\":%d", diag->line, diag->column, diag->length > 0 ? diag->length : 1);
+  zbuf_append(buf, ",\"expected\":");
+  append_json_string(buf, diag->expected);
+  zbuf_append(buf, ",\"actual\":");
+  append_json_string(buf, diag->actual);
+  zbuf_append(buf, ",\"help\":");
+  append_json_string(buf, diag->help);
+  zbuf_append(buf, ",\"fixSafety\":");
+  append_json_string(buf, diag_fix_safety(diag->code));
+  zbuf_append(buf, ",\"repair\":{\"id\":");
+  append_json_string(buf, diag_repair_id(diag->code));
+  zbuf_append(buf, ",\"summary\":");
+  append_json_string(buf, diag_repair_summary(diag->code));
+  zbuf_append(buf, "}");
+  if (diag->backend_blocker.present) {
+    zbuf_append(buf, ",\"backendBlocker\":");
+    append_backend_blocker_json(buf, &diag->backend_blocker);
+  }
+  zbuf_append(buf, ",\"related\":[]}");
+}
+
+static void append_target_readiness_json(ZBuf *buf, SourceInput *input, const Program *program, const ZTargetInfo *target, const Command *command) {
+  long long phase_started = now_ms();
+  IrProgram ir = z_lower_program_with_source(program, input);
+  if (input) input->lower_ms = now_ms() - phase_started;
+  apply_ir_metrics_to_input(input, &ir);
+
+  ZDiag diag = {0};
+  bool ready = true;
+  if (!ir.mir_valid) {
+    init_lowering_backend_diag(&diag, input, target, command, &ir);
+    ready = false;
+  } else if (!target_readiness_select_diag(command, input, program, target, &ir, &diag)) {
+    ready = false;
+  }
+  if (!ready && input) {
+    z_map_source_diag(input, &diag);
+    if (!diag.path) diag.path = input->source_file;
+  }
+
+  const char *emit_kind = emit_kind_name(command ? command->emit : EMIT_EXE);
+  zbuf_append(buf, "{\"schemaVersion\":1,\"ok\":");
+  zbuf_append(buf, ready ? "true" : "false");
+  zbuf_append(buf, ",\"languageOk\":true,\"buildable\":");
+  zbuf_append(buf, ready ? "true" : "false");
+  zbuf_append(buf, ",\"target\":");
+  append_json_string(buf, target && target->name ? target->name : z_host_target());
+  zbuf_append(buf, ",\"emit\":");
+  append_json_string(buf, emit_kind);
+  zbuf_append(buf, ",\"objectFormat\":");
+  append_json_string(buf, target && target->object_format ? target->object_format : "unknown");
+  zbuf_append(buf, ",\"backend\":");
+  append_json_string(buf, ready ? target_readiness_backend(target, command) : (diag.backend_blocker.present ? diag.backend_blocker.backend : direct_emit_emitter(target, command, emit_kind)));
+  zbuf_append(buf, ",\"stage\":");
+  append_json_string(buf, ready ? "ready" : (diag.backend_blocker.present && diag.backend_blocker.stage[0] ? diag.backend_blocker.stage : "select"));
+  zbuf_append(buf, ",\"diagnostics\":[");
+  if (!ready) append_target_readiness_diagnostic_json(buf, input ? input->source_file : NULL, &diag);
+  zbuf_append(buf, "]}");
+  z_free_ir_program(&ir);
+}
+
 static void append_release_matrix_target_support_json(ZBuf *buf) {
   const char *targets[] = {"wasm32-web", "wasm32-wasi", "linux-musl-x64", "linux-arm64", "darwin-arm64", "win32-x64.exe", NULL};
   zbuf_append(buf, "[");
@@ -9088,7 +9293,7 @@ int main(int argc, char **argv) {
   }
 
   if (strcmp(command.command, "check") == 0) {
-    if (command.json) print_check_json_success(input.source_file, &input, &program, target);
+    if (command.json) print_check_json_success(input.source_file, &input, &program, target, &command);
     else printf("ok\n");
     z_free_program(&program);
     z_free_source(&input);

@@ -57,7 +57,7 @@ Use `--json` when another tool will read the result. Text output is for people.
 
 | Command | Useful JSON fields |
 | --- | --- |
-| `zero check --json` | Diagnostics with code, span, expected/actual details, help, and repair metadata. |
+| `zero check --json` | Diagnostics with code, span, expected/actual details, help, repair metadata, and `targetReadiness` for the selected target/emit kind. |
 | `zero graph --json` | Modules, public symbols, capabilities, static facts, and helper use. |
 | `zero dev --json` | A watch plan for changed source, manifest, package-lock, and generated-binding inputs. |
 | `zero dev --json --trace` | Adds phase timing, cache hit/miss facts, diagnostics passthrough, and `interfaceFingerprints`. |
@@ -70,6 +70,11 @@ Use `--json` when another tool will read the result. Text output is for people.
 `zero check --json` and `zero graph --json` also include `compileTime`.
 That object records bounded `meta` evaluation, sandbox denials, cache key
 inputs, typed reflection facts, and integer/Bool/enum static values.
+
+`zero check --json --target <target> --emit <kind>` keeps language validity
+separate from target buildability. Top-level `ok` and `diagnostics` describe
+parse/typecheck results; `targetReadiness.ok`, `buildable`, and nested
+diagnostics describe predictable backend blockers without writing artifacts.
 
 Build and ship JSON include `releaseTargetContract`. It records artifact kind,
 object format, direct linker flavor, target libc mode, sysroot requirements,
