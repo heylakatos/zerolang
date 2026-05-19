@@ -1106,6 +1106,52 @@ assert.equal(interfaceParamMismatchBody.diagnostics[0].code, "IFC005");
 assert.match(interfaceParamMismatchBody.diagnostics[0].expected, /ref<Counter>/);
 assert.match(interfaceParamMismatchBody.diagnostics[0].actual, /i32/);
 
+const interfaceStaticUnsupportedTypeFixture = `${outDir}/interface-static-unsupported-type.0`;
+await writeFile(interfaceStaticUnsupportedTypeFixture, `interface Bad<static N: String> {
+    fun value() -> u8
+}
+
+pub fun main() -> Void {
+}
+`);
+const interfaceStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", interfaceStaticUnsupportedTypeFixture]).catch((error) => error);
+assert.notEqual(interfaceStaticUnsupportedTypeJson.code, 0);
+const interfaceStaticUnsupportedTypeBody = JSON.parse(interfaceStaticUnsupportedTypeJson.stdout);
+assert.equal(interfaceStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
+
+const interfaceMethodStaticUnsupportedTypeFixture = `${outDir}/interface-method-static-unsupported-type.0`;
+await writeFile(interfaceMethodStaticUnsupportedTypeFixture, `interface Bad {
+    fun value<static N: String>() -> u8
+}
+
+pub fun main() -> Void {
+}
+`);
+const interfaceMethodStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", interfaceMethodStaticUnsupportedTypeFixture]).catch((error) => error);
+assert.notEqual(interfaceMethodStaticUnsupportedTypeJson.code, 0);
+const interfaceMethodStaticUnsupportedTypeBody = JSON.parse(interfaceMethodStaticUnsupportedTypeJson.stdout);
+assert.equal(interfaceMethodStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
+
+for (const value of ["4_", "M"]) {
+  const fixture = `${outDir}/interface-static-constraint-${value.replace(/[^A-Za-z0-9]/g, "_")}.0`;
+  await writeFile(fixture, `interface First<T, static N: usize> {
+    fun first(self: ref<T>) -> u8
+}
+
+fun readFirst<T: First<T,${value}>>(value: ref<T>) -> u8 {
+    return T.first(value)
+}
+
+pub fun main() -> Void {
+}
+`);
+  const interfaceStaticConstraintJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
+  assert.notEqual(interfaceStaticConstraintJson.code, 0);
+  const interfaceStaticConstraintBody = JSON.parse(interfaceStaticConstraintJson.stdout);
+  assert.equal(interfaceStaticConstraintBody.diagnostics[0].code, "STC002");
+  assert.equal(interfaceStaticConstraintBody.diagnostics[0].actual, value);
+}
+
 const staticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-unsupported-type.0"]).catch((error) => error);
 assert.notEqual(staticUnsupportedTypeJson.code, 0);
 const staticUnsupportedTypeBody = JSON.parse(staticUnsupportedTypeJson.stdout);

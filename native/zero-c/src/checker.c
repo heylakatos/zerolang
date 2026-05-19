@@ -1853,6 +1853,7 @@ static bool check_lvalue_target(CheckContext *ctx, const Program *program, const
 static const char *expr_type(CheckContext *ctx, const Program *program, const Expr *expr, Scope *scope);
 static bool types_compatible(const Program *program, const char *expected, const char *actual);
 static bool validate_type_names(const Program *program, const char *type, const ParamVec *primary, const ParamVec *secondary, bool allow_self, ZDiag *diag, int line, int column);
+static bool static_type_param_name_known_for_type(const Program *program, const ParamVec *primary, const ParamVec *secondary, const char *name, const char *expected_type);
 static const Shape *find_shape_for_type(const Program *program, const char *type);
 static const Choice *find_choice(const Program *program, const char *name);
 static const Param *find_case(const ParamVec *cases, const char *name);
@@ -7808,6 +7809,19 @@ static bool validate_function_error_set(const Function *fun, ZDiag *diag) {
   return true;
 }
 
+static bool validate_static_type_param_decls(const Program *program, const ParamVec *params, ZDiag *diag) {
+  if (!params) return true;
+  for (size_t i = 0; i < params->len; i++) {
+    const Param *param = &params->items[i];
+    if (!param->is_static) continue;
+    if (!validate_type_names(program, param->type, NULL, NULL, false, diag, param->line, param->column)) return false;
+    if (!is_static_value_param_type(program, param->type)) {
+      return set_diag_detail(diag, 3043, "static value parameter type is not supported", param->line, param->column, "integer, Bool, or enum static parameter", param->type ? param->type : "Unknown", "use a concrete integer, Bool, or enum type for this static parameter");
+    }
+  }
+  return true;
+}
+
 static bool validate_type_param_constraints(const Program *program, const Function *fun, ZDiag *diag) {
   if (!fun) return true;
   for (size_t i = 0; i < fun->type_params.len; i++) {
@@ -7825,6 +7839,30 @@ static bool validate_type_param_constraints(const Program *program, const Functi
     if (!interface_constraint_parts(program, param->type, &interface, &args, &arg_len) || !interface) {
       free_type_arg_list(args, arg_len);
       return set_diag_detail(diag, 3038, "unknown interface constraint", param->line, param->column, "declared interface constraint", param->type, "declare the interface or change the generic parameter bound to Type");
+    }
+    for (size_t arg_index = 0; arg_index < arg_len; arg_index++) {
+      const Param *interface_param = &interface->type_params.items[arg_index];
+      if (interface_param->is_static) {
+        const char *static_type = interface_param->type ? interface_param->type : "usize";
+        if (!is_static_value_param_type(program, static_type)) {
+          free_type_arg_list(args, arg_len);
+          return set_diag_detail(diag, 3043, "static value parameter type is not supported", interface_param->line, interface_param->column, "integer, Bool, or enum static parameter", static_type, "use a concrete integer, Bool, or enum type for this static parameter");
+        }
+        char *canonical = canonical_static_arg_for_type(program, args[arg_index], static_type);
+        bool ok = canonical || static_type_param_name_known_for_type(program, &fun->type_params, NULL, args[arg_index], static_type);
+        free(canonical);
+        if (!ok) {
+          char actual[160];
+          snprintf(actual, sizeof(actual), "%s", args[arg_index] ? args[arg_index] : "Unknown");
+          free_type_arg_list(args, arg_len);
+          return set_diag_detail(diag, 3044, "static value argument must be deterministic and concrete", param->line, param->column, static_value_expected_label(program, static_type), actual, "pass an explicit literal, top-level const, or supported meta value with the static parameter type");
+        }
+        continue;
+      }
+      if (!validate_type_names(program, args[arg_index], &fun->type_params, NULL, false, diag, param->line, param->column)) {
+        free_type_arg_list(args, arg_len);
+        return false;
+      }
     }
     free_type_arg_list(args, arg_len);
   }
@@ -7972,17 +8010,19 @@ static bool validate_type_names_inner(const Program *program, const char *type, 
     size_t arg_len = 0;
     bool parsed = type_generic_arg_list(type, name, &args, &arg_len);
     const Shape *shape = find_shape(program, name);
-    if (parsed && shape) {
-      if (arg_len != shape->type_params.len) {
+    const InterfaceDecl *interface = shape ? NULL : find_interface(program, name);
+    const ParamVec *type_params = shape ? &shape->type_params : (interface ? &interface->type_params : NULL);
+    if (parsed && type_params) {
+      if (arg_len != type_params->len) {
         char actual[160];
         snprintf(actual, sizeof(actual), "%zu type argument(s)", arg_len);
         free_type_arg_list(args, arg_len);
         free(name);
-        return set_diag_detail(diag, 3032, "shape type argument count mismatch", line, column, "one argument per shape type parameter", actual, "match the shape declaration's type parameter list");
+        return set_diag_detail(diag, 3032, shape ? "shape type argument count mismatch" : "interface type argument count mismatch", line, column, shape ? "one argument per shape type parameter" : "one argument per interface type parameter", actual, "match the declaration's type parameter list");
       }
       for (size_t i = 0; i < arg_len; i++) {
-        if (shape->type_params.items[i].is_static) {
-          const char *static_type = shape->type_params.items[i].type ? shape->type_params.items[i].type : "usize";
+        if (type_params->items[i].is_static) {
+          const char *static_type = type_params->items[i].type ? type_params->items[i].type : "usize";
           if (!is_static_value_param_type(program, static_type)) {
             free_type_arg_list(args, arg_len);
             free(name);
@@ -8038,12 +8078,14 @@ static bool validate_interface_decl(const Program *program, const InterfaceDecl 
     }
   }
   if (!validate_type_param_names_do_not_shadow(program, &interface->type_params, NULL, diag)) return false;
+  if (!validate_static_type_param_decls(program, &interface->type_params, diag)) return false;
   for (size_t method_index = 0; method_index < interface->methods.len; method_index++) {
     const Function *method = &interface->methods.items[method_index];
     if (method->body.len > 0) {
       return set_diag_detail(diag, 3038, "interface methods cannot have bodies", method->line, method->column, "method signature only", "method body", "move implementation to a concrete shape static method");
     }
     if (!validate_type_param_names_do_not_shadow(program, &method->type_params, &interface->type_params, diag)) return false;
+    if (!validate_static_type_param_decls(program, &method->type_params, diag)) return false;
     if (!validate_type_form(method->return_type, diag, method->line, method->column)) return false;
     if (!validate_type_names(program, method->return_type, &interface->type_params, &method->type_params, true, diag, method->line, method->column)) return false;
     if (!validate_function_error_set(method, diag)) return false;
