@@ -89,7 +89,7 @@ jobs:
       - name: Cross-compile for all targets
         run: |
           mkdir -p /tmp/zero-release
-          node scripts/embed-skill-data.mjs
+          node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/embed-skill-data.mts
 
           build_asset() {
             target="$1"
