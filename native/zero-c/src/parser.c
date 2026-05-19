@@ -10,59 +10,46 @@ typedef struct {
   ZDiag *diag;
 } Parser;
 
-static void push_function(FunctionVec *vec, Function fun) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 8 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Function));
+static void *parser_grow_items(void *items, size_t len, size_t *cap, size_t initial, size_t item_size) {
+  if (len + 1 > *cap) {
+    *cap = z_grow_capacity(*cap, len + 1, initial);
+    return z_checked_reallocarray(items, *cap, item_size);
   }
+  return items;
+}
+
+static void push_function(FunctionVec *vec, Function fun) {
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 8, sizeof(Function));
   vec->items[vec->len++] = fun;
 }
 
 static void push_stmt(StmtVec *vec, Stmt *stmt) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 8 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Stmt *));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 8, sizeof(Stmt *));
   vec->items[vec->len++] = stmt;
 }
 
 static void push_expr(ExprVec *vec, Expr *expr) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Expr *));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(Expr *));
   vec->items[vec->len++] = expr;
 }
 
 static void push_param(ParamVec *vec, Param param) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Param));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(Param));
   vec->items[vec->len++] = param;
 }
 
 static void push_type_arg(TypeArgVec *vec, TypeArg arg) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(TypeArg));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(TypeArg));
   vec->items[vec->len++] = arg;
 }
 
 static void push_shape(ShapeVec *vec, Shape shape) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Shape));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(Shape));
   vec->items[vec->len++] = shape;
 }
 
 static void push_interface(InterfaceVec *vec, InterfaceDecl interface) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(InterfaceDecl));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(InterfaceDecl));
   vec->items[vec->len++] = interface;
 }
 
@@ -71,66 +58,42 @@ static void push_method(FunctionVec *vec, Function fun) {
 }
 
 static void push_enum(EnumVec *vec, EnumDecl item) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(EnumDecl));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(EnumDecl));
   vec->items[vec->len++] = item;
 }
 
 static void push_c_import(CImportVec *vec, CImport item) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(CImport));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(CImport));
   vec->items[vec->len++] = item;
 }
 
 static void push_use_import(UseImportVec *vec, UseImport item) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(UseImport));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(UseImport));
   vec->items[vec->len++] = item;
 }
 
 static void push_choice(ChoiceVec *vec, Choice item) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Choice));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(Choice));
   vec->items[vec->len++] = item;
 }
 
 static void push_const(ConstVec *vec, ConstDecl item) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(ConstDecl));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(ConstDecl));
   vec->items[vec->len++] = item;
 }
 
 static void push_alias(TypeAliasVec *vec, TypeAlias item) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(TypeAlias));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(TypeAlias));
   vec->items[vec->len++] = item;
 }
 
 static void push_field_init(FieldInitVec *vec, FieldInit field) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(FieldInit));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(FieldInit));
   vec->items[vec->len++] = field;
 }
 
 static void push_match_arm(MatchArmVec *vec, MatchArm arm) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(MatchArm));
-  }
+  vec->items = parser_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(MatchArm));
   vec->items[vec->len++] = arm;
 }
 
