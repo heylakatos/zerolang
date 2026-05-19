@@ -8,8 +8,10 @@ BUILD_ID := $(HOST_ID)|$(CC)|$(CFLAGS)
 SRC := $(wildcard src/*.c)
 TEST_LEXER := $(ROOT)/.zero/bin/test_lexer
 TEST_LEXER_DEPS := src/lexer.c src/fs.c src/target.c
+TEST_PARSER := $(ROOT)/.zero/bin/test_parser
+TEST_PARSER_DEPS := src/lexer.c src/parser.c src/fs.c src/target.c
 
-.PHONY: all clean install-local test test-lexer FORCE
+.PHONY: all clean install-local test test-lexer test-parser FORCE
 
 all: $(OUT)
 
@@ -27,7 +29,7 @@ $(OUT): $(BUILD_STAMP) $(SRC) include/zero.h
 	$(CC) $(CFLAGS) -Iinclude $(SRC) -o $(OUT)
 
 clean:
-	rm -f $(OUT) $(BUILD_STAMP) $(TEST_LEXER)
+	rm -f $(OUT) $(BUILD_STAMP) $(TEST_LEXER) $(TEST_PARSER)
 
 install-local: $(OUT)
 	@printf 'installed %s\n' "$(OUT)"
@@ -39,4 +41,11 @@ $(TEST_LEXER): tests/test_lexer.c tests/test_framework.h $(TEST_LEXER_DEPS) incl
 test-lexer: $(TEST_LEXER)
 	$(TEST_LEXER)
 
-test: test-lexer
+$(TEST_PARSER): tests/test_parser.c tests/test_framework.h $(TEST_PARSER_DEPS) include/zero.h
+	@mkdir -p $(dir $(TEST_PARSER))
+	$(CC) $(CFLAGS) -Iinclude -Itests tests/test_parser.c $(TEST_PARSER_DEPS) -o $(TEST_PARSER)
+
+test-parser: $(TEST_PARSER)
+	$(TEST_PARSER)
+
+test: test-lexer test-parser
