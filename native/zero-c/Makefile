@@ -7,6 +7,8 @@ HOST_ID := $(shell uname -s 2>/dev/null || echo unknown)-$(shell uname -m 2>/dev
 BUILD_ID := $(HOST_ID)|$(CC)|$(CFLAGS)
 SRC := $(wildcard src/*.c)
 INCLUDES := $(wildcard include/*.h) $(wildcard src/*.inc)
+EMBEDDED_SKILLS := src/embedded_skills.inc
+SKILL_INPUTS := $(ROOT)/skills/zero/SKILL.md $(wildcard $(ROOT)/skill-data/*.md)
 
 .PHONY: all clean install-local FORCE
 
@@ -19,7 +21,10 @@ $(BUILD_STAMP): FORCE
 		printf '%s\n' "$(BUILD_ID)" > $(BUILD_STAMP); \
 	fi
 
-$(OUT): $(BUILD_STAMP) $(SRC) $(INCLUDES)
+$(EMBEDDED_SKILLS): $(ROOT)/scripts/embed-skill-data.mjs $(SKILL_INPUTS)
+	cd $(ROOT) && node scripts/embed-skill-data.mjs
+
+$(OUT): $(BUILD_STAMP) $(SRC) $(INCLUDES) $(EMBEDDED_SKILLS)
 	@mkdir -p $(dir $(OUT))
 	$(CC) $(CFLAGS) -Iinclude $(SRC) -o $(OUT)
 

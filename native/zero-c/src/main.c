@@ -24,6 +24,7 @@
 #define ZERO_VERSION "0.1.2"
 
 #include "embedded_runtime_sources.inc"
+#include "embedded_skills.inc"
 
 typedef enum {
   EMIT_C,
@@ -73,6 +74,8 @@ typedef struct {
   long long size_bytes;
   long long sbom_bytes;
 } ShipArtifacts;
+
+static void print_command_help(const char *command);
 
 static const char *diag_code(int code) {
   switch (code) {
@@ -194,6 +197,177 @@ static void print_json_string(const char *value) {
   append_json_string(&buf, value);
   fputs(buf.data, stdout);
   zbuf_free(&buf);
+}
+
+static const ZeroEmbeddedSkill *find_embedded_skill(const char *name) {
+  for (size_t i = 0; i < zero_embedded_skill_count; i++) {
+    if (strcmp(zero_embedded_skills[i].name, name) == 0) return &zero_embedded_skills[i];
+  }
+  return NULL;
+}
+
+static void append_embedded_skill_content(ZBuf *buf, const ZeroEmbeddedSkill *skill) {
+  if (!skill || !skill->content) return;
+  for (size_t i = 0; skill->content[i]; i++) {
+    zbuf_append(buf, skill->content[i]);
+  }
+}
+
+static void print_embedded_skill_content(const ZeroEmbeddedSkill *skill) {
+  if (!skill || !skill->content) return;
+  for (size_t i = 0; skill->content[i]; i++) {
+    fputs(skill->content[i], stdout);
+  }
+}
+
+static int embedded_skills_error(bool json, const char *message) {
+  if (json) {
+    ZBuf buf;
+    zbuf_init(&buf);
+    zbuf_append(&buf, "{\"success\":false,\"error\":");
+    append_json_string(&buf, message);
+    zbuf_append(&buf, "}\n");
+    fputs(buf.data, stdout);
+    zbuf_free(&buf);
+  } else {
+    fprintf(stderr, "error: %s\n", message);
+  }
+  return 1;
+}
+
+static int embedded_skills_list_command(bool json) {
+  if (json) {
+    ZBuf buf;
+    zbuf_init(&buf);
+    zbuf_append(&buf, "{\"success\":true,\"data\":[");
+    bool first = true;
+    for (size_t i = 0; i < zero_embedded_skill_count; i++) {
+      const ZeroEmbeddedSkill *skill = &zero_embedded_skills[i];
+      if (skill->hidden) continue;
+      if (!first) zbuf_append(&buf, ",");
+      first = false;
+      zbuf_append(&buf, "{\"name\":");
+      append_json_string(&buf, skill->name);
+      zbuf_append(&buf, ",\"description\":");
+      append_json_string(&buf, skill->description);
+      zbuf_append(&buf, "}");
+    }
+    zbuf_append(&buf, "]}\n");
+    fputs(buf.data, stdout);
+    zbuf_free(&buf);
+    return 0;
+  }
+
+  size_t max_name = 0;
+  for (size_t i = 0; i < zero_embedded_skill_count; i++) {
+    const ZeroEmbeddedSkill *skill = &zero_embedded_skills[i];
+    if (!skill->hidden && strlen(skill->name) > max_name) max_name = strlen(skill->name);
+  }
+  if (max_name == 0) {
+    printf("No skills found\n");
+    return 0;
+  }
+  for (size_t i = 0; i < zero_embedded_skill_count; i++) {
+    const ZeroEmbeddedSkill *skill = &zero_embedded_skills[i];
+    if (skill->hidden) continue;
+    printf("  %-*s  %s\n", (int)max_name, skill->name, skill->description);
+  }
+  return 0;
+}
+
+static int embedded_skills_get_command(int argc, char **argv, int subcommand_index, bool json) {
+  bool get_all = false;
+  const ZeroEmbeddedSkill *targets[64];
+  size_t target_count = 0;
+
+  for (int i = subcommand_index + 1; i < argc; i++) {
+    const char *arg = argv[i];
+    if (strcmp(arg, "--all") == 0) {
+      get_all = true;
+      continue;
+    }
+    if (strcmp(arg, "--full") == 0 || strcmp(arg, "--json") == 0) continue;
+    if (arg[0] == '-') {
+      char message[160];
+      snprintf(message, sizeof(message), "Unknown skills flag: %s", arg);
+      return embedded_skills_error(json, message);
+    }
+    const ZeroEmbeddedSkill *skill = find_embedded_skill(arg);
+    if (!skill) {
+      char message[160];
+      snprintf(message, sizeof(message), "Skill not found: %s", arg);
+      return embedded_skills_error(json, message);
+    }
+    if (target_count < sizeof(targets) / sizeof(targets[0])) targets[target_count++] = skill;
+  }
+
+  if (get_all) {
+    target_count = 0;
+    for (size_t i = 0; i < zero_embedded_skill_count && target_count < sizeof(targets) / sizeof(targets[0]); i++) {
+      if (!zero_embedded_skills[i].hidden) targets[target_count++] = &zero_embedded_skills[i];
+    }
+  }
+
+  if (target_count == 0) {
+    return embedded_skills_error(json, "No skill name provided. Usage: zero skills get <name>");
+  }
+
+  if (json) {
+    ZBuf buf;
+    zbuf_init(&buf);
+    zbuf_append(&buf, "{\"success\":true,\"data\":[");
+    for (size_t i = 0; i < target_count; i++) {
+      if (i > 0) zbuf_append(&buf, ",");
+      zbuf_append(&buf, "{\"name\":");
+      append_json_string(&buf, targets[i]->name);
+      zbuf_append(&buf, ",\"content\":");
+      ZBuf content;
+      zbuf_init(&content);
+      append_embedded_skill_content(&content, targets[i]);
+      append_json_string(&buf, content.data ? content.data : "");
+      zbuf_free(&content);
+      zbuf_append(&buf, "}");
+    }
+    zbuf_append(&buf, "]}\n");
+    fputs(buf.data, stdout);
+    zbuf_free(&buf);
+    return 0;
+  }
+
+  for (size_t i = 0; i < target_count; i++) {
+    if (i > 0) printf("\n---\n\n");
+    print_embedded_skill_content(targets[i]);
+  }
+  return 0;
+}
+
+static int embedded_skills_command(int argc, char **argv, bool json) {
+  int subcommand_index = -1;
+  const char *subcommand = "list";
+  for (int i = 2; i < argc; i++) {
+    const char *arg = argv[i];
+    if (strcmp(arg, "--json") == 0 || strcmp(arg, "--all") == 0 || strcmp(arg, "--full") == 0) continue;
+    if (arg[0] == '-') {
+      char message[160];
+      snprintf(message, sizeof(message), "Unknown skills flag: %s", arg);
+      return embedded_skills_error(json, message);
+    }
+    if (subcommand_index < 0) {
+      subcommand = arg;
+      subcommand_index = i;
+    }
+  }
+
+  if (strcmp(subcommand, "help") == 0) {
+    print_command_help("skills");
+    return 0;
+  }
+  if (strcmp(subcommand, "list") == 0) return embedded_skills_list_command(json);
+  if (strcmp(subcommand, "get") == 0) return embedded_skills_get_command(argc, argv, subcommand_index >= 0 ? subcommand_index : 1, json);
+
+  char message[160];
+  snprintf(message, sizeof(message), "Unknown skills subcommand: %s", subcommand);
+  return embedded_skills_error(json, message);
 }
 
 static const char *token_kind_name(TokenKind kind) {
@@ -3166,7 +3340,7 @@ static void print_help(void) {
   printf("zero %s native bootstrap\n\n", ZERO_VERSION);
   printf("Usage:\n");
   printf("  zero --version [--json]\n");
-  printf("  zero skills [list|get|path] [--json]\n");
+  printf("  zero skills [list|get] [--json]\n");
   printf("  zero new cli|lib|package <name>\n");
   printf("  zero check <file.0|project|zero.json>\n");
   printf("  zero test <file.0|project|zero.json>\n");
@@ -3207,15 +3381,12 @@ static void print_command_help(const char *command) {
     printf("  zero new lib math-kit\n");
     printf("  zero new package demo\n");
   } else if (strcmp(command, "skills") == 0) {
-    printf("Usage: zero skills [list|get|path] [--json]\n\n");
-    printf("List and retrieve bundled skill content for agents.\n\n");
+    printf("Usage: zero skills [list|get] [--json]\n\n");
+    printf("List and retrieve version-matched skill content for agents.\n\n");
     printf("Subcommands:\n");
     printf("  list                 list available skills (default)\n");
-    printf("  get <name> [--full]  print a skill and optional references/templates\n");
+    printf("  get <name> [--full]  print bundled skill content\n");
     printf("  get --all            print every visible skill\n");
-    printf("  path [name]          print skill directory paths\n\n");
-    printf("Environment:\n");
-    printf("  ZERO_SKILLS_DIR      override the bundled skills directory\n");
   } else if (strcmp(command, "doctor") == 0) {
     printf("Usage: zero doctor [--json]\n\n");
     printf("Check host, compiler, target toolchain, and docs/example readiness.\n");
@@ -3386,8 +3557,6 @@ static bool parse_command(int argc, char **argv, Command *command) {
       else if (strcmp(argv[i], "--all") == 0) command->all = true;
       else if (strcmp(argv[i], "--full") == 0) {
         continue;
-      } else if (strncmp(argv[i], "--", 2) == 0) {
-        command->unknown_flag = argv[i];
       } else if (!command->kind) {
         command->kind = argv[i];
       } else if (!command->input) {
@@ -5453,44 +5622,36 @@ static char *format_source_minimal(const char *source) {
 }
 
 static int print_version_command(bool json) {
+  if (!json) {
+    printf("zero %s\n", ZERO_VERSION);
+    return 0;
+  }
+
   const char *zero_cc = getenv("ZERO_CC");
   bool target_cc_override = zero_cc && zero_cc[0];
   bool bundled_target_cc_available = command_available("zig");
   bool target_cc_available = target_cc_override || bundled_target_cc_available;
   char *target_cc_version = target_cc_override ? z_strdup("configured via ZERO_CC") : (bundled_target_cc_available ? command_first_line("zig version 2>/dev/null") : z_strdup(""));
-  if (json) {
-    ZBuf buf;
-    zbuf_init(&buf);
-    zbuf_append(&buf, "{\n  \"schemaVersion\": 1,\n  \"version\": ");
-    append_json_string(&buf, ZERO_VERSION);
-    zbuf_append(&buf, ",\n  \"commit\": ");
-    append_json_string(&buf, zero_commit());
-    zbuf_append(&buf, ",\n  \"host\": ");
-    append_json_string(&buf, z_host_target());
-    zbuf_append(&buf, ",\n  \"backend\": \"zero-c\",\n  \"targets\": ");
-    z_append_target_names_json(&buf);
-    zbuf_append(&buf, ",\n  \"targetCompiler\": {\"available\": ");
-    zbuf_append(&buf, target_cc_available ? "true" : "false");
-    zbuf_append(&buf, ", \"kind\": \"target-capable C compiler\", \"version\": ");
-    append_json_string(&buf, target_cc_version);
-    zbuf_append(&buf, "},\n  \"crossCompilation\": {\"ready\": ");
-    zbuf_append(&buf, target_cc_available ? "true" : "false");
-    zbuf_append(&buf, "}\n}\n");
-    fputs(buf.data, stdout);
-    zbuf_free(&buf);
-  } else {
-    printf("zero %s\n", ZERO_VERSION);
-    printf("commit: %s\n", zero_commit());
-    printf("host: %s\n", z_host_target());
-    printf("backend: zero-c\n");
-    printf("targets: ");
-    ZBuf target_names;
-    zbuf_init(&target_names);
-    z_append_target_names_json(&target_names);
-    printf("%s\n", target_names.data);
-    zbuf_free(&target_names);
-    printf("target compiler: %s%s%s\n", target_cc_available ? "available" : "missing", target_cc_available && target_cc_version[0] ? " " : "", target_cc_available ? target_cc_version : "");
-  }
+
+  ZBuf buf;
+  zbuf_init(&buf);
+  zbuf_append(&buf, "{\n  \"schemaVersion\": 1,\n  \"version\": ");
+  append_json_string(&buf, ZERO_VERSION);
+  zbuf_append(&buf, ",\n  \"commit\": ");
+  append_json_string(&buf, zero_commit());
+  zbuf_append(&buf, ",\n  \"host\": ");
+  append_json_string(&buf, z_host_target());
+  zbuf_append(&buf, ",\n  \"backend\": \"zero-c\",\n  \"targets\": ");
+  z_append_target_names_json(&buf);
+  zbuf_append(&buf, ",\n  \"targetCompiler\": {\"available\": ");
+  zbuf_append(&buf, target_cc_available ? "true" : "false");
+  zbuf_append(&buf, ", \"kind\": \"target-capable C compiler\", \"version\": ");
+  append_json_string(&buf, target_cc_version);
+  zbuf_append(&buf, "},\n  \"crossCompilation\": {\"ready\": ");
+  zbuf_append(&buf, target_cc_available ? "true" : "false");
+  zbuf_append(&buf, "}\n}\n");
+  fputs(buf.data, stdout);
+  zbuf_free(&buf);
   free(target_cc_version);
   return 0;
 }
@@ -9059,12 +9220,7 @@ int main(int argc, char **argv) {
     return clean_command(&command);
   }
   if (strcmp(command.command, "skills") == 0) {
-    if (command.json) {
-      printf("{\"success\":false,\"error\":\"zero skills is served by the bin/zero wrapper; run bin/zero skills from the checkout\"}\n");
-    } else {
-      fprintf(stderr, "zero skills is served by the bin/zero wrapper; run `bin/zero skills` from the checkout.\n");
-    }
-    return 1;
+    return embedded_skills_command(argc, argv, command.json);
   }
   if (!command.input) {
     print_command_help(command.command);
@@ -9287,6 +9443,16 @@ int main(int argc, char **argv) {
     z_free_tokens(&tokens);
     z_free_source(&parse_input);
     return 0;
+  }
+
+  if (strcmp(command.command, "dev") == 0 && target_name_is(target, "wasm32-web")) {
+    char *web_dev = NULL;
+    if (z_discover_web_dev_plan_json(command.input, &web_dev, &diag)) {
+      fputs(web_dev, stdout);
+      free(web_dev);
+      return 0;
+    }
+    diag = (ZDiag){0};
   }
 
   SourceInput input = {0};

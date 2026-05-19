@@ -116,11 +116,10 @@ name. A test marked this way must fail; an unexpected pass fails the command.
 zero skills list
 zero skills get zero
 zero skills get zero --full
-zero skills path zero
 ```
 
-Add `--json` for automation. Set `ZERO_SKILLS_DIR` to point the command at an
-alternate skill directory.
+Add `--json` for automation. Skill content is bundled with the compiler so
+agents can load the workflow that matches the Zero binary they are using.
 
 ## Language Server Smoke
 

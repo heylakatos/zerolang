@@ -34,7 +34,8 @@ where they will run.
 ## Development
 
 - Build the local compiler with `make -C native/zero-c`.
-- Use `bin/zero` for focused checks.
+- Use `bin/zero` for focused checks; it execs the local native compiler at
+  `.zero/bin/zero`.
 - Keep examples runnable and docs copyable.
 - Prefer small, direct changes over broad refactors.
 - Use direct emitters for compiler output.

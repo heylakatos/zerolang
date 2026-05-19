@@ -814,6 +814,7 @@ bool z_emit_coff_x64_object_from_ir(const IrProgram *program, ZBuf *out, ZDiag *
 bool z_emit_coff_x64_exe_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 
 bool z_discover_routes_json(const char *input, char **json, ZDiag *diag);
+bool z_discover_web_dev_plan_json(const char *input, char **json, ZDiag *diag);
 const char *z_host_target(void);
 size_t z_target_count(void);
 const ZTargetInfo *z_target_at(size_t index);

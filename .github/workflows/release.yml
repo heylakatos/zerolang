@@ -89,6 +89,7 @@ jobs:
       - name: Cross-compile for all targets
         run: |
           mkdir -p /tmp/zero-release
+          node scripts/embed-skill-data.mjs
 
           build_asset() {
             target="$1"
@@ -131,8 +132,14 @@ jobs:
 
           if [ "$(uname -s)" = "Darwin" ]; then
             case "$(uname -m)" in
-              arm64) ./zero-darwin-arm64 --version ;;
-              x86_64) ./zero-darwin-x64 --version ;;
+              arm64)
+                ./zero-darwin-arm64 --version
+                ./zero-darwin-arm64 skills list --json
+                ;;
+              x86_64)
+                ./zero-darwin-x64 --version
+                ./zero-darwin-x64 skills list --json
+                ;;
               *) echo "Skipping host binary smoke for unsupported macOS arch $(uname -m)" ;;
             esac
           fi

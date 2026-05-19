@@ -209,6 +209,8 @@ function assertReleaseTargetContract(report, expected) {
 
 const generatedCBytesBeforeReadOnlyCommands = json(["size", "--json", "examples/memory-package"]).body.generatedCBytes;
 
+assert.equal(zero(["--version"]).stdout, "zero 0.1.2\n");
+
 const version = json(["--version", "--json"]).body;
 assert.equal(version.schemaVersion, 1);
 assert.equal(version.version, "0.1.2");
@@ -286,17 +288,25 @@ const diagnosticSkill = json(["skills", "get", "zero-diagnostics", "--json"]).bo
 assert.equal(diagnosticSkill.success, true);
 assert.match(diagnosticSkill.data[0].content, /fixSafety/);
 
-const skillsPath = json(["skills", "path", "zero", "--json"]).body;
-assert.equal(skillsPath.success, true);
-assert.match(skillsPath.data.path, /skills\/zero$/);
-
-const languagePath = json(["skills", "path", "zero-language", "--json"]).body;
-assert.equal(languagePath.success, true);
-assert.match(languagePath.data.path, /skill-data\/zero-language\.md$/);
-
 const missingSkill = zero(["skills", "get", "missing", "--json"], { allowFailure: true });
 assert.notEqual(missingSkill.code, 0);
 assert.equal(JSON.parse(missingSkill.stdout).success, false);
+
+const removedSkillsPath = zero(["skills", "path", "zero", "--json"], { allowFailure: true });
+assert.notEqual(removedSkillsPath.code, 0);
+assert.match(JSON.parse(removedSkillsPath.stdout).error, /Unknown skills subcommand: path/);
+
+const badSkillsFlag = zero(["skills", "-x"], { allowFailure: true });
+assert.notEqual(badSkillsFlag.code, 0);
+assert.match(badSkillsFlag.stderr, /Unknown skills flag: -x/);
+
+const badSkillsListFlag = zero(["skills", "list", "--unknown", "--json"], { allowFailure: true });
+assert.notEqual(badSkillsListFlag.code, 0);
+assert.match(JSON.parse(badSkillsListFlag.stdout).error, /Unknown skills flag: --unknown/);
+
+const badSkillsGetFlag = zero(["skills", "get", "zero-language", "--unknown", "--json"], { allowFailure: true });
+assert.notEqual(badSkillsGetFlag.code, 0);
+assert.match(JSON.parse(badSkillsGetFlag.stdout).error, /Unknown skills flag: --unknown/);
 
 const lexerTokens = json(["tokens", "--json", "conformance/lexer/compiler-smoke.0"]).body;
 assert.equal(lexerTokens.schemaVersion, 1);
@@ -1134,14 +1144,13 @@ const compilerZeroStage0Bytes = readFileSync(`${compilerZeroStage0Path}.wasm`);
 assert.equal(compilerZeroStage0Report.emit, "wasm");
 assert.equal(compilerZeroStage0Report.target, "wasm32-web");
 assert.equal(compilerZeroStage0Report.generatedCBytes, 0);
-assert.equal(compilerZeroStage0Report.productCliHandoff, true);
 assert.equal(compilerZeroStage0Report.objectBackend.directFacts.moduleCount, 10);
 assert.equal(compilerZeroStage0Report.objectBackend.directFacts.bufferHelperCount, 3);
 assert.equal(compilerZeroStage0Report.selfHostRouting.subsetCompatible, true);
-assert.equal(compilerZeroStage0Report.selfHostRouting.mode, "self-hosted-cli");
-assert.equal(compilerZeroStage0Report.selfHostRouting.phases.parse, "compiler-zero-wasm");
-assert.equal(compilerZeroStage0Report.selfHostRouting.phases.emit, "compiler-zero-wasm");
-assert.equal(compilerZeroStage0Report.selfHostRouting.phases.selfHostCompilerRole, "product-cli");
+assert.equal(compilerZeroStage0Report.selfHostRouting.mode, "seed");
+assert.equal(compilerZeroStage0Report.selfHostRouting.phases.parse, "zero-c");
+assert.equal(compilerZeroStage0Report.selfHostRouting.phases.emit, "zero-c-direct-wasm");
+assert.equal(compilerZeroStage0Report.selfHostRouting.phases.selfHostCompilerRole, "seed-artifact");
 assert.equal(compilerZeroStage0Report.selfHostRouting.frontend.selected, true);
 assert.equal(compilerZeroStage0Report.selfHostRouting.wasmEmitter.selected, true);
 assert.equal(compilerZeroStage0Report.selfHostRouting.cBridge.required, false);
@@ -1197,13 +1206,10 @@ assert.equal(compilerZeroStage0Instance.exports.compiler_self_host_command_respo
 assert.equal(compilerZeroStage0Instance.exports.compiler_self_host_command_response(3, 52680001, 1821673, 1836278016), 4030001);
 assert.equal(compilerZeroStage0Instance.exports.compiler_self_host_command_response(4, 52680001, 1821673, 1836278016), 4040008);
 const compilerDriverCheck = json(["check", "--json", "--target", "wasm32-web", "examples/hello.0"]).body;
-assert.equal(compilerDriverCheck.productCliHandoff, true);
-assert.equal(compilerDriverCheck.selfHostRouting.mode, "self-hosted-driver");
-assert.equal(compilerDriverCheck.selfHostRouting.phases.check, "compiler-zero-wasm");
-assert.equal(compilerDriverCheck.selfHostRouting.nativeFallback.used, false);
-assert.equal(compilerDriverCheck.selfHostDriver.owner, "compiler-zero");
-assert.equal(compilerDriverCheck.selfHostDriver.input, "examples/hello.0");
-assert.equal(compilerDriverCheck.selfHostDriver.commandResponse, 4010001);
+assert.equal(compilerDriverCheck.selfHostRouting.mode, "seed");
+assert.equal(compilerDriverCheck.selfHostRouting.phases.check, "zero-c");
+assert.equal(compilerDriverCheck.selfHostRouting.frontend.selected, true);
+assert.equal(compilerDriverCheck.selfHostRouting.wasmEmitter.selected, false);
 assert.equal(compilerDriverCheck.targetReadiness.ok, false);
 assert.equal(compilerDriverCheck.targetReadiness.languageOk, true);
 assert.equal(compilerDriverCheck.targetReadiness.buildable, false);
@@ -1212,18 +1218,17 @@ assert.equal(compilerDriverCheck.targetReadiness.emit, "exe");
 assert.equal(compilerDriverCheck.targetReadiness.diagnostics[0].code, "CGEN004");
 assert.equal(compilerDriverCheck.targetReadiness.diagnostics[0].backendBlocker.stage, "select");
 const defaultTargetCheck = json(["check", "--json", "examples/hello.0"]).body;
-assert.equal(defaultTargetCheck.productCliHandoff, undefined);
 assert.equal(defaultTargetCheck.targetReadiness.target, version.host);
 const compilerDriverBuildPath = join(outDir, "compiler-driver-hello");
 rmSync(`${compilerDriverBuildPath}.wasm`, { force: true });
 const compilerDriverBuild = json(["build", "--json", "--emit", "wasm", "--target", "wasm32-web", "examples/hello.0", "--out", compilerDriverBuildPath]).body;
 const compilerDriverBuildBytes = readFileSync(`${compilerDriverBuildPath}.wasm`);
-assert.equal(compilerDriverBuild.selfHostRouting.mode, "self-hosted-driver");
-assert.equal(compilerDriverBuild.selfHostRouting.phases.emit, "compiler-zero-wasm");
-assert.equal(compilerDriverBuild.selfHostRouting.nativeFallback.used, false);
-assert.equal(compilerDriverBuild.selfHostDriver.commandResponse, 4020008);
+assert.equal(compilerDriverBuild.selfHostRouting.mode, "seed");
+assert.equal(compilerDriverBuild.selfHostRouting.phases.emit, "zero-c-direct-wasm");
+assert.equal(compilerDriverBuild.selfHostRouting.frontend.selected, true);
+assert.equal(compilerDriverBuild.selfHostRouting.wasmEmitter.selected, true);
 assert.equal(compilerDriverBuild.generatedCBytes, 0);
-assert.equal(compilerDriverBuild.cBridgeFallback, false);
+assert.equal(compilerDriverBuild.selfHostRouting.cBridge.required, false);
 assert.equal(compilerDriverBuild.artifactBytes, 157);
 assert.equal(compilerDriverBuildBytes[0], 0);
 assert.equal(compilerDriverBuildBytes[1], 0x61);
@@ -1553,6 +1558,8 @@ assert.equal(webDevPlan.localRuntime.runtimeKind, "browser-worker");
 assert.equal(webDevPlan.localRuntime.productionLikeImports, true);
 assert.equal(webDevPlan.localRuntime.providerSpecificDeployment, false);
 assert.equal(webDevPlan.localRuntime.capabilityRestrictions.filesystem, "denied");
+assert.equal(webDevPlan.watch.manifest, "examples/web/hello/zero.json");
+assert.equal(webDevPlan.watch.files.some((file) => file === "examples/web/hello/src/routes/index.0"), true);
 
 const diagnostics = [
   ["PAR100", ["check", "--json", "conformance/check/fail/parse-missing-brace.0"]],
