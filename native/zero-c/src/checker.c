@@ -2666,10 +2666,8 @@ static bool generic_binding_is_self_alias(const GenericBinding *binding) {
   return binding && binding->name && binding->type && strcmp(binding->name, binding->type) == 0;
 }
 
-static void type_core_substitution_scope(const Program *program, GenericBinding *bindings, size_t binding_len, ZTypeBinderDecl *decls, ZTypeBinderScope *scope) {
-  if (scope) *scope = (ZTypeBinderScope){0};
-  if (!decls || !scope) return;
-  size_t len = 0;
+static size_t append_type_core_substitution_binders(GenericBinding *bindings, size_t binding_len, ZTypeBinderDecl *decls, size_t len) {
+  if (!decls) return len;
   for (size_t i = 0; i < binding_len; i++) {
     if (!bindings || !bindings[i].name) continue;
     decls[len++] = (ZTypeBinderDecl){
@@ -2679,11 +2677,27 @@ static void type_core_substitution_scope(const Program *program, GenericBinding 
       .static_type = bindings[i].is_static ? static_type_or_usize(bindings[i].static_type) : NULL,
     };
   }
+  return len;
+}
+
+static void type_core_substitution_source_scope(const Program *program, GenericBinding *bindings, size_t binding_len, ZTypeBinderDecl *decls, ZTypeBinderScope *scope) {
+  if (scope) *scope = (ZTypeBinderScope){0};
+  if (!decls || !scope) return;
+  size_t len = append_type_core_substitution_binders(bindings, binding_len, decls, 0);
   len = append_type_core_static_const_binders(program, NULL, decls, len, (ZTypeBinderId)(binding_len + 1), false);
   *scope = (ZTypeBinderScope){.items = decls, .len = len, .arg_kind = type_core_generic_arg_kind_for_program, .arg_kind_context = program};
 }
 
-static bool seed_type_core_substitution_bindings(ZTypeArena *arena, const ZTypeBinderScope *scope, GenericBinding *bindings, size_t binding_len, ZUnifyTrace *trace) {
+static void type_core_substitution_binding_scope(const Program *program, GenericBinding *bindings, size_t binding_len, ZTypeBinderDecl *decls, ZTypeBinderScope *scope) {
+  if (scope) *scope = (ZTypeBinderScope){0};
+  if (!decls || !scope) return;
+  size_t len = append_type_core_substitution_binders(bindings, binding_len, decls, 0);
+  // Binding values come from the caller context; importing top-level const binders here
+  // would collapse open static args that intentionally shadow const names.
+  *scope = (ZTypeBinderScope){.items = decls, .len = len, .arg_kind = type_core_generic_arg_kind_for_program, .arg_kind_context = program};
+}
+
+static bool seed_type_core_substitution_bindings(ZTypeArena *arena, const ZTypeBinderScope *binding_scope, GenericBinding *bindings, size_t binding_len, ZUnifyTrace *trace) {
   if (!arena || !trace) return false;
   for (size_t i = 0; i < binding_len; i++) {
     if (!bindings || !bindings[i].name || !bindings[i].type || generic_binding_is_self_alias(&bindings[i])) continue;
@@ -2694,8 +2708,8 @@ static bool seed_type_core_substitution_bindings(ZTypeArena *arena, const ZTypeB
     binding->name = z_strdup(bindings[i].name);
     ZTypeParseError error = {0};
     if (bindings[i].is_static) {
-      if (!z_static_value_parse_with_binders(bindings[i].type, scope, &binding->static_value, &error)) return false;
-    } else if (!z_type_parse_with_binders(arena, bindings[i].type, scope, &binding->type, &error)) {
+      if (!z_static_value_parse_with_binders(bindings[i].type, binding_scope, &binding->static_value, &error)) return false;
+    } else if (!z_type_parse_with_binders(arena, bindings[i].type, binding_scope, &binding->type, &error)) {
       return false;
     }
   }
@@ -2706,8 +2720,11 @@ static char *type_substitute_generic_signature(const Program *program, const cha
   if (!type) return z_strdup("Unknown");
   size_t max_binders = binding_len + type_core_static_const_binder_count(program);
   ZTypeBinderDecl *decls = z_checked_calloc(max_binders ? max_binders : 1, sizeof(ZTypeBinderDecl));
-  ZTypeBinderScope scope = {0};
-  type_core_substitution_scope(program, bindings, binding_len, decls, &scope);
+  ZTypeBinderDecl *binding_decls = z_checked_calloc(binding_len ? binding_len : 1, sizeof(ZTypeBinderDecl));
+  ZTypeBinderScope source_scope = {0};
+  ZTypeBinderScope binding_scope = {0};
+  type_core_substitution_source_scope(program, bindings, binding_len, decls, &source_scope);
+  type_core_substitution_binding_scope(program, bindings, binding_len, binding_decls, &binding_scope);
 
   ZTypeArena arena;
   z_type_arena_init(&arena);
@@ -2717,13 +2734,14 @@ static char *type_substitute_generic_signature(const Program *program, const cha
   ZTypeId source = Z_TYPE_ID_INVALID;
   ZTypeId substituted = Z_TYPE_ID_INVALID;
   char *result = NULL;
-  bool ok = seed_type_core_static_const_bindings(program, &scope, (ZTypeBinderId)(binding_len + 1), &trace) &&
-            seed_type_core_substitution_bindings(&arena, &scope, bindings, binding_len, &trace) &&
-            z_type_parse_with_binders(&arena, type, &scope, &source, &error) &&
+  bool ok = seed_type_core_static_const_bindings(program, &source_scope, (ZTypeBinderId)(binding_len + 1), &trace) &&
+            seed_type_core_substitution_bindings(&arena, &binding_scope, bindings, binding_len, &trace) &&
+            z_type_parse_with_binders(&arena, type, &source_scope, &source, &error) &&
             z_type_substitute(&arena, source, &trace, &substituted);
   if (ok) result = z_type_format(&arena, substituted);
   z_unify_trace_free(&trace);
   z_type_arena_free(&arena);
+  free(binding_decls);
   free(decls);
   return result ? result : z_strdup("Unknown");
 }
