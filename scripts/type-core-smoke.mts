@@ -405,6 +405,34 @@ static void expect_failed_unify_rolls_back_trace(void) {
   z_type_arena_free(&arena);
 }
 
+static void expect_failed_substitute_rolls_back_arena(void) {
+  ZTypeArena arena;
+  z_type_arena_init(&arena);
+  ZTypeBinderDecl decls[] = {
+    {.name = "T", .kind = Z_TYPE_BINDER_TYPE, .id = 80},
+  };
+  ZTypeBinderScope scope = {.items = decls, .len = 1};
+  ZTypeId source = parse_with_binders_or_die(&arena, "Tuple<i32,T,u8>", &scope);
+  ZTypeId recursive = parse_with_binders_or_die(&arena, "T", &scope);
+  size_t before = arena.len;
+
+  ZUnifyTrace trace;
+  z_unify_trace_init(&trace);
+  trace.items = calloc(1, sizeof(ZUnifyBinding));
+  expect(trace.items != NULL, "failed to allocate regression trace");
+  trace.len = 1;
+  trace.cap = 1;
+  trace.items[0] = (ZUnifyBinding){.binder = 80, .kind = Z_UNIFY_BINDING_TYPE, .type = recursive};
+
+  ZTypeId substituted = Z_TYPE_ID_INVALID;
+  expect(!z_type_substitute(&arena, source, &trace, &substituted), "recursive substitution unexpectedly succeeded");
+  expect(substituted == Z_TYPE_ID_INVALID, "failed substitution returned a type id");
+  expect(arena.len == before, "failed substitution did not roll back arena");
+
+  z_unify_trace_free(&trace);
+  z_type_arena_free(&arena);
+}
+
 int main(void) {
   expect_roundtrip("i32", "i32");
   expect_roundtrip("const i32", "const i32");
@@ -446,6 +474,7 @@ int main(void) {
   expect_concrete_first_static_substitution();
   expect_static_binder_types_are_checked();
   expect_failed_unify_rolls_back_trace();
+  expect_failed_substitute_rolls_back_arena();
 
   expect_invalid_type("");
   expect_invalid_type("Span<");

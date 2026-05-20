@@ -323,6 +323,7 @@ static bool type_substitute_inner(ZTypeArena *arena, ZTypeId source, const ZUnif
   if (kind == Z_TYPE_NODE_APPLY) {
     size_t arg_len = z_type_apply_arg_len(arena, source);
     ZTypeArg *args = arg_len ? unify_reallocarray(NULL, arg_len, sizeof(ZTypeArg)) : NULL;
+    if (args) memset(args, 0, arg_len * sizeof(ZTypeArg));
     bool ok = true;
     for (size_t i = 0; i < arg_len && ok; i++) {
       const ZTypeArg *arg = z_type_apply_arg(arena, source, i);
@@ -344,7 +345,15 @@ static bool type_substitute_inner(ZTypeArena *arena, ZTypeId source, const ZUnif
 }
 
 bool z_type_substitute(ZTypeArena *arena, ZTypeId source, const ZUnifyTrace *trace, ZTypeId *out) {
-  return type_substitute_inner(arena, source, trace, out, NULL, 0);
+  if (out) *out = Z_TYPE_ID_INVALID;
+  size_t start_len = arena ? arena->len : 0;
+  ZTypeId substituted = Z_TYPE_ID_INVALID;
+  if (type_substitute_inner(arena, source, trace, &substituted, NULL, 0)) {
+    if (out) *out = substituted;
+    return true;
+  }
+  z_type_arena_truncate(arena, start_len);
+  return false;
 }
 
 static bool type_unify_inner(ZTypeArena *arena, ZTypeId pattern, ZTypeId actual, ZUnifyTrace *trace) {

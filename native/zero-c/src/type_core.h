@@ -82,6 +82,7 @@ typedef struct {
 
 void z_type_arena_init(ZTypeArena *arena);
 void z_type_arena_free(ZTypeArena *arena);
+void z_type_arena_truncate(ZTypeArena *arena, size_t len);
 
 bool z_static_value_parse(const char *text, ZStaticValue *out, ZTypeParseError *error);
 bool z_static_value_parse_with_binders(const char *text, const ZTypeBinderScope *scope, ZStaticValue *out, ZTypeParseError *error);

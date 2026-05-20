@@ -210,7 +210,7 @@ ZTypeId z_type_make_apply(ZTypeArena *arena, const char *name, const ZTypeArg *a
   return type_arena_add(arena, (ZTypeNode){.kind = Z_TYPE_NODE_APPLY, .as.apply = {.name = type_strdup(name), .args = arg_copy, .arg_len = arg_len}});
 }
 
-static void type_arena_rewind(ZTypeArena *arena, size_t len) {
+void z_type_arena_truncate(ZTypeArena *arena, size_t len) {
   if (!arena || len > arena->len) return;
   for (size_t i = len; i < arena->len; i++) type_node_free(&arena->nodes[i]);
   arena->len = len;
@@ -265,7 +265,7 @@ static void parser_restore(TypeParser *parser, ZTypeArena *arena, TypeParserMark
     parser->cursor = mark.cursor;
     if (parser->error) *parser->error = mark.error;
   }
-  type_arena_rewind(arena, mark.arena_len);
+  z_type_arena_truncate(arena, mark.arena_len);
 }
 
 static bool static_symbol_text(const char *text) {
@@ -589,13 +589,13 @@ static bool type_parse_inner(ZTypeArena *arena, const char *text, const ZTypeBin
   ZTypeId type = Z_TYPE_ID_INVALID;
   size_t start_len = arena->len;
   if (!parse_type(&parser, arena, &type)) {
-    type_arena_rewind(arena, start_len);
+    z_type_arena_truncate(arena, start_len);
     return false;
   }
   parser_skip_ws(&parser);
   if (parser.text[parser.cursor] != 0) {
     parser_error(&parser, "unexpected trailing type syntax");
-    type_arena_rewind(arena, start_len);
+    z_type_arena_truncate(arena, start_len);
     return false;
   }
   if (out) *out = type;
