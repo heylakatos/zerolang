@@ -7,7 +7,7 @@ BUILD_STAMP := $(OUT).build
 HOST_ID := $(shell uname -s 2>/dev/null || echo unknown)-$(shell uname -m 2>/dev/null || echo unknown)
 BUILD_ID := $(HOST_ID)|$(CC)|$(CFLAGS)
 SRC := $(wildcard src/*.c)
-INCLUDES := $(wildcard include/*.h) $(wildcard src/*.inc)
+INCLUDES := $(wildcard include/*.h) $(wildcard src/*.h) $(wildcard src/*.inc)
 EMBEDDED_SKILLS := src/embedded_skills.inc
 SKILL_INPUTS := $(ROOT)/skills/zero/SKILL.md $(wildcard $(ROOT)/skill-data/*.md)
 

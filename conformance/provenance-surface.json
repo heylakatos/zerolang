@@ -146,7 +146,7 @@
     {
       "surface": "Static interface calls",
       "action": "Resolve constrained interface calls through the same summary/effect path",
-      "owners": ["resolve_provenance_call", "build_constrained_interface_bindings_for_provenance", "apply_checked_call_storage_effects"],
+      "owners": ["resolve_provenance_call", "build_constrained_interface_method_bindings", "apply_checked_call_storage_effects"],
       "fixtures": {
         "fail": ["conformance/native/fail/static-interface-mutref-reference-origin.0", "conformance/native/fail/static-interface-return-reference-origin.0"],
         "pass": ["conformance/native/pass/static-interface-return-reference-origin.0", "conformance/native/pass/static-interface-mutref-reference-store.0"]

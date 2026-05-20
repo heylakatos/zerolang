@@ -1106,6 +1106,504 @@ assert.equal(interfaceParamMismatchBody.diagnostics[0].code, "IFC005");
 assert.match(interfaceParamMismatchBody.diagnostics[0].expected, /ref<Counter>/);
 assert.match(interfaceParamMismatchBody.diagnostics[0].actual, /i32/);
 
+const interfaceStaticUnsupportedTypeFixture = `${outDir}/interface-static-unsupported-type.0`;
+await writeFile(interfaceStaticUnsupportedTypeFixture, `interface Bad<static N: String> {
+    fun value() -> u8
+}
+
+pub fun main() -> Void {
+}
+`);
+const interfaceStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", interfaceStaticUnsupportedTypeFixture]).catch((error) => error);
+assert.notEqual(interfaceStaticUnsupportedTypeJson.code, 0);
+const interfaceStaticUnsupportedTypeBody = JSON.parse(interfaceStaticUnsupportedTypeJson.stdout);
+assert.equal(interfaceStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
+
+const interfaceMethodStaticUnsupportedTypeFixture = `${outDir}/interface-method-static-unsupported-type.0`;
+await writeFile(interfaceMethodStaticUnsupportedTypeFixture, `interface Bad {
+    fun value<static N: String>() -> u8
+}
+
+pub fun main() -> Void {
+}
+`);
+const interfaceMethodStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", interfaceMethodStaticUnsupportedTypeFixture]).catch((error) => error);
+assert.notEqual(interfaceMethodStaticUnsupportedTypeJson.code, 0);
+const interfaceMethodStaticUnsupportedTypeBody = JSON.parse(interfaceMethodStaticUnsupportedTypeJson.stdout);
+assert.equal(interfaceMethodStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
+
+const shapeMethodStaticUnsupportedTypeFixture = `${outDir}/shape-method-static-unsupported-type.0`;
+await writeFile(shapeMethodStaticUnsupportedTypeFixture, `shape Box {
+    value: u8,
+
+    fun value<static N: String>(self: ref<Self>) -> u8 {
+        return self.value
+    }
+}
+
+pub fun main() -> Void {
+}
+`);
+const shapeMethodStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", shapeMethodStaticUnsupportedTypeFixture]).catch((error) => error);
+assert.notEqual(shapeMethodStaticUnsupportedTypeJson.code, 0);
+const shapeMethodStaticUnsupportedTypeBody = JSON.parse(shapeMethodStaticUnsupportedTypeJson.stdout);
+assert.equal(shapeMethodStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
+
+const methodUnknownConstraintFixtures = [
+  {
+    name: "interface-method-unknown-constraint",
+    source: `interface Bad {
+    fun value<T: Missing>() -> u8
+}
+
+pub fun main() -> Void {
+}
+`,
+  },
+  {
+    name: "shape-method-unknown-constraint",
+    source: `shape Box {
+    value: u8,
+
+    fun value<T: Missing>(self: ref<Self>) -> u8 {
+        return self.value
+    }
+}
+
+pub fun main() -> Void {
+}
+`,
+  },
+];
+
+for (const fixtureCase of methodUnknownConstraintFixtures) {
+  const fixture = `${outDir}/${fixtureCase.name}.0`;
+  await writeFile(fixture, fixtureCase.source);
+  const methodUnknownConstraintJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
+  assert.notEqual(methodUnknownConstraintJson.code, 0);
+  const methodUnknownConstraintBody = JSON.parse(methodUnknownConstraintJson.stdout);
+  assert.equal(methodUnknownConstraintBody.diagnostics[0].code, "IFC001");
+}
+
+const duplicateStaticGenericFixtures = [
+  {
+    name: "function-duplicate-static-param",
+    message: /duplicate generic parameter/,
+    source: `fun id<static N: usize, static N: usize>() -> u8 {
+    return 1
+}
+
+pub fun main() -> Void {
+}
+`,
+  },
+  {
+    name: "interface-duplicate-static-param",
+    message: /duplicate generic parameter/,
+    source: `interface Bad<static N: usize, static N: usize> {
+    fun value() -> u8
+}
+
+pub fun main() -> Void {
+}
+`,
+  },
+  {
+    name: "shape-method-duplicate-static-param",
+    message: /duplicate generic parameter/,
+    source: `shape Box {
+    value: u8,
+
+    fun value<static N: usize, static N: usize>(self: ref<Self>) -> u8 {
+        return self.value
+    }
+}
+
+pub fun main() -> Void {
+}
+`,
+  },
+  {
+    name: "shape-method-static-shadows-shape-static",
+    message: /shadows outer generic parameter/,
+    source: `shape Box<static N: usize> {
+    value: [N]u8,
+
+    fun len<static N: usize>(self: ref<Self>) -> usize {
+        return N
+    }
+}
+
+pub fun main() -> Void {
+}
+`,
+  },
+  {
+    name: "shape-method-static-self-param",
+    message: /generic type parameter shadows Self type/,
+    source: `shape Box {
+    value: u8,
+
+    fun value<static Self: usize>(self: ref<Self>) -> usize {
+        return Self
+    }
+}
+
+pub fun main() -> Void {
+}
+`,
+  },
+];
+
+for (const fixtureCase of duplicateStaticGenericFixtures) {
+  const fixture = `${outDir}/${fixtureCase.name}.0`;
+  await writeFile(fixture, fixtureCase.source);
+  const duplicateStaticJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
+  assert.notEqual(duplicateStaticJson.code, 0);
+  const duplicateStaticBody = JSON.parse(duplicateStaticJson.stdout);
+  assert.equal(duplicateStaticBody.diagnostics[0].code, "NAM004");
+  assert.match(duplicateStaticBody.diagnostics[0].message, fixtureCase.message);
+}
+
+for (const value of ["4_", "M"]) {
+  const fixture = `${outDir}/interface-static-constraint-${value.replace(/[^A-Za-z0-9]/g, "_")}.0`;
+  await writeFile(fixture, `interface First<T, static N: usize> {
+    fun first(self: ref<T>) -> u8
+}
+
+fun readFirst<T: First<T,${value}>>(value: ref<T>) -> u8 {
+    return T.first(value)
+}
+
+pub fun main() -> Void {
+}
+`);
+  const interfaceStaticConstraintJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
+  assert.notEqual(interfaceStaticConstraintJson.code, 0);
+  const interfaceStaticConstraintBody = JSON.parse(interfaceStaticConstraintJson.stdout);
+  assert.equal(interfaceStaticConstraintBody.diagnostics[0].code, "STC002");
+  assert.equal(interfaceStaticConstraintBody.diagnostics[0].actual, value);
+}
+
+const shapeMethodStaticParamFixture = `${outDir}/shape-method-static-param.0`;
+await writeFile(shapeMethodStaticParamFixture, `shape Box {
+    value: u8,
+
+    fun tag<static N: usize>(self: ref<Self>) -> usize {
+        return N
+    }
+
+    fun value<static N: usize>() -> usize {
+        return N
+    }
+}
+
+pub fun main() -> Void {
+    let box: Box = Box { value: 1 }
+    let receiverTag: usize = box.tag<4>()
+    let namespaceTag: usize = Box.value<8>()
+}
+`);
+const shapeMethodStaticParamJson = await execFileAsync(zero, ["check", "--json", shapeMethodStaticParamFixture]);
+const shapeMethodStaticParamBody = JSON.parse(shapeMethodStaticParamJson.stdout);
+assert.equal(shapeMethodStaticParamBody.ok, true);
+const shapeMethodStaticParamGraph = await execFileAsync(zero, ["graph", "--json", shapeMethodStaticParamFixture]);
+const shapeMethodStaticParamGraphBody = JSON.parse(shapeMethodStaticParamGraph.stdout);
+const shapeMethodStaticBox = shapeMethodStaticParamGraphBody.shapes.find((item) => item.name === "Box");
+assert(shapeMethodStaticBox);
+const shapeMethodStaticTag = shapeMethodStaticBox.methods.find((item) => item.name === "tag");
+assert(shapeMethodStaticTag);
+assert(shapeMethodStaticTag.staticParams.some((item) => item.name === "N" && item.type === "usize" && item.staticDispatch === true));
+
+const shapeMethodStaticCanonicalFixture = `${outDir}/shape-method-static-canonical.0`;
+await writeFile(shapeMethodStaticCanonicalFixture, `shape Box {
+    fun take<static N: usize>(a: [N]u8, b: [N]u8) -> usize {
+        return N
+    }
+}
+
+pub fun main() -> Void {
+    let a: [4]u8 = [1, 2, 3, 4]
+    let b: [0x4]u8 = [1, 2, 3, 4]
+    let inferred: usize = Box.take(a, b)
+    let explicit: usize = Box.take<0x4>(a, b)
+}
+`);
+const shapeMethodStaticCanonicalJson = await execFileAsync(zero, ["check", "--json", shapeMethodStaticCanonicalFixture]);
+const shapeMethodStaticCanonicalBody = JSON.parse(shapeMethodStaticCanonicalJson.stdout);
+assert.equal(shapeMethodStaticCanonicalBody.ok, true);
+
+const interfaceMethodStaticParamFixture = `${outDir}/interface-method-static-param.0`;
+await writeFile(interfaceMethodStaticParamFixture, `interface Width<T> {
+    fun width<static N: usize>(self: ref<T>) -> usize
+}
+
+shape Bytes {
+    value: u8,
+
+    fun width<static N: usize>(self: ref<Self>) -> usize {
+        return N
+    }
+}
+
+fun readWidth<T: Width<T>>(value: ref<T>) -> usize {
+    return T.width<4>(value)
+}
+
+pub fun main() -> Void {
+    let bytes: Bytes = Bytes { value: 1 }
+    let width: usize = readWidth<Bytes>(&bytes)
+}
+`);
+const interfaceMethodStaticParamJson = await execFileAsync(zero, ["check", "--json", interfaceMethodStaticParamFixture]);
+const interfaceMethodStaticParamBody = JSON.parse(interfaceMethodStaticParamJson.stdout);
+assert.equal(interfaceMethodStaticParamBody.ok, true);
+const interfaceMethodStaticParamGraph = await execFileAsync(zero, ["graph", "--json", interfaceMethodStaticParamFixture]);
+const interfaceMethodStaticParamGraphBody = JSON.parse(interfaceMethodStaticParamGraph.stdout);
+const interfaceMethodStaticWidth = interfaceMethodStaticParamGraphBody.interfaces.find((item) => item.name === "Width");
+assert(interfaceMethodStaticWidth);
+const interfaceMethodStaticWidthMethod = interfaceMethodStaticWidth.methods.find((item) => item.name === "width");
+assert(interfaceMethodStaticWidthMethod);
+assert(interfaceMethodStaticWidthMethod.staticParams.some((item) => item.name === "N" && item.type === "usize" && item.staticDispatch === true));
+const interfaceMethodStaticBytes = interfaceMethodStaticParamGraphBody.shapes.find((item) => item.name === "Bytes");
+assert(interfaceMethodStaticBytes);
+const interfaceMethodStaticBytesWidth = interfaceMethodStaticBytes.methods.find((item) => item.name === "width");
+assert(interfaceMethodStaticBytesWidth);
+assert(interfaceMethodStaticBytesWidth.staticParams.some((item) => item.name === "N" && item.type === "usize" && item.staticDispatch === true));
+
+const interfaceMethodStaticRenamedParamFixture = `${outDir}/interface-method-static-renamed-param.0`;
+await writeFile(interfaceMethodStaticRenamedParamFixture, `interface Width<T> {
+    fun width<static N: usize>(self: ref<T>, bytes: [N]u8) -> [N]u8
+}
+
+shape Bytes {
+    value: u8,
+
+    fun width<static M: usize>(self: ref<Self>, bytes: [M]u8) -> [M]u8 {
+        return bytes
+    }
+}
+
+fun readWidth<T: Width<T>>(value: ref<T>, bytes: [4]u8) -> [4]u8 {
+    return T.width<4>(value, bytes)
+}
+
+pub fun main() -> Void {
+    let bytes: Bytes = Bytes { value: 1 }
+    let output: [4]u8 = readWidth<Bytes>(&bytes, [1, 2, 3, 4])
+}
+`);
+const interfaceMethodStaticRenamedParamJson = await execFileAsync(zero, ["check", "--json", interfaceMethodStaticRenamedParamFixture]);
+const interfaceMethodStaticRenamedParamBody = JSON.parse(interfaceMethodStaticRenamedParamJson.stdout);
+assert.equal(interfaceMethodStaticRenamedParamBody.ok, true);
+const interfaceMethodStaticRenamedParamGraph = await execFileAsync(zero, ["graph", "--json", interfaceMethodStaticRenamedParamFixture]);
+const interfaceMethodStaticRenamedParamGraphBody = JSON.parse(interfaceMethodStaticRenamedParamGraph.stdout);
+const interfaceMethodStaticRenamedWidth = interfaceMethodStaticRenamedParamGraphBody.interfaces.find((item) => item.name === "Width");
+assert(interfaceMethodStaticRenamedWidth);
+const interfaceMethodStaticRenamedWidthMethod = interfaceMethodStaticRenamedWidth.methods.find((item) => item.name === "width");
+assert(interfaceMethodStaticRenamedWidthMethod);
+assert(interfaceMethodStaticRenamedWidthMethod.staticParams.some((item) => item.name === "N" && item.type === "usize" && item.staticDispatch === true));
+const interfaceMethodStaticRenamedBytes = interfaceMethodStaticRenamedParamGraphBody.shapes.find((item) => item.name === "Bytes");
+assert(interfaceMethodStaticRenamedBytes);
+const interfaceMethodStaticRenamedBytesWidth = interfaceMethodStaticRenamedBytes.methods.find((item) => item.name === "width");
+assert(interfaceMethodStaticRenamedBytesWidth);
+assert(interfaceMethodStaticRenamedBytesWidth.staticParams.some((item) => item.name === "M" && item.type === "usize" && item.staticDispatch === true));
+
+const shapeMethodGenericConstraintFixture = `${outDir}/shape-method-generic-constraint.0`;
+await writeFile(shapeMethodGenericConstraintFixture, `interface NeedsMethod<T> {
+    fun need(self: ref<T>) -> u8
+}
+
+shape Box {
+    value: u8,
+
+    fun accept<T: NeedsMethod<T>>(self: ref<Self>, item: T) -> u8 {
+        return self.value
+    }
+}
+
+shape Plain {
+    value: u8,
+}
+
+pub fun main() -> Void {
+    let box: Box = Box { value: 1 }
+    let plain: Plain = Plain { value: 2 }
+    let out: u8 = box.accept<Plain>(plain)
+}
+`);
+const shapeMethodGenericConstraintJson = await execFileAsync(zero, ["check", "--json", shapeMethodGenericConstraintFixture]).catch((error) => error);
+assert.notEqual(shapeMethodGenericConstraintJson.code, 0);
+const shapeMethodGenericConstraintBody = JSON.parse(shapeMethodGenericConstraintJson.stdout);
+assert.equal(shapeMethodGenericConstraintBody.diagnostics[0].code, "IFC002");
+
+const interfaceMethodGenericConstraintFixture = `${outDir}/interface-method-generic-constraint.0`;
+await writeFile(interfaceMethodGenericConstraintFixture, `interface NeedsMethod<T> {
+    fun need(self: ref<T>) -> u8
+}
+
+interface Caller<T> {
+    fun accept<U: NeedsMethod<U>>(self: ref<T>, item: U) -> u8
+}
+
+shape Box {
+    value: u8,
+
+    fun accept<U: NeedsMethod<U>>(self: ref<Self>, item: U) -> u8 {
+        return self.value
+    }
+}
+
+shape Plain {
+    value: u8,
+}
+
+fun read<T: Caller<T>>(value: ref<T>, plain: Plain) -> u8 {
+    return T.accept<Plain>(value, plain)
+}
+
+pub fun main() -> Void {
+    let box: Box = Box { value: 1 }
+    let plain: Plain = Plain { value: 2 }
+    let out: u8 = read<Box>(&box, plain)
+}
+`);
+const interfaceMethodGenericConstraintJson = await execFileAsync(zero, ["check", "--json", interfaceMethodGenericConstraintFixture]).catch((error) => error);
+assert.notEqual(interfaceMethodGenericConstraintJson.code, 0);
+const interfaceMethodGenericConstraintBody = JSON.parse(interfaceMethodGenericConstraintJson.stdout);
+assert.equal(interfaceMethodGenericConstraintBody.diagnostics[0].code, "IFC002");
+
+const interfaceMethodGenericMismatchFixtures = [
+  {
+    name: "interface-method-generic-constraint-mismatch",
+    code: "IFC005",
+    message: /constraint does not match/,
+    source: `interface NeedsA<T> {
+    fun needA(self: ref<T>) -> u8
+}
+
+interface NeedsB<T> {
+    fun needB(self: ref<T>) -> u8
+}
+
+interface Caller<T> {
+    fun accept<U: NeedsA<U>>(self: ref<T>, item: U) -> u8
+}
+
+shape Box {
+    value: u8,
+
+    fun accept<U: NeedsB<U>>(self: ref<Self>, item: U) -> u8 {
+        return self.value
+    }
+}
+
+shape A {
+    value: u8,
+
+    fun needA(self: ref<Self>) -> u8 {
+        return self.value
+    }
+}
+
+fun read<T: Caller<T>>(value: ref<T>, item: A) -> u8 {
+    return T.accept<A>(value, item)
+}
+
+pub fun main() -> Void {
+    let box: Box = Box { value: 1 }
+    let a: A = A { value: 2 }
+    let out: u8 = read<Box>(&box, a)
+}
+`,
+  },
+  {
+    name: "interface-method-missing-static-param",
+    code: "IFC003",
+    source: `interface Width<T> {
+    fun width<static N: usize>(self: ref<T>) -> usize
+}
+
+shape Bytes {
+    value: u8,
+
+    fun width(self: ref<Self>) -> usize {
+        return 1
+    }
+}
+
+fun readWidth<T: Width<T>>(value: ref<T>) -> usize {
+    return T.width<4>(value)
+}
+
+pub fun main() -> Void {
+    let bytes: Bytes = Bytes { value: 1 }
+    let width: usize = readWidth<Bytes>(&bytes)
+}
+`,
+  },
+  {
+    name: "interface-method-extra-static-param",
+    code: "IFC003",
+    source: `interface Width<T> {
+    fun width(self: ref<T>) -> usize
+}
+
+shape Bytes {
+    value: u8,
+
+    fun width<static N: usize>(self: ref<Self>) -> usize {
+        return N
+    }
+}
+
+fun readWidth<T: Width<T>>(value: ref<T>) -> usize {
+    return T.width(value)
+}
+
+pub fun main() -> Void {
+    let bytes: Bytes = Bytes { value: 1 }
+    let width: usize = readWidth<Bytes>(&bytes)
+}
+`,
+  },
+  {
+    name: "interface-method-static-param-type-mismatch",
+    code: "IFC005",
+    source: `interface Width<T> {
+    fun width<static N: usize>(self: ref<T>) -> usize
+}
+
+shape Bytes {
+    value: u8,
+
+    fun width<static N: Bool>(self: ref<Self>) -> usize {
+        return 1
+    }
+}
+
+fun readWidth<T: Width<T>>(value: ref<T>) -> usize {
+    return T.width<4>(value)
+}
+
+pub fun main() -> Void {
+    let bytes: Bytes = Bytes { value: 1 }
+    let width: usize = readWidth<Bytes>(&bytes)
+}
+`,
+  },
+];
+
+for (const fixtureCase of interfaceMethodGenericMismatchFixtures) {
+  const fixture = `${outDir}/${fixtureCase.name}.0`;
+  await writeFile(fixture, fixtureCase.source);
+  const interfaceMethodGenericMismatchJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
+  assert.notEqual(interfaceMethodGenericMismatchJson.code, 0);
+  const interfaceMethodGenericMismatchBody = JSON.parse(interfaceMethodGenericMismatchJson.stdout);
+  assert.equal(interfaceMethodGenericMismatchBody.diagnostics[0].code, fixtureCase.code);
+  if (fixtureCase.message) assert.match(interfaceMethodGenericMismatchBody.diagnostics[0].message, fixtureCase.message);
+}
+
 const staticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-unsupported-type.0"]).catch((error) => error);
 assert.notEqual(staticUnsupportedTypeJson.code, 0);
 const staticUnsupportedTypeBody = JSON.parse(staticUnsupportedTypeJson.stdout);
@@ -1117,6 +1615,38 @@ assert.notEqual(staticNonConstantJson.code, 0);
 const staticNonConstantBody = JSON.parse(staticNonConstantJson.stdout);
 assert.equal(staticNonConstantBody.diagnostics[0].code, "STC002");
 assert.equal(staticNonConstantBody.diagnostics[0].repair.id, "pass-constant-static-value");
+
+for (const value of ["4_", "4__5", "0x_1", "4_nope"]) {
+  const fixture = `${outDir}/static-value-malformed-${value.replace(/[^A-Za-z0-9]/g, "_")}.0`;
+  await writeFile(fixture, `shape FixedVec<T, static N: usize> {
+    items: [N]T,
+}
+
+pub fun main() -> Void {
+    let _vec: FixedVec<u8,${value}> = FixedVec { items: [1, 2, 3, 4] }
+}
+`);
+  const malformedStaticJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
+  assert.notEqual(malformedStaticJson.code, 0);
+  const malformedStaticBody = JSON.parse(malformedStaticJson.stdout);
+  assert.equal(malformedStaticBody.diagnostics[0].code, "STC002");
+  assert.equal(malformedStaticBody.diagnostics[0].actual, value);
+}
+
+for (const value of ["4_", "4__5", "0x_1", "4_nope"]) {
+  const fixture = `${outDir}/array-length-malformed-${value.replace(/[^A-Za-z0-9]/g, "_")}.0`;
+  await writeFile(fixture, `fun take(bytes: [${value}]u8) -> Void {
+}
+
+pub fun main() -> Void {
+}
+`);
+  const malformedArrayJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
+  assert.notEqual(malformedArrayJson.code, 0);
+  const malformedArrayBody = JSON.parse(malformedArrayJson.stdout);
+  assert.equal(malformedArrayBody.diagnostics[0].code, "STC002");
+  assert.equal(malformedArrayBody.diagnostics[0].actual, value);
+}
 
 const staticMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-mismatch.0"]).catch((error) => error);
 assert.notEqual(staticMismatchJson.code, 0);

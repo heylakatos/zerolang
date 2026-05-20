@@ -2142,6 +2142,52 @@ static const char *static_param_kind_json(const Program *program, const char *ty
   return "integer";
 }
 
+static void append_type_param_names_json(ZBuf *buf, const ParamVec *params) {
+  zbuf_append(buf, "[");
+  for (size_t i = 0; params && i < params->len; i++) {
+    if (i > 0) zbuf_append(buf, ",");
+    append_json_string(buf, params->items[i].name);
+  }
+  zbuf_append(buf, "]");
+}
+
+static void append_static_params_json(ZBuf *buf, const Program *program, const ParamVec *params) {
+  zbuf_append(buf, "[");
+  bool wrote_static_param = false;
+  for (size_t i = 0; params && i < params->len; i++) {
+    const Param *type_param = &params->items[i];
+    if (!type_param->is_static) continue;
+    if (wrote_static_param) zbuf_append(buf, ",");
+    wrote_static_param = true;
+    zbuf_append(buf, "{\"name\":");
+    append_json_string(buf, type_param->name);
+    zbuf_append(buf, ",\"type\":");
+    append_json_string(buf, type_param->type ? type_param->type : "usize");
+    zbuf_append(buf, ",\"kind\":");
+    append_json_string(buf, static_param_kind_json(program, type_param->type));
+    zbuf_append(buf, ",\"staticDispatch\":true}");
+  }
+  zbuf_append(buf, "]");
+}
+
+static void append_type_param_constraints_json(ZBuf *buf, const ParamVec *params) {
+  zbuf_append(buf, "[");
+  bool wrote_constraint = false;
+  for (size_t i = 0; params && i < params->len; i++) {
+    const Param *type_param = &params->items[i];
+    if (type_param->is_static) continue;
+    if (!type_param->type || strcmp(type_param->type, "Type") == 0) continue;
+    if (wrote_constraint) zbuf_append(buf, ",");
+    wrote_constraint = true;
+    zbuf_append(buf, "{\"typeParam\":");
+    append_json_string(buf, type_param->name);
+    zbuf_append(buf, ",\"interface\":");
+    append_json_string(buf, type_param->type);
+    zbuf_append(buf, ",\"staticDispatch\":true}");
+  }
+  zbuf_append(buf, "]");
+}
+
 static void append_compile_time_json(ZBuf *buf, const Program *program, const SourceInput *input, const ZTargetInfo *target) {
   char *manifest = read_optional_file(input && input->manifest_path ? input->manifest_path : "zero.json");
   zbuf_append(buf, "{");
@@ -8797,7 +8843,11 @@ static void append_graph_json(ZBuf *buf, const SourceInput *input, const Program
         if (type_param_index > 0) zbuf_append(buf, ",");
         append_json_string(buf, method->type_params.items[type_param_index].name);
       }
-      zbuf_append(buf, "],\"inheritedShapeParams\":");
+      zbuf_append(buf, "],\"staticParams\":");
+      append_static_params_json(buf, program, &method->type_params);
+      zbuf_append(buf, ",\"constraints\":");
+      append_type_param_constraints_json(buf, &method->type_params);
+      zbuf_append(buf, ",\"inheritedShapeParams\":");
       zbuf_append(buf, shape->type_params.len > 0 ? "true" : "false");
       zbuf_append(buf, ",\"shapeTypeParams\":[");
       for (size_t type_param_index = 0; type_param_index < shape->type_params.len; type_param_index++) {
@@ -8852,6 +8902,12 @@ static void append_graph_json(ZBuf *buf, const SourceInput *input, const Program
       zbuf_append(buf, "{\"name\":");
       append_json_string(buf, method->name);
       zbuf_append(buf, ",\"doc\":\"\"");
+      zbuf_append(buf, ",\"typeParams\":");
+      append_type_param_names_json(buf, &method->type_params);
+      zbuf_append(buf, ",\"staticParams\":");
+      append_static_params_json(buf, program, &method->type_params);
+      zbuf_append(buf, ",\"constraints\":");
+      append_type_param_constraints_json(buf, &method->type_params);
       zbuf_append(buf, ",\"params\":[");
       for (size_t param_index = 0; param_index < method->params.len; param_index++) {
         Param *param = &method->params.items[param_index];

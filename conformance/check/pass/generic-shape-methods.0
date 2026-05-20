@@ -11,7 +11,8 @@ shape FixedVec<T, static N: usize> {
     }
 
     fun get(self: ref<Self>, index: usize) -> Maybe<T> {
-        return std.mem.get(self.items, index)
+        let items: [N]T = self.items
+        return std.mem.get(items, index)
     }
 }
 
