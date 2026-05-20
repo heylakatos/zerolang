@@ -1,0 +1,39 @@
+shape Pair<A, B> {
+    left: A,
+    right: B,
+}
+
+shape Box<T> {
+    value: T,
+
+    fun rightOf<U>(self: ref<Self>, pair: ref<Pair<T,U>>) -> U {
+        return pair.right
+    }
+}
+
+interface Projector<T> {
+    fun project<U>(self: ref<T>, pair: ref<Pair<T,U>>) -> U
+}
+
+shape PlainBox {
+    value: i32,
+
+    fun project<U>(self: ref<Self>, pair: ref<Pair<Self,U>>) -> U {
+        return pair.right
+    }
+}
+
+fun project<T: Projector<T>, U>(value: ref<T>, pair: ref<Pair<T,U>>) -> U {
+    return T.project(value, pair)
+}
+
+pub fun main() -> Void {
+    let box: Box<i32> = Box { value: 1 }
+    let pair: Pair<i32,Bool> = Pair { left: 2, right: true }
+    let receiver: Bool = box.rightOf(&pair)
+    let namespaced: Bool = Box.rightOf(&box, &pair)
+    let plain: PlainBox = PlainBox { value: 3 }
+    let projectedPair: Pair<PlainBox,Bool> = Pair { left: PlainBox { value: 4 }, right: true }
+    let projected: Bool = project(&plain, &projectedPair)
+    expect(receiver && namespaced && projected)
+}

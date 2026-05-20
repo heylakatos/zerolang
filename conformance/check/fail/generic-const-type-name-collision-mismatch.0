@@ -1,0 +1,22 @@
+const Foo: usize = 3
+const Bar: usize = 3
+
+shape Foo {
+    value: i32,
+}
+
+shape Bar {
+    value: i32,
+}
+
+shape Holder<T> {
+    value: T,
+}
+
+fun needsBar(holder: Holder<Bar>) -> Void {
+}
+
+pub fun main() -> Void {
+    let holder: Holder<Foo> = Holder { value: Foo { value: 1 } }
+    needsBar(holder)
+}

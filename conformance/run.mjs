@@ -398,6 +398,7 @@ for (const fixture of [
   "conformance/check/pass/generic-static-method-forwarding.0",
   "conformance/check/pass/generic-const-shadowing.0",
   "conformance/check/pass/generic-const-type-name-collision.0",
+  "conformance/check/pass/generic-method-outer-param-inference.0",
   "conformance/native/pass/generic-nested-calls.0",
   "conformance/native/pass/generic-specialization-reuse.0",
   "conformance/check/pass/generic-shape-basic.0",
@@ -1063,6 +1064,13 @@ const genericStaticParamTypeNameCollisionBody = JSON.parse(genericStaticParamTyp
 assert.equal(genericStaticParamTypeNameCollisionBody.diagnostics[0].code, "NAM004");
 assert.match(genericStaticParamTypeNameCollisionBody.diagnostics[0].message, /generic static parameter shadows concrete type name/);
 assert.match(genericStaticParamTypeNameCollisionBody.diagnostics[0].actual, /'Foo' already names a shape/);
+
+const genericConstTypeNameCollisionMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-const-type-name-collision-mismatch.0"]).catch((error) => error);
+assert.notEqual(genericConstTypeNameCollisionMismatchJson.code, 0);
+const genericConstTypeNameCollisionMismatchBody = JSON.parse(genericConstTypeNameCollisionMismatchJson.stdout);
+assert.equal(genericConstTypeNameCollisionMismatchBody.diagnostics[0].code, "TYP001");
+assert.match(genericConstTypeNameCollisionMismatchBody.diagnostics[0].expected, /Holder<Bar>/);
+assert.match(genericConstTypeNameCollisionMismatchBody.diagnostics[0].actual, /Holder<Foo>/);
 
 const genericArgCountJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-type-arg-count.0"]).catch((error) => error);
 assert.notEqual(genericArgCountJson.code, 0);
