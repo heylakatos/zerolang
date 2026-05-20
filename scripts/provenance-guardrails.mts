@@ -253,6 +253,10 @@ const requiredFunctions = [
   "choice_constructor_value_provenance",
   "register_match_payload_binding_provenance",
   "apply_checked_call_storage_effects",
+  "call_resolution_record_bindings",
+  "call_resolution_record_param_facts",
+  "call_resolution_param_type_text",
+  "resolved_call_param_type_text",
   "apply_provenance_storage_effect",
   "collect_effect_target_places",
   "collect_assignment_target_places",
@@ -280,10 +284,26 @@ for (const kind of [
   assertIncludes("checker provenance call resolver", checker, kind);
 }
 
+for (const needle of [
+  "ZCallArgument",
+  "ZCallBinding",
+  "z_call_resolution_add_arg",
+  "z_call_resolution_param_type",
+  "z_call_resolution_add_binding",
+  "z_call_resolution_binding_type",
+]) {
+  assertIncludes("shared call argument facts", callResolve, needle);
+}
+
 const callResultBody = sliceBetween(checker, "static bool call_result_value_provenance", "static bool expr_reference_provenance");
 assertIncludes("call result provenance", callResultBody, "resolve_provenance_call");
 assertIncludes("call result provenance", callResultBody, "function_return_value_provenance");
 assertIncludes("call result provenance", callResultBody, "instantiate_call_provenance_entry");
+assertIncludes("call result provenance", callResultBody, "resolved_call_param_type_text");
+
+const checkCallBody = sliceBetween(checker, "static bool check_expr_expected", "case EXPR_CAST");
+assertIncludes("call checking argument facts", checkCallBody, "call_resolution_record_param_facts");
+assertIncludes("call checking argument facts", checkCallBody, "call_resolution_param_type_text");
 
 const checkedCallBody = sliceBetween(checker, "static bool apply_checked_call_storage_effects", "static bool apply_resolved_call_storage_effects");
 assertIncludes("checked call storage effects", checkedCallBody, "resolve_provenance_call");

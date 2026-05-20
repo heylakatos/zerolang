@@ -1883,6 +1883,9 @@ static void set_expr_resolved_type(const Expr *expr, const char *type);
 static const Function *find_namespace_shape_method(const Program *program, const Expr *callee, const Shape **out_shape);
 static const Function *find_constrained_interface_method_in_function(const Program *program, const Function *fun, const Expr *callee, const InterfaceDecl **out_interface);
 static void strip_ref_like_type(const char *type, char *out, size_t out_len);
+static void call_resolution_record_bindings(ZCallResolution *resolution, GenericBinding *bindings, size_t binding_len);
+static void call_resolution_record_param_facts(CheckContext *ctx, const Program *program, const Function *callee, const Expr *call, const Expr *receiver, size_t param_offset, Scope *scope, GenericBinding *bindings, size_t binding_len, ZCallResolution *resolution);
+static char *call_resolution_param_type_text(const ZCallResolution *resolution, size_t param_index);
 static bool interface_constraint_parts(const Program *program, const char *constraint, const InterfaceDecl **out_interface, char ***out_args, size_t *out_arg_len);
 static void mark_owned_move_if_needed(const Expr *expr, Scope *scope, const char *destination_type);
 static void mark_owned_target_live_if_needed(const Expr *target, Scope *scope, const char *target_type);
@@ -5958,8 +5961,10 @@ static bool check_expr_expected(CheckContext *ctx, const Program *program, const
             z_call_resolution_free(&resolution);
             return false;
           }
+          call_resolution_record_bindings(&resolution, method_bindings, method_binding_len);
+          call_resolution_record_param_facts(ctx, program, method, expr, NULL, 0, scope, method_bindings, method_binding_len, &resolution);
           for (size_t i = 0; i < expr->args.len; i++) {
-            char *expected_type = type_substitute_generic_signature(program, method->params.items[i].type, method_bindings, method_binding_len);
+            char *expected_type = call_resolution_param_type_text(&resolution, i);
             if (!check_expr_expected(ctx, program, expr->args.items[i], scope, diag, expected_type)) {
               free(expected_type);
               generic_bindings_free(method_bindings, method_binding_len);
@@ -6101,6 +6106,8 @@ static bool check_expr_expected(CheckContext *ctx, const Program *program, const
               z_call_resolution_free(&resolution);
               return false;
             }
+            call_resolution_record_bindings(&resolution, receiver_bindings, receiver_binding_len);
+            call_resolution_record_param_facts(ctx, program, receiver_method, expr, receiver, resolution.param_offset, scope, receiver_bindings, receiver_binding_len, &resolution);
             char *expected_self = type_substitute_generic_signature(program, receiver_method->params.items[0].type, receiver_bindings, receiver_binding_len);
             if (!types_compatible_in_scope(program, scope, expected_self, self_arg_type)) {
               bool ok = set_diag_detail(diag, 3047, "receiver Self type does not match method receiver", receiver->line, receiver->column, expected_self, self_arg_type, "call the method on a receiver with the expected shape instantiation");
@@ -6114,7 +6121,7 @@ static bool check_expr_expected(CheckContext *ctx, const Program *program, const
             free(expected_self);
             free(self_arg_type);
             for (size_t i = 0; i < expr->args.len; i++) {
-              char *expected_type = type_substitute_generic_signature(program, receiver_method->params.items[i + 1].type, receiver_bindings, receiver_binding_len);
+              char *expected_type = call_resolution_param_type_text(&resolution, i + resolution.param_offset);
               if (!check_expr_expected(ctx, program, expr->args.items[i], scope, diag, expected_type)) {
                 free(expected_type);
                 generic_bindings_free(receiver_bindings, receiver_binding_len);
@@ -6183,8 +6190,10 @@ static bool check_expr_expected(CheckContext *ctx, const Program *program, const
             z_call_resolution_free(&resolution);
             return false;
           }
+          call_resolution_record_bindings(&resolution, interface_bindings, interface_binding_len);
+          call_resolution_record_param_facts(ctx, program, required, expr, NULL, 0, scope, interface_bindings, interface_binding_len, &resolution);
           for (size_t i = 0; i < expr->args.len; i++) {
-            char *expected_type = type_substitute_generic_signature(program, required->params.items[i].type, interface_bindings, interface_binding_len);
+            char *expected_type = call_resolution_param_type_text(&resolution, i);
             if (!check_expr_expected(ctx, program, expr->args.items[i], scope, diag, expected_type)) {
               free(expected_type);
               generic_bindings_free(interface_bindings, interface_binding_len);
@@ -7082,6 +7091,41 @@ static char *call_param_type_text(const Program *program, const Function *callee
   return z_strdup(param_type ? param_type : "Unknown");
 }
 
+static void call_resolution_record_bindings(ZCallResolution *resolution, GenericBinding *bindings, size_t binding_len) {
+  if (!resolution || !bindings) return;
+  for (size_t i = 0; i < binding_len; i++) {
+    z_call_resolution_add_binding(resolution, bindings[i].name, bindings[i].type, bindings[i].is_static, bindings[i].static_type);
+  }
+}
+
+static char *call_resolution_param_type_text(const ZCallResolution *resolution, size_t param_index) {
+  const char *param_type = z_call_resolution_param_type(resolution, param_index);
+  return z_strdup(param_type ? param_type : "Unknown");
+}
+
+static void call_resolution_record_param_facts(CheckContext *ctx, const Program *program, const Function *callee, const Expr *call, const Expr *receiver, size_t param_offset, Scope *scope, GenericBinding *bindings, size_t binding_len, ZCallResolution *resolution) {
+  if (!program || !callee || !call || !scope || !resolution) return;
+  if (receiver && callee->params.len > 0) {
+    char *expected = call_param_type_text(program, callee, 0, bindings, binding_len);
+    z_call_resolution_add_arg(resolution, 0, receiver, expected, expr_type(ctx, program, receiver, scope));
+    free(expected);
+  }
+  for (size_t i = 0; i < call->args.len; i++) {
+    size_t param_index = i + param_offset;
+    if (param_index >= callee->params.len) continue;
+    char *expected = call_param_type_text(program, callee, param_index, bindings, binding_len);
+    z_call_resolution_add_arg(resolution, param_index, call->args.items[i], expected, expr_type(ctx, program, call->args.items[i], scope));
+    free(expected);
+  }
+}
+
+static char *resolved_call_param_type_text(const Program *program, const ResolvedProvenanceCall *resolved, size_t param_index) {
+  if (!resolved) return z_strdup("Unknown");
+  const char *recorded = z_call_resolution_param_type(&resolved->resolution, param_index);
+  if (recorded) return z_strdup(recorded);
+  return call_param_type_text(program, resolved->resolution.callee, param_index, resolved->bindings, resolved->binding_len);
+}
+
 static bool resolve_provenance_call(CheckContext *ctx, const Program *program, const Expr *call, Scope *scope, const char *expected_return, const Function *context_fun, GenericBinding *context_bindings, size_t context_binding_len, ResolvedProvenanceCall *out) {
   if (!out) return false;
   *out = (ResolvedProvenanceCall){0};
@@ -7099,7 +7143,9 @@ static bool resolve_provenance_call(CheckContext *ctx, const Program *program, c
         return false;
       }
       provenance_context_substitute_bindings(ctx, program, out->bindings, out->binding_len, context_bindings, context_binding_len);
+      call_resolution_record_bindings(&out->resolution, out->bindings, out->binding_len);
     }
+    call_resolution_record_param_facts(ctx, program, callee, call, NULL, 0, scope, out->bindings, out->binding_len, &out->resolution);
     return true;
   }
 
@@ -7115,6 +7161,8 @@ static bool resolve_provenance_call(CheckContext *ctx, const Program *program, c
       return false;
     }
     provenance_context_substitute_bindings(ctx, program, out->bindings, out->binding_len, context_bindings, context_binding_len);
+    call_resolution_record_bindings(&out->resolution, out->bindings, out->binding_len);
+    call_resolution_record_param_facts(ctx, program, callee, call, NULL, 0, scope, out->bindings, out->binding_len, &out->resolution);
     return true;
   }
 
@@ -7128,6 +7176,8 @@ static bool resolve_provenance_call(CheckContext *ctx, const Program *program, c
       return false;
     }
     provenance_context_substitute_bindings(ctx, program, out->bindings, out->binding_len, context_bindings, context_binding_len);
+    call_resolution_record_bindings(&out->resolution, out->bindings, out->binding_len);
+    call_resolution_record_param_facts(ctx, program, callee, call, NULL, 0, scope, out->bindings, out->binding_len, &out->resolution);
     return true;
   }
 
@@ -7142,6 +7192,8 @@ static bool resolve_provenance_call(CheckContext *ctx, const Program *program, c
     char *substituted_return = type_substitute_generic_signature(program, callee->return_type, out->bindings, out->binding_len);
     z_call_resolution_set_return_type(&out->resolution, return_type ? return_type : substituted_return);
     free(substituted_return);
+    call_resolution_record_bindings(&out->resolution, out->bindings, out->binding_len);
+    call_resolution_record_param_facts(ctx, program, callee, call, NULL, 0, scope, out->bindings, out->binding_len, &out->resolution);
     return true;
   }
 
@@ -7163,6 +7215,8 @@ static bool resolve_provenance_call(CheckContext *ctx, const Program *program, c
   }
   free(self_arg_type);
   provenance_context_substitute_bindings(ctx, program, out->bindings, out->binding_len, context_bindings, context_binding_len);
+  call_resolution_record_bindings(&out->resolution, out->bindings, out->binding_len);
+  call_resolution_record_param_facts(ctx, program, callee, call, out->resolution.receiver_expr, out->resolution.param_offset, scope, out->bindings, out->binding_len, &out->resolution);
   return true;
 }
 
@@ -7339,7 +7393,7 @@ static bool value_provenance_add_actual_place(ValueProvenance *origins, const Ex
   return added;
 }
 
-static bool instantiate_call_provenance_entry(CheckContext *ctx, const Program *program, const Function *callee, const Expr *call, const Expr *receiver, size_t param_offset, Scope *scope, GenericBinding *bindings, size_t binding_len, const ProvenanceEntry *summary_entry, ValueProvenance *out);
+static bool instantiate_call_provenance_entry(CheckContext *ctx, const Program *program, const ResolvedProvenanceCall *resolved, Scope *scope, const ProvenanceEntry *summary_entry, ValueProvenance *out);
 
 static bool call_result_value_provenance(CheckContext *ctx, const Program *program, const Expr *expr, Scope *scope, ValueProvenance *origins) {
   if (!program || !expr || expr->kind != EXPR_CALL || !expr->left || !origins) return false;
@@ -7355,7 +7409,7 @@ static bool call_result_value_provenance(CheckContext *ctx, const Program *progr
   bool callee_may_return = true;
   if (function_return_value_provenance(ctx, program, resolved.resolution.callee, resolved.bindings, resolved.binding_len, &summary, &callee_may_return)) {
     for (size_t origin_index = 0; origin_index < summary.len; origin_index++) {
-      if (instantiate_call_provenance_entry(ctx, program, resolved.resolution.callee, expr, resolved.resolution.receiver_expr, resolved.resolution.param_offset, scope, resolved.bindings, resolved.binding_len, &summary.items[origin_index], origins)) added = true;
+      if (instantiate_call_provenance_entry(ctx, program, &resolved, scope, &summary.items[origin_index], origins)) added = true;
     }
   }
   value_provenance_free(&summary);
@@ -7374,7 +7428,7 @@ static bool call_result_value_provenance(CheckContext *ctx, const Program *progr
   }
 
   if (resolved.resolution.receiver_expr && resolved.resolution.callee->params.len > 0) {
-    char *param_type = call_param_type_text(program, resolved.resolution.callee, 0, resolved.bindings, resolved.binding_len);
+    char *param_type = resolved_call_param_type_text(program, &resolved, 0);
     if (type_is_named_generic(param_type, "ref") || type_is_named_generic(param_type, "mutref")) {
       if (expr_reference_provenance_as(ctx, program, resolved.resolution.receiver_expr, scope, origins, return_mut)) {
         added = true;
@@ -7389,7 +7443,7 @@ static bool call_result_value_provenance(CheckContext *ctx, const Program *progr
   }
 
   for (size_t i = 0; i < expr->args.len && i + resolved.resolution.param_offset < resolved.resolution.callee->params.len; i++) {
-    char *param_type = call_param_type_text(program, resolved.resolution.callee, i + resolved.resolution.param_offset, resolved.bindings, resolved.binding_len);
+    char *param_type = resolved_call_param_type_text(program, &resolved, i + resolved.resolution.param_offset);
     bool reference_param = type_is_named_generic(param_type, "ref") || type_is_named_generic(param_type, "mutref");
     free(param_type);
     if (!reference_param) continue;
@@ -8039,16 +8093,19 @@ static bool actual_storage_value_provenance_under_path(CheckContext *ctx, const 
   return added;
 }
 
-static bool instantiate_call_provenance_entry(CheckContext *ctx, const Program *program, const Function *callee, const Expr *call, const Expr *receiver, size_t param_offset, Scope *scope, GenericBinding *bindings, size_t binding_len, const ProvenanceEntry *summary_entry, ValueProvenance *out) {
-  if (!program || !callee || !call || !scope || !summary_entry || !out) return false;
+static bool instantiate_call_provenance_entry(CheckContext *ctx, const Program *program, const ResolvedProvenanceCall *resolved, Scope *scope, const ProvenanceEntry *summary_entry, ValueProvenance *out) {
+  if (!program || !resolved || !resolved->resolution.callee || !resolved->resolution.call_expr || !scope || !summary_entry || !out) return false;
+  const ZCallResolution *resolution = &resolved->resolution;
+  const Function *callee = resolution->callee;
+  const Expr *call = resolution->call_expr;
   size_t param_index = callee->params.len;
   if (!function_param_index_by_name(callee, summary_entry->origin.root, &param_index)) return false;
-  const Expr *actual = call_actual_for_param(call, receiver, param_offset, param_index);
+  const Expr *actual = call_actual_for_param(call, resolution->receiver_expr, resolution->param_offset, param_index);
   if (!actual) return false;
 
   bool added = false;
   ValueProvenance actual_origins = {0};
-  char *param_type = call_param_type_text(program, callee, param_index, bindings, binding_len);
+  char *param_type = resolved_call_param_type_text(program, resolved, param_index);
   bool reference_param = type_is_named_generic(param_type, "ref") || type_is_named_generic(param_type, "mutref");
   free(param_type);
   if (reference_param && callee->params.items[param_index].name &&
@@ -8160,7 +8217,7 @@ static bool apply_provenance_storage_effect(CheckContext *ctx, const Program *pr
       place_vec_free(&targets);
       return set_diag_detail(diag, 3030, "cannot store a reference to a callee-local binding through a mutable parameter", resolution->call_expr->line, resolution->call_expr->column, "borrow source that outlives the call", actual_detail, "store only references derived from caller-owned arguments into mutable parameter storage");
     }
-    instantiate_call_provenance_entry(ctx, program, resolution->callee, resolution->call_expr, resolution->receiver_expr, resolution->param_offset, scope, resolved->bindings, resolved->binding_len, entry, &instantiated);
+    instantiate_call_provenance_entry(ctx, program, resolved, scope, entry, &instantiated);
   }
   if (instantiated.len == 0) {
     value_provenance_free(&instantiated);
@@ -8213,7 +8270,7 @@ static bool apply_provenance_call_storage_effects(CheckContext *ctx, const Progr
   bool complete = function_storage_effect_summary(ctx, program, resolution->callee, resolved->bindings, resolved->binding_len, &effects);
   if (!complete) {
     for (size_t i = 0; i < resolution->callee->params.len; i++) {
-      char *param_type = call_param_type_text(program, resolution->callee, i, resolved->bindings, resolved->binding_len);
+      char *param_type = resolved_call_param_type_text(program, resolved, i);
       bool mutref_param = type_is_named_generic(param_type, "mutref");
       free(param_type);
       if (!mutref_param) continue;
