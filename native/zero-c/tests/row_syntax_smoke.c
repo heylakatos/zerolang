@@ -304,6 +304,98 @@ static void formats_row_layout_with_trivia(void) {
   z_free_row_tokens(&tokens);
 }
 
+static void formats_blank_line_before_dedented_sibling(void) {
+  const char *source =
+    "pub fn main Void\n"
+    "  if ready\n"
+    "    check world.out.write \"ready\\n\"\n"
+    "\n"
+    "  if done\n"
+    "    check world.out.write \"done\\n\"\n";
+  ZDiag diag = {0};
+  ZRowTokenVec tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  ZRowTree tree = {0};
+  expect(z_row_parse_layout(&tokens, &tree, &diag), diag.message);
+  char *formatted = z_format_row_layout(&tokens, &tree);
+  expect(strcmp(formatted, source) == 0, "expected blank line before dedented sibling to be preserved");
+  free(formatted);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void formats_terminal_top_level_comment(void) {
+  const char *source =
+    "const answer u32 42\n"
+    "# keep me\n";
+  ZDiag diag = {0};
+  ZRowTokenVec tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  ZRowTree tree = {0};
+  expect(z_row_parse_layout(&tokens, &tree, &diag), diag.message);
+  char *formatted = z_format_row_layout(&tokens, &tree);
+  expect(strcmp(formatted, source) == 0, "expected terminal top-level comment to be preserved");
+  free(formatted);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void formats_non_ascii_string_as_parseable_bytes(void) {
+  const char *source =
+    "pub fn main Void\n"
+    "  check world.out.write \"\303\251\\n\"\n";
+  ZDiag diag = {0};
+  ZRowTokenVec tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  ZRowTree tree = {0};
+  expect(z_row_parse_layout(&tokens, &tree, &diag), diag.message);
+  char *formatted = z_format_row_layout(&tokens, &tree);
+  expect(strcmp(formatted, source) == 0, "expected non-ASCII string bytes to remain parseable");
+
+  ZDiag second_diag = {0};
+  ZRowTokenVec second_tokens = z_row_tokenize(formatted, &second_diag);
+  expect(second_diag.code == 0, second_diag.message);
+  ZRowTree second_tree = {0};
+  expect(z_row_parse_layout(&second_tokens, &second_tree, &second_diag), second_diag.message);
+  char *formatted_again = z_format_row_layout(&second_tokens, &second_tree);
+  expect(strcmp(formatted_again, source) == 0, "expected non-ASCII string formatting to be idempotent");
+  free(formatted_again);
+  z_free_row_tree(&second_tree);
+  z_free_row_tokens(&second_tokens);
+
+  free(formatted);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void formats_control_string_escape_as_parseable_bytes(void) {
+  const char *source =
+    "pub fn main Void\n"
+    "  check world.out.write \"\\x08\"\n";
+  ZDiag diag = {0};
+  ZRowTokenVec tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  ZRowTree tree = {0};
+  expect(z_row_parse_layout(&tokens, &tree, &diag), diag.message);
+  char *formatted = z_format_row_layout(&tokens, &tree);
+  expect(strcmp(formatted, source) == 0, "expected control string escape to remain parseable");
+
+  ZDiag second_diag = {0};
+  ZRowTokenVec second_tokens = z_row_tokenize(formatted, &second_diag);
+  expect(second_diag.code == 0, second_diag.message);
+  ZRowTree second_tree = {0};
+  expect(z_row_parse_layout(&second_tokens, &second_tree, &second_diag), second_diag.message);
+  char *formatted_again = z_format_row_layout(&second_tokens, &second_tree);
+  expect(strcmp(formatted_again, source) == 0, "expected control string formatting to be idempotent");
+  free(formatted_again);
+  z_free_row_tree(&second_tree);
+  z_free_row_tokens(&second_tokens);
+
+  free(formatted);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
 static void tracks_nested_dedents(void) {
   const char *source =
     "type Point\n"
@@ -1017,6 +1109,10 @@ int main(void) {
   formats_empty_block_comment_before_sibling();
   formats_block_footer_comment_after_child_rows();
   formats_row_layout_with_trivia();
+  formats_blank_line_before_dedented_sibling();
+  formats_terminal_top_level_comment();
+  formats_non_ascii_string_as_parseable_bytes();
+  formats_control_string_escape_as_parseable_bytes();
   tracks_nested_dedents();
   accepts_trailing_whitespace_only_rows();
   accepts_indented_final_row_without_newline();

@@ -214,7 +214,26 @@ static bool row_scan_string(const char *source, size_t *offset, int *column, ZRo
       if (escaped == 'n') row_append_char(&value, &len, &cap, '\n');
       else if (escaped == 'r') row_append_char(&value, &len, &cap, '\r');
       else if (escaped == 't') row_append_char(&value, &len, &cap, '\t');
-      else row_append_char(&value, &len, &cap, escaped);
+      else if (escaped == 'x') {
+        char high_ch = source[*offset];
+        char low_ch = high_ch ? source[*offset + 1] : 0;
+        int high = row_hex_digit(high_ch);
+        int low = row_hex_digit(low_ch);
+        if (high < 0 || low < 0) {
+          free(value);
+          row_diag(diag, line, start_column, 1, "malformed hex string escape", "two hex digits", "use an escape like '\\x41'");
+          return false;
+        }
+        unsigned byte = (unsigned)((high << 4) | low);
+        if (byte == 0) {
+          free(value);
+          row_diag(diag, line, start_column, 1, "string literal cannot contain a zero byte", "nonzero byte", NULL);
+          return false;
+        }
+        row_append_char(&value, &len, &cap, (char)byte);
+        *offset += 2;
+        *column += 2;
+      } else row_append_char(&value, &len, &cap, escaped);
     } else {
       row_append_char(&value, &len, &cap, next);
     }
@@ -577,6 +596,20 @@ static void row_flush_block_trivia(RowPendingTrivia *pending, ZRowTree *tree, si
   for (size_t i = 0; i < pending->len; i++) {
     ZRowTrivia trivia = pending->items[i];
     if (trivia.indent_depth > min_depth && trivia.parent != Z_ROW_NO_PARENT) {
+      if (trivia.kind != Z_ROW_TRIVIA_BLANK_LINE) trivia.kind = Z_ROW_TRIVIA_BLOCK_COMMENT;
+      row_push_tree_trivia(tree, trivia);
+    } else {
+      pending->items[write++] = pending->items[i];
+    }
+  }
+  pending->len = write;
+}
+
+static void row_flush_terminal_trivia(RowPendingTrivia *pending, ZRowTree *tree) {
+  size_t write = 0;
+  for (size_t i = 0; i < pending->len; i++) {
+    ZRowTrivia trivia = pending->items[i];
+    if (trivia.row != Z_ROW_NO_PARENT) {
       if (trivia.kind != Z_ROW_TRIVIA_BLANK_LINE) trivia.kind = Z_ROW_TRIVIA_BLOCK_COMMENT;
       row_push_tree_trivia(tree, trivia);
     } else {
@@ -1740,7 +1773,7 @@ bool z_row_parse_layout(const ZRowTokenVec *tokens, ZRowTree *tree, ZDiag *diag)
         } else if (row_newline_is_blank(tokens, i, first_token)) {
           row_pending_trivia_push(&pending, (ZRowTrivia){
             .kind = Z_ROW_TRIVIA_BLANK_LINE,
-            .row = Z_ROW_NO_PARENT,
+            .row = last_row,
             .parent = depth < parent_len ? parents[depth] : Z_ROW_NO_PARENT,
             .token = Z_ROW_NO_PARENT,
             .indent_depth = depth,
@@ -1776,6 +1809,7 @@ bool z_row_parse_layout(const ZRowTokenVec *tokens, ZRowTree *tree, ZDiag *diag)
         }
         (void)last_row;
         row_flush_block_trivia(&pending, tree, 0);
+        row_flush_terminal_trivia(&pending, tree);
         break;
       default:
         if (first_token == Z_ROW_NO_PARENT) {
@@ -1815,7 +1849,7 @@ static void row_format_string(ZBuf *buf, const char *text) {
     else if (*ch == '"' || *ch == '\\') {
       zbuf_append_char(buf, '\\');
       zbuf_append_char(buf, (char)*ch);
-    } else if (*ch < 32 || *ch >= 127) {
+    } else if (*ch < 32) {
       zbuf_appendf(buf, "\\x%02x", (unsigned)*ch);
     } else {
       zbuf_append_char(buf, (char)*ch);
@@ -1844,11 +1878,16 @@ static void row_format_token(ZBuf *buf, const ZRowToken *token) {
   else zbuf_append(buf, token->text);
 }
 
+static bool row_blank_trivia_precedes_row(const ZRowTree *tree, const ZRowTrivia *trivia, size_t row) {
+  return tree && trivia && trivia->kind == Z_ROW_TRIVIA_BLANK_LINE && row < tree->len && trivia->line <= tree->items[row].line;
+}
+
 static void row_format_prefix_trivia(ZBuf *buf, const ZRowTokenVec *tokens, const ZRowTree *tree, size_t row) {
   for (size_t i = 0; tree && i < tree->trivia_len; i++) {
     const ZRowTrivia *trivia = &tree->trivia[i];
     if (trivia->row != row) continue;
     if (trivia->kind == Z_ROW_TRIVIA_BLANK_LINE) {
+      if (!row_blank_trivia_precedes_row(tree, trivia, row)) continue;
       row_format_blank_line(buf);
     } else if (trivia->kind == Z_ROW_TRIVIA_LEADING_COMMENT && tokens && trivia->token < tokens->len) {
       row_format_indent(buf, trivia->indent_depth);
@@ -1865,13 +1904,19 @@ static const ZRowTrivia *row_format_trailing_trivia(const ZRowTree *tree, size_t
   return NULL;
 }
 
-static void row_format_block_trivia(ZBuf *buf, const ZRowTokenVec *tokens, const ZRowTree *tree, size_t parent, size_t depth) {
+static void row_format_block_trivia(ZBuf *buf, const ZRowTokenVec *tokens, const ZRowTree *tree, size_t parent) {
   for (size_t i = 0; tree && i < tree->trivia_len; i++) {
     const ZRowTrivia *trivia = &tree->trivia[i];
-    if (trivia->kind != Z_ROW_TRIVIA_BLOCK_COMMENT || !tokens || trivia->token >= tokens->len) continue;
+    if (trivia->kind != Z_ROW_TRIVIA_BLOCK_COMMENT && trivia->kind != Z_ROW_TRIVIA_BLANK_LINE) continue;
+    if (trivia->kind != Z_ROW_TRIVIA_BLANK_LINE && (!tokens || trivia->token >= tokens->len)) continue;
     size_t anchor = trivia->row == Z_ROW_NO_PARENT ? trivia->parent : trivia->row;
     if (anchor != parent) continue;
-    row_format_indent(buf, trivia->indent_depth ? trivia->indent_depth : depth + 1);
+    if (trivia->kind == Z_ROW_TRIVIA_BLANK_LINE) {
+      if (trivia->row != Z_ROW_NO_PARENT && row_blank_trivia_precedes_row(tree, trivia, trivia->row)) continue;
+      row_format_blank_line(buf);
+      continue;
+    }
+    row_format_indent(buf, trivia->indent_depth);
     zbuf_append(buf, tokens->items[trivia->token].text);
     row_format_newline(buf);
   }
@@ -1901,7 +1946,7 @@ char *z_format_row_layout(const ZRowTokenVec *tokens, const ZRowTree *tree) {
       zbuf_append(&buf, tokens->items[trailing->token].text);
     }
     row_format_newline(&buf);
-    row_format_block_trivia(&buf, tokens, tree, row, node->indent_depth);
+    row_format_block_trivia(&buf, tokens, tree, row);
   }
 
   return buf.data ? buf.data : z_strdup("");
