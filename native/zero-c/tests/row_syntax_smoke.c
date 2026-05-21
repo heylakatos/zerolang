@@ -1,5 +1,6 @@
 #include "zero.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,12 @@ void *z_checked_reallocarray(void *ptr, size_t count, size_t item_size) {
   void *next = realloc(ptr, count * item_size);
   if (!next && count) abort();
   return next;
+}
+
+void *z_checked_calloc(size_t count, size_t item_size) {
+  void *ptr = calloc(count ? count : 1, item_size ? item_size : 1);
+  if (!ptr) abort();
+  return ptr;
 }
 
 size_t z_grow_capacity(size_t current, size_t required, size_t initial) {
@@ -37,6 +44,43 @@ char *z_strndup(const char *text, size_t len) {
   return copy;
 }
 
+void zbuf_init(ZBuf *buf) {
+  memset(buf, 0, sizeof(*buf));
+}
+
+void zbuf_append_char(ZBuf *buf, char ch) {
+  if (buf->len + 1 >= buf->cap) {
+    buf->cap = z_grow_capacity(buf->cap, buf->len + 2, 64);
+    buf->data = z_checked_reallocarray(buf->data, buf->cap, sizeof(char));
+  }
+  buf->data[buf->len++] = ch;
+  buf->data[buf->len] = 0;
+}
+
+void zbuf_append(ZBuf *buf, const char *text) {
+  while (text && *text) zbuf_append_char(buf, *text++);
+}
+
+void zbuf_appendf(ZBuf *buf, const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  va_list copy;
+  va_copy(copy, args);
+  int needed = vsnprintf(NULL, 0, fmt, copy);
+  va_end(copy);
+  if (needed > 0) {
+    size_t start = buf->len;
+    for (int i = 0; i < needed; i++) zbuf_append_char(buf, '\0');
+    vsnprintf(buf->data + start, (size_t)needed + 1, fmt, args);
+    buf->len = start + (size_t)needed;
+  }
+  va_end(args);
+}
+
+void zbuf_free(ZBuf *buf) {
+  free(buf->data);
+}
+
 static void expect(bool ok, const char *message) {
   if (ok) return;
   fprintf(stderr, "%s\n", message);
@@ -56,6 +100,16 @@ static bool has_text(const ZRowTokenVec *tokens, ZRowTokenKind kind, const char 
     if (tokens->items[i].kind == kind && strcmp(tokens->items[i].text, text) == 0) return true;
   }
   return false;
+}
+
+static Program parse_row_program(const char *source, ZRowTokenVec *tokens, ZRowTree *tree) {
+  ZDiag diag = {0};
+  *tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  expect(z_row_parse_layout(tokens, tree, &diag), diag.message);
+  Program program = z_parse_row(tokens, tree, &diag);
+  expect(diag.code == 0, diag.message);
+  return program;
 }
 
 static void tokenizes_layout_and_trivia(void) {
@@ -222,6 +276,200 @@ static void rejects_short_hex_character_escape(void) {
   z_free_row_tokens(&tokens);
 }
 
+static void parses_core_function_program(void) {
+  const char *source =
+    "use std.mem\n"
+    "const answer i32 42\n"
+    "export c fn boot Void\n"
+    "fn id<T> T value T\n"
+    "  ret value\n"
+    "fn validate Bool input String ![InvalidInput ParseError]\n"
+    "  ret true\n"
+    "type Point\n"
+    "  x i32\n"
+    "  y i32\n"
+    "pub fn main Void world World !\n"
+    "  let point Point . x 40 y 2\n"
+    "  let bytes [3]u8 [1 2 3]\n"
+    "  let got i32 (id<i32> 42)\n"
+    "  let total i32 (+ 40 2)\n"
+    "  let byte u8 ('A' as u8)\n"
+    "  let middle Span<u8> \"zero\"[1..3]\n"
+    "  check world.out.write \"ok\\n\"\n";
+  ZRowTokenVec tokens = {0};
+  ZRowTree tree = {0};
+  Program program = parse_row_program(source, &tokens, &tree);
+
+  expect(program.use_imports.len == 1, "expected one use import");
+  expect(strcmp(program.use_imports.items[0].module, "std.mem") == 0, "expected dotted use import");
+  expect(program.consts.len == 1, "expected one const");
+  expect(strcmp(program.consts.items[0].name, "answer") == 0, "expected const name");
+  expect(strcmp(program.consts.items[0].type, "i32") == 0, "expected const type");
+  expect(program.shapes.len == 1, "expected one shape");
+  expect(program.functions.len == 4, "expected four functions");
+  expect(program.functions.items[0].export_c, "expected exported function");
+  expect(program.functions.items[1].type_params.len == 1, "expected generic function parameter");
+  Function *validate_fun = &program.functions.items[2];
+  expect(validate_fun->raises, "expected named error function to raise");
+  expect(validate_fun->has_error_set, "expected named error set");
+  expect(validate_fun->errors.len == 2, "expected named errors");
+  expect(strcmp(validate_fun->errors.items[0].name, "InvalidInput") == 0, "expected first named error");
+  Function *main_fun = &program.functions.items[3];
+  expect(main_fun->is_public, "expected public function");
+  expect(main_fun->raises, "expected open fallibility");
+  expect(main_fun->params.len == 1, "expected one function parameter");
+  expect(strcmp(main_fun->params.items[0].name, "world") == 0, "expected world parameter");
+  expect(strcmp(main_fun->params.items[0].type, "World") == 0, "expected World parameter type");
+  expect(main_fun->body.len == 7, "expected seven function statements");
+  expect(main_fun->body.items[0]->kind == STMT_LET, "expected let statement");
+  expect(main_fun->body.items[0]->expr->kind == EXPR_SHAPE_LITERAL, "expected shape literal expression");
+  expect(main_fun->body.items[0]->expr->fields.len == 2, "expected shape literal fields");
+  expect(main_fun->body.items[1]->expr->kind == EXPR_ARRAY_LITERAL, "expected array literal expression");
+  expect(main_fun->body.items[1]->expr->args.len == 3, "expected array literal items");
+  expect(main_fun->body.items[2]->expr->kind == EXPR_CALL, "expected generic call expression");
+  expect(main_fun->body.items[2]->expr->left->type_args.len == 1, "expected generic call type argument");
+  expect(main_fun->body.items[3]->expr->kind == EXPR_BINARY, "expected prefix operator expression");
+  expect(main_fun->body.items[4]->expr->kind == EXPR_CAST, "expected cast expression");
+  expect(main_fun->body.items[5]->expr->kind == EXPR_SLICE, "expected slice expression");
+  expect(main_fun->body.items[6]->kind == STMT_CHECK, "expected check statement");
+  expect(main_fun->body.items[6]->expr->kind == EXPR_CALL, "expected row call expression");
+
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void parses_control_flow_statements(void) {
+  const char *source =
+    "fn classify i32 value i32\n"
+    "  if <= value 0\n"
+    "    ret 0\n"
+    "  else if == value 1\n"
+    "    ret 1\n"
+    "  else\n"
+    "    mut total i32 0\n"
+    "    while < total value\n"
+    "      set total (+ total 1)\n"
+    "      if == total 2\n"
+    "        continue\n"
+    "    for index 0..3\n"
+    "      if == index 2\n"
+    "        break\n"
+    "    defer cleanup total\n"
+    "    ret total\n";
+  ZRowTokenVec tokens = {0};
+  ZRowTree tree = {0};
+  Program program = parse_row_program(source, &tokens, &tree);
+
+  Function *fun = &program.functions.items[0];
+  expect(fun->body.len == 1, "expected one outer statement");
+  Stmt *outer = fun->body.items[0];
+  expect(outer->kind == STMT_IF, "expected if statement");
+  expect(outer->then_body.len == 1, "expected if body");
+  expect(outer->else_body.len == 1, "expected else-if body");
+  Stmt *else_if = outer->else_body.items[0];
+  expect(else_if->kind == STMT_IF, "expected else-if to map to nested if");
+  expect(else_if->else_body.len == 5, "expected else block statements");
+  expect(else_if->else_body.items[0]->kind == STMT_LET, "expected mutable binding in else");
+  expect(else_if->else_body.items[0]->mutable_binding, "expected mut binding");
+  expect(else_if->else_body.items[1]->kind == STMT_WHILE, "expected while statement");
+  expect(else_if->else_body.items[1]->then_body.len == 2, "expected while body");
+  expect(else_if->else_body.items[1]->then_body.items[1]->then_body.items[0]->kind == STMT_CONTINUE, "expected nested continue");
+  expect(else_if->else_body.items[2]->kind == STMT_FOR, "expected for statement");
+  expect(strcmp(else_if->else_body.items[2]->name, "index") == 0, "expected loop binding name");
+  expect(else_if->else_body.items[2]->range_end->kind == EXPR_NUMBER, "expected range end expression");
+  expect(else_if->else_body.items[2]->then_body.items[0]->then_body.items[0]->kind == STMT_BREAK, "expected nested break");
+  expect(else_if->else_body.items[3]->kind == STMT_DEFER, "expected defer statement");
+  expect(else_if->else_body.items[4]->kind == STMT_RETURN, "expected final return");
+
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void parses_match_statement(void) {
+  const char *source =
+    "fn bucket i32 value u8\n"
+    "  match value\n"
+    "    0\n"
+    "      ret 0\n"
+    "    1..3\n"
+    "      ret 1\n"
+    "    _\n"
+    "      ret 9\n";
+  ZRowTokenVec tokens = {0};
+  ZRowTree tree = {0};
+  Program program = parse_row_program(source, &tokens, &tree);
+
+  Function *fun = &program.functions.items[0];
+  expect(fun->body.len == 1, "expected one match statement");
+  Stmt *match = fun->body.items[0];
+  expect(match->kind == STMT_MATCH, "expected match statement");
+  expect(match->match_arms.len == 3, "expected three match arms");
+  expect(strcmp(match->match_arms.items[1].case_name, "1") == 0, "expected range start case");
+  expect(strcmp(match->match_arms.items[1].range_end, "3") == 0, "expected range end case");
+  expect(strcmp(match->match_arms.items[2].case_name, "_") == 0, "expected fallback case");
+  expect(match->match_arms.items[2].body.items[0]->kind == STMT_RETURN, "expected fallback body");
+
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void parses_core_data_declarations(void) {
+  const char *source =
+    "type Point\n"
+    "  x i32\n"
+    "  y i32\n"
+    "  fn clear Void self mutref<Self>\n"
+    "    set self.x 0\n"
+    "enum Mode\n"
+    "  off\n"
+    "  on\n"
+    "choice Result\n"
+    "  ok i32\n"
+    "  err String\n"
+    "test \"adds\"\n"
+    "  expect == (+ 1 1) 2\n";
+  ZRowTokenVec tokens = {0};
+  ZRowTree tree = {0};
+  Program program = parse_row_program(source, &tokens, &tree);
+
+  expect(program.shapes.len == 1, "expected one shape");
+  expect(strcmp(program.shapes.items[0].name, "Point") == 0, "expected shape name");
+  expect(program.shapes.items[0].fields.len == 2, "expected shape fields");
+  expect(program.shapes.items[0].methods.len == 1, "expected shape method");
+  expect(program.shapes.items[0].methods.items[0].body.len == 1, "expected method body");
+  expect(program.shapes.items[0].methods.items[0].body.items[0]->kind == STMT_ASSIGN, "expected method assignment");
+  expect(program.enums.len == 1, "expected one enum");
+  expect(program.enums.items[0].cases.len == 2, "expected enum cases");
+  expect(program.choices.len == 1, "expected one choice");
+  expect(program.choices.items[0].cases.len == 2, "expected choice cases");
+  expect(strcmp(program.choices.items[0].cases.items[1].type, "String") == 0, "expected choice payload type");
+  expect(program.functions.len == 1, "expected one test function");
+  expect(program.functions.items[0].is_test, "expected test function");
+  expect(program.functions.items[0].body.items[0]->expr->kind == EXPR_CALL, "expected test expression call");
+
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void rejects_unbracketed_named_errors(void) {
+  const char *source = "fn validate i32 ok Bool ! InvalidInput\n";
+  ZDiag diag = {0};
+  ZRowTokenVec tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  ZRowTree tree = {0};
+  expect(z_row_parse_layout(&tokens, &tree, &diag), diag.message);
+  Program program = z_parse_row(&tokens, &tree, &diag);
+  expect(diag.code == 100, "expected unbracketed named error rejection");
+  expect(strstr(diag.message, "'['") != NULL, "expected named error bracket diagnostic");
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
 int main(void) {
   tokenizes_layout_and_trivia();
   tracks_nested_dedents();
@@ -232,6 +480,11 @@ int main(void) {
   rejects_indent_jump();
   rejects_escaped_string_newline();
   rejects_short_hex_character_escape();
+  parses_core_function_program();
+  parses_control_flow_statements();
+  parses_match_statement();
+  parses_core_data_declarations();
+  rejects_unbracketed_named_errors();
   printf("row syntax smoke ok\n");
   return 0;
 }
