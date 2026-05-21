@@ -354,6 +354,33 @@ static void parses_core_function_program(void) {
   z_free_row_tokens(&tokens);
 }
 
+static void parses_shape_literal_inside_array_literal(void) {
+  const char *source =
+    "type Point\n"
+    "  x i32\n"
+    "pub fn main Void\n"
+    "  let points [1]Point [Point . x 7]\n";
+  ZRowTokenVec tokens = {0};
+  ZRowTree tree = {0};
+  Program program = parse_row_program(source, &tokens, &tree);
+
+  Function *main_fun = &program.functions.items[0];
+  expect(main_fun->body.len == 1, "expected one main statement");
+  Expr *array = main_fun->body.items[0]->expr;
+  expect(array->kind == EXPR_ARRAY_LITERAL, "expected array literal expression");
+  expect(array->args.len == 1, "expected one array literal item");
+  Expr *point = array->args.items[0];
+  expect(point->kind == EXPR_SHAPE_LITERAL, "expected nested shape literal expression");
+  expect(strcmp(point->text, "Point") == 0, "expected nested shape literal type");
+  expect(point->fields.len == 1, "expected nested shape literal field");
+  expect(strcmp(point->fields.items[0].name, "x") == 0, "expected nested shape literal field name");
+  expect(point->fields.items[0].value->kind == EXPR_NUMBER, "expected nested shape literal field value");
+
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
 static void parses_control_flow_statements(void) {
   const char *source =
     "fn classify i32 value i32\n"
@@ -729,6 +756,7 @@ int main(void) {
   rejects_escaped_string_newline();
   rejects_short_hex_character_escape();
   parses_core_function_program();
+  parses_shape_literal_inside_array_literal();
   parses_control_flow_statements();
   parses_match_statement();
   parses_core_data_declarations();

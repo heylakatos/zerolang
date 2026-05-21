@@ -899,13 +899,21 @@ static bool row_next_starts_shape_literal(RowExprParser *parser) {
   return row_token_text(parser->tokens, copy, ".") && !row_token_connected_to_previous(parser->tokens, copy);
 }
 
+static bool row_shape_literal_at_boundary(RowExprParser *parser) {
+  if (parser->pos >= parser->end) return true;
+  return row_token_text(parser->tokens, parser->pos, ")") ||
+         row_token_text(parser->tokens, parser->pos, "]") ||
+         row_token_text(parser->tokens, parser->pos, ",") ||
+         row_token_text(parser->tokens, parser->pos, "as");
+}
+
 static Expr *row_parse_shape_literal(RowExprParser *parser) {
   const ZRowToken *start = &parser->tokens->items[parser->pos];
   char *type = row_parse_type_text(parser->tokens, &parser->pos, parser->end, parser->diag);
   row_expect_text(parser->tokens, &parser->pos, parser->end, parser->diag, ".", "expected '.' after shape literal type");
   Expr *expr = row_new_expr(EXPR_SHAPE_LITERAL, start);
   expr->text = type;
-  while (parser->pos < parser->end && !row_token_text(parser->tokens, parser->pos, ")")) {
+  while (!row_shape_literal_at_boundary(parser)) {
     const ZRowToken *field = row_expect_word(parser->tokens, &parser->pos, parser->end, parser->diag, "expected shape literal field name");
     if (!field) break;
     Expr *value = row_parse_expr_atom(parser);
