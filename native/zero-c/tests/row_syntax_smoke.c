@@ -340,6 +340,42 @@ static void formats_terminal_top_level_comment(void) {
   z_free_row_tokens(&tokens);
 }
 
+static void formats_comment_only_row_layout(void) {
+  const char *source = "# file docs\n";
+  ZDiag diag = {0};
+  ZRowTokenVec tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  ZRowTree tree = {0};
+  expect(z_row_parse_layout(&tokens, &tree, &diag), diag.message);
+  expect(tree.len == 0, "expected no row nodes for comment-only source");
+  expect(tree.trivia_len == 1, "expected unanchored comment trivia");
+  expect(tree.trivia[0].row == Z_ROW_NO_PARENT, "expected comment without row anchor");
+  char *formatted = z_format_row_layout(&tokens, &tree);
+  expect(strcmp(formatted, source) == 0, "expected comment-only row layout to be preserved");
+  free(formatted);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void formats_blank_comment_only_row_layout(void) {
+  const char *source =
+    "\n"
+    "# file docs\n";
+  ZDiag diag = {0};
+  ZRowTokenVec tokens = z_row_tokenize(source, &diag);
+  expect(diag.code == 0, diag.message);
+  ZRowTree tree = {0};
+  expect(z_row_parse_layout(&tokens, &tree, &diag), diag.message);
+  expect(tree.len == 0, "expected no row nodes for blank/comment-only source");
+  expect(count_trivia(&tree, Z_ROW_TRIVIA_BLANK_LINE) == 1, "expected unanchored blank-line trivia");
+  expect(count_trivia(&tree, Z_ROW_TRIVIA_LEADING_COMMENT) == 1, "expected unanchored comment trivia");
+  char *formatted = z_format_row_layout(&tokens, &tree);
+  expect(strcmp(formatted, source) == 0, "expected blank/comment-only row layout to be preserved");
+  free(formatted);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
 static void formats_non_ascii_string_as_parseable_bytes(void) {
   const char *source =
     "pub fn main Void\n"
@@ -1111,6 +1147,8 @@ int main(void) {
   formats_row_layout_with_trivia();
   formats_blank_line_before_dedented_sibling();
   formats_terminal_top_level_comment();
+  formats_comment_only_row_layout();
+  formats_blank_comment_only_row_layout();
   formats_non_ascii_string_as_parseable_bytes();
   formats_control_string_escape_as_parseable_bytes();
   tracks_nested_dedents();

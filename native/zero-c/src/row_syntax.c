@@ -606,17 +606,14 @@ static void row_flush_block_trivia(RowPendingTrivia *pending, ZRowTree *tree, si
 }
 
 static void row_flush_terminal_trivia(RowPendingTrivia *pending, ZRowTree *tree) {
-  size_t write = 0;
   for (size_t i = 0; i < pending->len; i++) {
     ZRowTrivia trivia = pending->items[i];
-    if (trivia.row != Z_ROW_NO_PARENT) {
+    if (trivia.row != Z_ROW_NO_PARENT || trivia.parent != Z_ROW_NO_PARENT) {
       if (trivia.kind != Z_ROW_TRIVIA_BLANK_LINE) trivia.kind = Z_ROW_TRIVIA_BLOCK_COMMENT;
-      row_push_tree_trivia(tree, trivia);
-    } else {
-      pending->items[write++] = pending->items[i];
     }
+    row_push_tree_trivia(tree, trivia);
   }
-  pending->len = write;
+  pending->len = 0;
 }
 
 static size_t row_finalize_node(ZRowTree *tree, size_t parent, size_t first_token, size_t token_count, size_t depth, const ZRowTokenVec *tokens) {
@@ -1922,11 +1919,32 @@ static void row_format_block_trivia(ZBuf *buf, const ZRowTokenVec *tokens, const
   }
 }
 
+static bool row_trivia_is_unanchored(const ZRowTrivia *trivia) {
+  return trivia && trivia->row == Z_ROW_NO_PARENT && trivia->parent == Z_ROW_NO_PARENT;
+}
+
+static void row_format_unanchored_trivia(ZBuf *buf, const ZRowTokenVec *tokens, const ZRowTree *tree) {
+  for (size_t i = 0; tree && i < tree->trivia_len; i++) {
+    const ZRowTrivia *trivia = &tree->trivia[i];
+    if (!row_trivia_is_unanchored(trivia)) continue;
+    if (trivia->kind == Z_ROW_TRIVIA_BLANK_LINE) {
+      if (!buf->data || buf->len == 0) zbuf_append_char(buf, '\n');
+      else row_format_blank_line(buf);
+      continue;
+    }
+    if (!tokens || trivia->token >= tokens->len) continue;
+    row_format_indent(buf, trivia->indent_depth);
+    zbuf_append(buf, tokens->items[trivia->token].text);
+    row_format_newline(buf);
+  }
+}
+
 char *z_format_row_layout(const ZRowTokenVec *tokens, const ZRowTree *tree) {
   ZBuf buf;
   zbuf_init(&buf);
   if (!tokens || !tree) return z_strdup("");
 
+  row_format_unanchored_trivia(&buf, tokens, tree);
   for (size_t row = 0; row < tree->len; row++) {
     const ZRowNode *node = &tree->items[row];
     row_format_prefix_trivia(&buf, tokens, tree, row);
