@@ -3800,7 +3800,23 @@ static char *format_row_source_text(const char *source, ZDiag *diag) {
   return formatted;
 }
 
-static void direct_input_push_symbol(SourceInput *input, const char *module, const char *kind, const char *name, bool is_public) {
+static bool direct_input_push_symbol(SourceInput *input, const char *module, const char *kind, const char *name, bool is_public, ZDiag *diag) {
+  if (is_public) {
+    for (size_t i = 0; input && i < input->symbol_count; i++) {
+      if (input->symbol_public[i] && strcmp(input->symbol_names[i], name ? name : "") == 0 && strcmp(input->symbol_modules[i], module ? module : "") != 0) {
+        diag->code = 7003;
+        diag->path = z_strdup(input->source_file ? input->source_file : "");
+        diag->line = 1;
+        diag->column = 1;
+        diag->length = 1;
+        snprintf(diag->message, sizeof(diag->message), "duplicate public symbol '%s'", name ? name : "");
+        snprintf(diag->expected, sizeof(diag->expected), "unique public symbol names across imported modules");
+        snprintf(diag->actual, sizeof(diag->actual), "%s also exported by %s", name ? name : "", input->symbol_modules[i]);
+        snprintf(diag->help, sizeof(diag->help), "rename one symbol or keep it private inside its module");
+        return false;
+      }
+    }
+  }
   input->symbol_names = z_checked_reallocarray(input->symbol_names, input->symbol_count + 1, sizeof(char *));
   input->symbol_modules = z_checked_reallocarray(input->symbol_modules, input->symbol_count + 1, sizeof(char *));
   input->symbol_kinds = z_checked_reallocarray(input->symbol_kinds, input->symbol_count + 1, sizeof(char *));
@@ -3809,6 +3825,7 @@ static void direct_input_push_symbol(SourceInput *input, const char *module, con
   input->symbol_modules[input->symbol_count] = z_strdup(module ? module : "");
   input->symbol_kinds[input->symbol_count] = z_strdup(kind ? kind : "");
   input->symbol_public[input->symbol_count++] = is_public;
+  return true;
 }
 
 static bool direct_row_token_text(const ZRowTokenVec *tokens, size_t index, const char *text) {
@@ -3824,7 +3841,7 @@ static const char *direct_row_symbol_kind(const ZRowTokenVec *tokens, size_t ind
   return NULL;
 }
 
-static void direct_input_add_row_symbols(SourceInput *input, const ZRowTokenVec *tokens, const ZRowTree *tree, const char *module) {
+static bool direct_input_add_row_symbols(SourceInput *input, const ZRowTokenVec *tokens, const ZRowTree *tree, const char *module, ZDiag *diag) {
   for (size_t i = 0; input && tokens && tree && i < tree->len; i++) {
     const ZRowNode *node = &tree->items[i];
     if (node->parent != Z_ROW_NO_PARENT) continue;
@@ -3844,8 +3861,9 @@ static void direct_input_add_row_symbols(SourceInput *input, const ZRowTokenVec 
     if (!kind) continue;
     size_t name_index = pos + 1;
     if (name_index >= end || tokens->items[name_index].kind != Z_ROW_TOKEN_WORD) continue;
-    direct_input_push_symbol(input, module, kind, tokens->items[name_index].text, is_public);
+    if (!direct_input_push_symbol(input, module, kind, tokens->items[name_index].text, is_public, diag)) return false;
   }
+  return !diag || diag->code == 0;
 }
 
 static bool parse_row_source_text(const char *source, Program *program, ZDiag *diag) {
@@ -3871,6 +3889,83 @@ static char *direct_row_join_module(const ZRowTokenVec *tokens, size_t start, si
   zbuf_init(&buf);
   for (size_t i = start; tokens && i < end && i < tokens->len; i++) zbuf_append(&buf, tokens->items[i].text);
   return buf.data ? buf.data : z_strdup("");
+}
+
+static bool direct_row_reserved_word(const char *text) {
+  const char *keywords[] = {
+    "as", "break", "check", "choice", "const", "continue", "defer", "else", "enum", "export", "extern", "false",
+    "fn", "for", "fun", "if", "import", "in", "let", "match", "meta", "mut", "null", "packed", "pub",
+    "raise", "raises", "rescue", "ret", "return", "set", "shape", "static", "test", "true", "type",
+    "use", "var", "while", NULL
+  };
+  for (int i = 0; keywords[i]; i++) {
+    if (text && strcmp(text, keywords[i]) == 0) return true;
+  }
+  return false;
+}
+
+static void direct_row_parse_diag(ZDiag *diag, const ZRowToken *token, const char *message, const char *expected) {
+  diag->code = 100;
+  diag->line = token ? token->line : 1;
+  diag->column = token ? token->column : 1;
+  diag->length = token && token->length > 0 ? (int)token->length : 1;
+  snprintf(diag->message, sizeof(diag->message), "%s", message ? message : "row syntax error");
+  snprintf(diag->expected, sizeof(diag->expected), "%s", expected ? expected : "");
+}
+
+static bool direct_row_validate_use(const ZRowTokenVec *tokens, size_t module_start, size_t module_end, size_t row_end, ZDiag *diag) {
+  if (module_start >= module_end) {
+    const ZRowToken *token = tokens && module_start < tokens->len ? &tokens->items[module_start] : (tokens && module_start > 0 ? &tokens->items[module_start - 1] : NULL);
+    direct_row_parse_diag(diag, token, "expected import module name", "import module name");
+    return false;
+  }
+
+  bool expect_segment = true;
+  for (size_t i = module_start; tokens && i < module_end; i++) {
+    const ZRowToken *token = &tokens->items[i];
+    if (expect_segment) {
+      if (token->kind != Z_ROW_TOKEN_WORD || direct_row_reserved_word(token->text)) {
+        direct_row_parse_diag(diag,
+                              token,
+                              i == module_start ? "expected import module name" : "expected import module segment",
+                              i == module_start ? "import module name" : "import module segment");
+        return false;
+      }
+      expect_segment = false;
+      continue;
+    }
+    if (!direct_row_token_text(tokens, i, ".")) {
+      direct_row_parse_diag(diag, token, "expected '.' between import module segments", "'.' or import alias");
+      return false;
+    }
+    expect_segment = true;
+  }
+
+  if (expect_segment) {
+    const ZRowToken *token = tokens && module_end > 0 ? &tokens->items[module_end - 1] : NULL;
+    direct_row_parse_diag(diag, token, "expected import module segment", "import module segment");
+    return false;
+  }
+
+  if (direct_row_token_text(tokens, module_end, "as")) {
+    size_t alias_pos = module_end + 1;
+    const ZRowToken *alias = tokens && alias_pos < row_end ? &tokens->items[alias_pos] : (tokens && module_end < tokens->len ? &tokens->items[module_end] : NULL);
+    if (!alias || alias->kind != Z_ROW_TOKEN_WORD) {
+      direct_row_parse_diag(diag, alias, "expected import alias", "identifier");
+      return false;
+    }
+    if (direct_row_reserved_word(alias->text)) {
+      direct_row_parse_diag(diag, alias, "reserved word cannot be used as an identifier", "identifier");
+      snprintf(diag->help, sizeof(diag->help), "choose a non-keyword name");
+      return false;
+    }
+    alias_pos++;
+    if (alias_pos < row_end) {
+      direct_row_parse_diag(diag, &tokens->items[alias_pos], "expected end of row after import alias", "end of row");
+      return false;
+    }
+  }
+  return true;
 }
 
 static char *direct_row_module_path(const char *root, const char *module) {
@@ -3906,6 +4001,37 @@ static bool direct_row_stack_contains(char **stack, size_t len, const char *path
   return false;
 }
 
+static void direct_row_format_cycle_chain(const char *root, char **stack, size_t stack_len, const char *path, ZBuf *out) {
+  bool started = false;
+  for (size_t i = 0; i < stack_len; i++) {
+    if (!started && strcmp(stack[i], path) != 0) continue;
+    started = true;
+    if (out->len > 0) zbuf_append(out, " -> ");
+    char *module = direct_row_module_name_from_path(root, stack[i]);
+    zbuf_append(out, module);
+    free(module);
+  }
+  if (out->len > 0) zbuf_append(out, " -> ");
+  char *module = direct_row_module_name_from_path(root, path);
+  zbuf_append(out, module);
+  free(module);
+}
+
+static void direct_row_set_cycle_diag(ZDiag *diag, const char *root, char **stack, size_t stack_len, const char *cycle_path, const char *diag_path, int line, int column, int length) {
+  ZBuf chain;
+  zbuf_init(&chain);
+  direct_row_format_cycle_chain(root, stack, stack_len, cycle_path, &chain);
+  diag->code = 7002;
+  diag->path = z_strdup(diag_path ? diag_path : "");
+  diag->line = line > 0 ? line : 1;
+  diag->column = column > 0 ? column : 1;
+  diag->length = length > 0 ? length : 1;
+  snprintf(diag->message, sizeof(diag->message), "import cycle detected");
+  snprintf(diag->actual, sizeof(diag->actual), "%s", chain.data ? chain.data : "");
+  snprintf(diag->help, sizeof(diag->help), "break the module cycle by moving shared declarations into a third module");
+  zbuf_free(&chain);
+}
+
 static void direct_row_append_source(SourceInput *input, ZBuf *combined, const char *path, const char *source) {
   const char *line = source ? source : "";
   int original_line = 1;
@@ -3929,13 +4055,7 @@ static void direct_row_append_source(SourceInput *input, ZBuf *combined, const c
 static bool direct_row_resolve_file(const char *path, const char *root, SourceInput *input, ZBuf *combined, ZDiag *diag, char ***stack, size_t *stack_len) {
   if (direct_input_has_file(input, path)) return true;
   if (direct_row_stack_contains(*stack, *stack_len, path)) {
-    diag->code = 7002;
-    diag->path = z_strdup(path);
-    diag->line = 1;
-    diag->column = 1;
-    diag->length = 1;
-    snprintf(diag->message, sizeof(diag->message), "import cycle detected");
-    snprintf(diag->help, sizeof(diag->help), "break the module cycle by moving shared declarations into a third module");
+    direct_row_set_cycle_diag(diag, root, *stack, *stack_len, path, path, 1, 1, 1);
     return false;
   }
 
@@ -3967,6 +4087,10 @@ static bool direct_row_resolve_file(const char *path, const char *root, SourceIn
     size_t module_start = pos + 1;
     size_t module_end = module_start;
     while (module_end < end && !direct_row_token_text(&tokens, module_end, "as")) module_end++;
+    if (!direct_row_validate_use(&tokens, module_start, module_end, end, diag)) {
+      if (!diag->path) diag->path = z_strdup(path);
+      break;
+    }
     char *import_name = direct_row_join_module(&tokens, module_start, module_end);
     if (strncmp(import_name, "std.", 4) == 0) {
       free(import_name);
@@ -3991,6 +4115,12 @@ static bool direct_row_resolve_file(const char *path, const char *root, SourceIn
     int import_length = module_end > module_start
       ? (int)(tokens.items[module_end - 1].column + tokens.items[module_end - 1].length - tokens.items[pos].column)
       : (int)tokens.items[pos].length;
+    if (direct_row_stack_contains(*stack, *stack_len, import_path)) {
+      direct_row_set_cycle_diag(diag, root, *stack, *stack_len, import_path, path, tokens.items[pos].line, tokens.items[pos].column, import_length);
+      free(import_path);
+      free(import_name);
+      break;
+    }
     direct_input_push_import_edge(input, module, import_name, import_path, path, tokens.items[pos].line, tokens.items[pos].column, import_length);
     bool ok = direct_row_resolve_file(import_path, root, input, combined, diag, stack, stack_len);
     free(import_path);
@@ -4001,8 +4131,9 @@ static bool direct_row_resolve_file(const char *path, const char *root, SourceIn
   if (diag->code == 0) {
     direct_input_push_string(&input->source_files, &input->source_file_count, path);
     direct_input_push_module(input, module, path);
-    direct_input_add_row_symbols(input, &tokens, &tree, module);
-    direct_row_append_source(input, combined, path, source);
+    if (direct_input_add_row_symbols(input, &tokens, &tree, module, diag)) {
+      direct_row_append_source(input, combined, path, source);
+    }
   }
 
   z_free_row_tree(&tree);

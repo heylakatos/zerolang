@@ -392,6 +392,52 @@ assert(rowImportGraph.imports.includes("row_helper"));
 assert(rowImportGraph.importEdges.some((edge) => edge.from === "row_import_main" && edge.to === "row_helper" && edge.path === rowHelperFixture));
 assert(rowImportGraph.functions.some((fun) => fun.name === "double"));
 
+const rowMalformedImportFixture = join(outDir, "row_malformed_import.row");
+writeFileSync(
+  rowMalformedImportFixture,
+  "use row helper\n" +
+    "pub fn main Void\n",
+);
+const rowMalformedImportCheck = json(["check", "--json", rowMalformedImportFixture], { allowFailure: true });
+assert.notEqual(rowMalformedImportCheck.code, 0);
+assert.equal(rowMalformedImportCheck.body.diagnostics[0].code, "PAR100");
+assert.match(rowMalformedImportCheck.body.diagnostics[0].message, /expected '\.' between import module segments/);
+
+const rowCycleAFixture = join(outDir, "row_cycle_a.row");
+const rowCycleBFixture = join(outDir, "row_cycle_b.row");
+writeFileSync(
+  rowCycleAFixture,
+  "use row_cycle_b\n" +
+    "pub fn a Void\n",
+);
+writeFileSync(
+  rowCycleBFixture,
+  "use row_cycle_a\n" +
+    "pub fn b Void\n",
+);
+const rowCycleCheck = json(["check", "--json", rowCycleAFixture], { allowFailure: true });
+assert.notEqual(rowCycleCheck.code, 0);
+assert.equal(rowCycleCheck.body.diagnostics[0].code, "IMP002");
+assert.equal(rowCycleCheck.body.diagnostics[0].path, rowCycleBFixture);
+assert.equal(rowCycleCheck.body.diagnostics[0].actual, "row_cycle_a -> row_cycle_b -> row_cycle_a");
+
+const rowDupMainFixture = join(outDir, "row_dup_main.row");
+const rowDupAFixture = join(outDir, "row_dup_a.row");
+const rowDupBFixture = join(outDir, "row_dup_b.row");
+writeFileSync(
+  rowDupMainFixture,
+  "use row_dup_a\n" +
+    "use row_dup_b\n" +
+    "pub fn main Void\n",
+);
+writeFileSync(rowDupAFixture, "pub fn shared Void\n");
+writeFileSync(rowDupBFixture, "pub fn shared Void\n");
+const rowDuplicatePublicCheck = json(["check", "--json", rowDupMainFixture], { allowFailure: true });
+assert.notEqual(rowDuplicatePublicCheck.code, 0);
+assert.equal(rowDuplicatePublicCheck.body.diagnostics[0].code, "IMP003");
+assert.match(rowDuplicatePublicCheck.body.diagnostics[0].message, /duplicate public symbol 'shared'/);
+assert.match(rowDuplicatePublicCheck.body.diagnostics[0].actual, /shared also exported by row_dup_a/);
+
 const rowMetadataFixture = join(outDir, "row_metadata.row");
 const rowMetadataSource =
   "pub enum Mode\n" +
