@@ -333,6 +333,131 @@ assert.equal(parseTree.functions[0].name, "main");
 assert.equal(parseTree.functions[0].paramCount, 1);
 assert.deepEqual(parseTree.functions[0].bodyKinds, ["if", "while", "check", "return"]);
 
+const rowCommandFixture = join(outDir, "row_command.row");
+const rowCommandSource =
+  "# command fixture\n" +
+  "fn inc i32 value i32\n" +
+  "  ret + value 1\n" +
+  "\n" +
+  "pub fn main Void\n" +
+  "  let total i32 inc 41\n";
+writeFileSync(rowCommandFixture, rowCommandSource);
+assert.equal(zero(["fmt", rowCommandFixture]).stdout, rowCommandSource);
+assert.match(zero(["fmt", "--check", rowCommandFixture]).stdout, /fmt ok/);
+const rowTokens = json(["tokens", "--json", rowCommandFixture]).body;
+assert.equal(rowTokens.schemaVersion, 1);
+assert.equal(rowTokens.syntax, "row");
+assert.deepEqual(rowTokens.tokens.slice(0, 4).map((token) => `${token.kind}:${token.text}`), [
+  "comment:# command fixture",
+  "newline:",
+  "word:fn",
+  "word:inc",
+]);
+const rowParseTree = json(["parse", "--json", rowCommandFixture]).body;
+assert.equal(rowParseTree.schemaVersion, 1);
+assert.equal(rowParseTree.root.functionCount, 2);
+assert.deepEqual(rowParseTree.functions.map((fun) => fun.name), ["inc", "main"]);
+assert.deepEqual(rowParseTree.functions.map((fun) => fun.bodyKinds), [["return"], ["let"]]);
+const rowCheck = json(["check", "--json", rowCommandFixture]).body;
+assert.equal(rowCheck.ok, true);
+assert.equal(rowCheck.sourceFile, rowCommandFixture);
+assert(rowCheck.interfaceFingerprints.modules.some((module) => module.name === "row_command" && module.publicSymbols.some((symbol) => symbol.name === "main")));
+const rowGraph = json(["graph", "--json", rowCommandFixture]).body;
+assert.equal(rowGraph.schemaVersion, 1);
+assert.equal(rowGraph.sourceFile, rowCommandFixture);
+assert(rowGraph.sourceFiles.includes(rowCommandFixture));
+assert(rowGraph.symbols.some((symbol) => symbol.name === "inc" && symbol.kind === "function"));
+assert(rowGraph.functions.some((fun) => fun.name === "main"));
+
+const rowHelperFixture = join(outDir, "row_helper.row");
+writeFileSync(
+  rowHelperFixture,
+  "pub fn double i32 value i32\n" +
+    "  ret + value value\n",
+);
+const rowImportFixture = join(outDir, "row_import_main.row");
+writeFileSync(
+  rowImportFixture,
+  "use row_helper\n" +
+    "pub fn main Void\n" +
+    "  let total i32 double 21\n",
+);
+const rowImportCheck = json(["check", "--json", rowImportFixture]).body;
+assert.equal(rowImportCheck.ok, true);
+assert(rowImportCheck.incrementalInvalidation.changedInputs.sourceFiles.includes(rowHelperFixture));
+const rowImportGraph = json(["graph", "--json", rowImportFixture]).body;
+assert(rowImportGraph.sourceFiles.includes(rowImportFixture));
+assert(rowImportGraph.sourceFiles.includes(rowHelperFixture));
+assert(rowImportGraph.imports.includes("row_helper"));
+assert(rowImportGraph.importEdges.some((edge) => edge.from === "row_import_main" && edge.to === "row_helper" && edge.path === rowHelperFixture));
+assert(rowImportGraph.functions.some((fun) => fun.name === "double"));
+
+const rowMalformedImportFixture = join(outDir, "row_malformed_import.row");
+writeFileSync(
+  rowMalformedImportFixture,
+  "use row helper\n" +
+    "pub fn main Void\n",
+);
+const rowMalformedImportCheck = json(["check", "--json", rowMalformedImportFixture], { allowFailure: true });
+assert.notEqual(rowMalformedImportCheck.code, 0);
+assert.equal(rowMalformedImportCheck.body.diagnostics[0].code, "PAR100");
+assert.match(rowMalformedImportCheck.body.diagnostics[0].message, /expected '\.' between import module segments/);
+
+const rowCycleAFixture = join(outDir, "row_cycle_a.row");
+const rowCycleBFixture = join(outDir, "row_cycle_b.row");
+writeFileSync(
+  rowCycleAFixture,
+  "use row_cycle_b\n" +
+    "pub fn a Void\n",
+);
+writeFileSync(
+  rowCycleBFixture,
+  "use row_cycle_a\n" +
+    "pub fn b Void\n",
+);
+const rowCycleCheck = json(["check", "--json", rowCycleAFixture], { allowFailure: true });
+assert.notEqual(rowCycleCheck.code, 0);
+assert.equal(rowCycleCheck.body.diagnostics[0].code, "IMP002");
+assert.equal(rowCycleCheck.body.diagnostics[0].path, rowCycleBFixture);
+assert.equal(rowCycleCheck.body.diagnostics[0].actual, "row_cycle_a -> row_cycle_b -> row_cycle_a");
+
+const rowDupMainFixture = join(outDir, "row_dup_main.row");
+const rowDupAFixture = join(outDir, "row_dup_a.row");
+const rowDupBFixture = join(outDir, "row_dup_b.row");
+writeFileSync(
+  rowDupMainFixture,
+  "use row_dup_a\n" +
+    "use row_dup_b\n" +
+    "pub fn main Void\n",
+);
+writeFileSync(rowDupAFixture, "pub fn shared Void\n");
+writeFileSync(rowDupBFixture, "pub fn shared Void\n");
+const rowDuplicatePublicCheck = json(["check", "--json", rowDupMainFixture], { allowFailure: true });
+assert.notEqual(rowDuplicatePublicCheck.code, 0);
+assert.equal(rowDuplicatePublicCheck.body.diagnostics[0].code, "IMP003");
+assert.match(rowDuplicatePublicCheck.body.diagnostics[0].message, /duplicate public symbol 'shared'/);
+assert.match(rowDuplicatePublicCheck.body.diagnostics[0].actual, /shared also exported by row_dup_a/);
+
+const rowMetadataFixture = join(outDir, "row_metadata.row");
+const rowMetadataSource =
+  "pub enum Mode\n" +
+  "  auto\n" +
+  "  manual\n" +
+  "pub choice Result\n" +
+  "  ok i32\n" +
+  "  err String\n" +
+  "test \"metadata\"\n" +
+  "  let total i32 + 1 1\n" +
+  "pub fn main Void\n";
+writeFileSync(rowMetadataFixture, rowMetadataSource);
+const rowMetadataGraph = json(["graph", "--json", rowMetadataFixture]).body;
+assert(rowMetadataGraph.symbols.some((symbol) => symbol.name === "Mode" && symbol.kind === "enum" && symbol.public === true));
+assert(rowMetadataGraph.symbols.some((symbol) => symbol.name === "Result" && symbol.kind === "choice" && symbol.public === true));
+assert(!rowMetadataGraph.symbols.some((symbol) => symbol.name.startsWith("__zero_test_")));
+const rowMetadataDoc = json(["doc", "--json", rowMetadataFixture]).body;
+assert(rowMetadataDoc.symbols.some((symbol) => symbol.name === "Mode" && symbol.kind === "enum"));
+assert(rowMetadataDoc.symbols.some((symbol) => symbol.name === "Result" && symbol.kind === "choice"));
+
 const testJson = json(["test", "--json", "--filter", "addition", "conformance/native/pass/test-blocks.0"]).body;
 assert.equal(testJson.schemaVersion, 1);
 assert.equal(testJson.ok, true);
