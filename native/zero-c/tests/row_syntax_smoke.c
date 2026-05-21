@@ -588,6 +588,43 @@ static void parses_lowercase_primitive_annotations(void) {
   z_free_row_tokens(&tokens);
 }
 
+static void parses_static_array_length_names(void) {
+  const char *source =
+    "fn first<static N: usize> u8 bytes [N]u8\n"
+    "  ret bytes[0]\n"
+    "pub fn main Void\n";
+  ZRowTokenVec tokens = {0};
+  ZRowTree tree = {0};
+  Program program = parse_row_program(source, &tokens, &tree);
+
+  Function *fun = &program.functions.items[0];
+  expect(fun->params.len == 1, "expected one array parameter");
+  expect(strcmp(fun->params.items[0].type, "[N]u8") == 0, "expected named array length type");
+
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
+static void parses_untyped_array_literals(void) {
+  const char *source =
+    "pub fn main Void\n"
+    "  let values [1 2]\n";
+  ZRowTokenVec tokens = {0};
+  ZRowTree tree = {0};
+  Program program = parse_row_program(source, &tokens, &tree);
+
+  Function *main_fun = &program.functions.items[0];
+  expect(main_fun->body.len == 1, "expected one statement");
+  expect(main_fun->body.items[0]->type == NULL, "expected no explicit array type");
+  expect(main_fun->body.items[0]->expr->kind == EXPR_ARRAY_LITERAL, "expected array literal expression");
+  expect(main_fun->body.items[0]->expr->args.len == 2, "expected two array literal items");
+
+  z_free_program(&program);
+  z_free_row_tree(&tree);
+  z_free_row_tokens(&tokens);
+}
+
 static void rejects_unbracketed_named_errors(void) {
   const char *source = "fn validate i32 ok Bool ! InvalidInput\n";
   ZDiag diag = {0};
@@ -651,6 +688,24 @@ static void rejects_unconsumed_row_expression_tokens(void) {
     "pub fn main Void\n"
     "  let x i32 1 ]\n",
     "unexpected token"
+  );
+}
+
+static void rejects_malformed_array_type_lengths(void) {
+  expect_row_parse_failure(
+    "pub fn main Void\n"
+    "  let bytes []u8 []\n",
+    "array length"
+  );
+  expect_row_parse_failure(
+    "pub fn main Void\n"
+    "  let bytes [1 2]u8 [1]\n",
+    "array length"
+  );
+  expect_row_parse_failure(
+    "pub fn main Void\n"
+    "  let bytes [pub]u8 []\n",
+    "array length"
   );
 }
 
@@ -798,10 +853,13 @@ int main(void) {
   parses_zero_arg_and_uppercase_member_calls();
   parses_check_space_call_expression();
   parses_lowercase_primitive_annotations();
+  parses_static_array_length_names();
+  parses_untyped_array_literals();
   rejects_unbracketed_named_errors();
   rejects_else_after_explicit_else_block();
   rejects_reserved_word_identifiers();
   rejects_unconsumed_row_expression_tokens();
+  rejects_malformed_array_type_lengths();
   rejects_empty_use_import();
   rejects_unexpected_child_rows();
   rejects_trailing_fixed_row_tokens();

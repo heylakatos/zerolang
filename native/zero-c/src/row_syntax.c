@@ -651,12 +651,20 @@ static bool row_append_type_atom(const ZRowTokenVec *tokens, size_t *pos, size_t
     return false;
   }
   if (row_token_text_at(tokens, *pos, end, "[")) {
+    const ZRowToken *start = &tokens->items[*pos];
     zbuf_append_char(buf, '[');
     (*pos)++;
-    while (*pos < end && !row_token_text(tokens, *pos, "]")) {
-      zbuf_append(buf, tokens->items[*pos].text);
-      (*pos)++;
+    if (*pos >= end || row_token_text(tokens, *pos, "]")) {
+      row_diag(diag, start->line, start->column, 1, "expected array length", "array length", NULL);
+      return false;
     }
+    const ZRowToken *length = &tokens->items[*pos];
+    if (length->kind != Z_ROW_TOKEN_NUMBER && (length->kind != Z_ROW_TOKEN_WORD || row_is_reserved_word(length->text))) {
+      row_diag(diag, length->line, length->column, length->length > 0 ? (int)length->length : 1, "expected array length", "integer literal or static length name", NULL);
+      return false;
+    }
+    zbuf_append(buf, length->text);
+    (*pos)++;
     if (!row_expect_text(tokens, pos, end, diag, "]", "expected ']' after array length")) return false;
     zbuf_append_char(buf, ']');
     return row_append_type_atom(tokens, pos, end, buf, diag);
@@ -1019,16 +1027,28 @@ static size_t row_find_closing_bracket(const ZRowTokenVec *tokens, size_t start,
   return Z_ROW_NO_PARENT;
 }
 
-static bool row_explicit_type_annotation(const ZRowTokenVec *tokens, size_t pos, size_t end) {
+static bool row_malformed_type_annotation_candidate(const ZRowTokenVec *tokens, size_t pos, size_t end) {
+  if (!row_token_text_at(tokens, pos, end, "[")) return true;
+  size_t close = row_find_closing_bracket(tokens, pos + 1, end);
+  return close != Z_ROW_NO_PARENT && close + 1 < end && row_is_type_start(tokens, close + 1, end);
+}
+
+static bool row_explicit_type_annotation(const ZRowTokenVec *tokens, size_t pos, size_t end, ZDiag *diag) {
   if (!row_is_type_start(tokens, pos, end)) return false;
   size_t copy = pos;
   ZDiag scratch = {0};
   char *type = row_parse_type_text(tokens, &copy, end, &scratch);
   free(type);
-  if (scratch.code == 0 && copy < end && row_token_text(tokens, copy, ".") && !row_token_connected_to_previous(tokens, copy)) return false;
-  if (scratch.code == 0 && copy < end && row_token_connected_to_previous(tokens, copy) &&
+  if (scratch.code != 0) {
+    if (row_malformed_type_annotation_candidate(tokens, pos, end)) {
+      row_diag(diag, scratch.line, scratch.column, scratch.length, scratch.message, scratch.expected, scratch.help);
+    }
+    return false;
+  }
+  if (copy < end && row_token_text(tokens, copy, ".") && !row_token_connected_to_previous(tokens, copy)) return false;
+  if (copy < end && row_token_connected_to_previous(tokens, copy) &&
       (row_token_text(tokens, copy, ".") || row_token_text(tokens, copy, "(") || row_token_text(tokens, copy, "["))) return false;
-  return scratch.code == 0 && copy < end;
+  return copy < end;
 }
 
 static bool row_reject_child_rows(const ZRowTree *tree, size_t parent, ZDiag *diag, const char *context) {
@@ -1065,7 +1085,7 @@ static Stmt *row_parse_statement(const ZRowTokenVec *tokens, const ZRowTree *tre
     Stmt *stmt = row_new_stmt(STMT_LET, start);
     stmt->mutable_binding = is_mut;
     if (name) stmt->name = z_strdup(name->text);
-    if (row_explicit_type_annotation(tokens, pos, end)) stmt->type = row_parse_type_text(tokens, &pos, end, diag);
+    if (row_explicit_type_annotation(tokens, pos, end, diag)) stmt->type = row_parse_type_text(tokens, &pos, end, diag);
     stmt->expr = row_parse_expr_range(tokens, pos, end, diag);
     return stmt;
   }
