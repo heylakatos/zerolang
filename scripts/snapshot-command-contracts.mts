@@ -1523,7 +1523,7 @@ const sizeWithArtifact = json(["size", "--json", "--out", sizedArtifact, "exampl
 assert.equal(sizeWithArtifact.artifactPath, sizedArtifact);
 assert(sizeWithArtifact.artifactBytes > 0);
 assert(existsSync(sizedArtifact));
-assert.equal(diagnostics.find((item) => item.code === "ERR001").repair.id, "add-raises-or-rescue");
+assert.equal(diagnostics.find((item) => item.code === "ERR001").repair.id, "add-fallible-marker-or-rescue");
 assert.equal(diagnostics.find((item) => item.code === "ERR003").repair.id, "check-or-rescue-fallible-call");
 assert.equal(diagnostics.find((item) => item.code === "TYP025").repair.id, "add-explicit-generic-type-arguments");
 assert.equal(diagnostics.find((item) => item.code === "TYP009").repair.id, "make-binding-mutable");

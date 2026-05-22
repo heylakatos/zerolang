@@ -58,6 +58,7 @@ function symbolKind(kind) {
     interface: 11,
     const: 14,
     alias: 5,
+    "type-alias": 5,
     type: 5,
   }[kind] ?? 13;
 }
@@ -199,7 +200,37 @@ async function compilerFacts(path) {
 }
 
 function completionItems() {
-  const keywordItems = ["pub", "fun", "shape", "enum", "choice", "interface", "let", "mut", "return", "check", "raises"].map((label) => ({ label, kind: 14 }));
+  const keywordItems = [
+    "pub",
+    "fn",
+    "type",
+    "enum",
+    "choice",
+    "interface",
+    "alias",
+    "const",
+    "let",
+    "mut",
+    "set",
+    "ret",
+    "if",
+    "else",
+    "while",
+    "for",
+    "match",
+    "check",
+    "rescue",
+    "raise",
+    "use",
+    "extern",
+    "packed",
+    "static",
+    "meta",
+    "test",
+    "break",
+    "continue",
+    "defer",
+  ].map((label) => ({ label, kind: 14 }));
   const symbolItems = [...symbols.values()].flat().map((symbol) => ({ label: symbol.name, kind: symbolKind(symbol.kind), detail: symbol.detail }));
   return [...keywordItems, ...symbolItems];
 }
@@ -430,7 +461,12 @@ async function selfTest() {
   assert(symbols.get(uri).some((symbol) => symbol.name === "add"));
   assert(notifications.some((item) => item.method === "textDocument/publishDiagnostics"));
   assert(workspaceSymbols("add").some((symbol) => symbol.name === "add"));
-  assert(completionItems().some((item) => item.label === "add"));
+  const completions = completionItems();
+  assert(completions.some((item) => item.label === "add"));
+  assert(completions.some((item) => item.label === "fn"));
+  assert(completions.some((item) => item.label === "ret"));
+  assert(!completions.some((item) => item.label === "fun"));
+  assert(!completions.some((item) => item.label === "raises"));
   const hoverText = hover({ textDocument: { uri }, position: { line: 0, character: 9 } }).contents.value;
   assert(hoverText.includes("add"));
   assert(hoverText.includes("capabilities:"));
@@ -472,7 +508,7 @@ async function selfTest() {
         {
           code: "ERR002",
           message: "caller error set is missing a callee error",
-          data: { repair: { id: "add-missing-error-name", summary: "Add the missing error name to the caller raises set." }, fixSafety: "api-changing" },
+          data: { repair: { id: "add-missing-error-name", summary: "Add the missing error name to the caller `![...]` set." }, fixSafety: "api-changing" },
         },
         {
           code: "ERR003",

@@ -2591,7 +2591,7 @@ static const char *diag_fix_safety(int code) {
 static const char *diag_repair_id(int code) {
   switch (code) {
     case 100: return "repair-syntax";
-    case 1001: return "add-raises-or-rescue";
+    case 1001: return "add-fallible-marker-or-rescue";
     case 1002: return "add-missing-error-name";
     case 1003: return "check-or-rescue-fallible-call";
     case 7001: return "fix-import-path";
@@ -7355,7 +7355,7 @@ static const char *helper_module_name(const StdHelperInfo *helper) {
 
 static const char *helper_error_behavior(const StdHelperInfo *helper) {
   if (!helper) return "unknown";
-  if (strstr(helper->name, "OrRaise")) return "raises ![NotFound TooLarge Io]";
+  if (strstr(helper->name, "OrRaise")) return "![NotFound TooLarge Io]";
   if (helper->return_type && strncmp(helper->return_type, "Maybe<", strlen("Maybe<")) == 0) return "returns null on failure";
   if (strcmp(helper->name, "std.proc.spawn") == 0) return "returns ProcStatus";
   return "infallible";

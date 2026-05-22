@@ -2270,7 +2270,7 @@ const errorSetMismatchJson = await execFileAsync(zero, ["check", "--json", "conf
 assert.notEqual(errorSetMismatchJson.code, 0);
 const errorSetMismatchBody = JSON.parse(errorSetMismatchJson.stdout);
 assert.equal(errorSetMismatchBody.diagnostics[0].code, "ERR002");
-assert.match(errorSetMismatchBody.diagnostics[0].expected, /caller raises/);
+assert.match(errorSetMismatchBody.diagnostics[0].expected, /caller `!\[\.\.\.\]` set/);
 assert.equal(errorSetMismatchBody.diagnostics[0].fixSafety, "api-changing");
 
 const stdFsErrorMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/std-fs-error-set-mismatch.0"]).catch((error) => error);
@@ -2283,7 +2283,7 @@ const stdFsCreateErrorMismatchJson = await execFileAsync(zero, ["check", "--json
 assert.notEqual(stdFsCreateErrorMismatchJson.code, 0);
 const stdFsCreateErrorMismatchBody = JSON.parse(stdFsCreateErrorMismatchJson.stdout);
 assert.equal(stdFsCreateErrorMismatchBody.diagnostics[0].code, "ERR002");
-assert.match(stdFsCreateErrorMismatchBody.diagnostics[0].help, /raises/);
+assert.match(stdFsCreateErrorMismatchBody.diagnostics[0].help, /`!\[\.\.\.\]`/);
 
 const stdFsUncheckedResourceJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/std-fs-unchecked-resource-fallible.0"]).catch((error) => error);
 assert.notEqual(stdFsUncheckedResourceJson.code, 0);
