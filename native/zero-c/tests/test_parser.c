@@ -3,16 +3,7 @@
  *
  * Build & run from native/zero-c/:
  *   make test-parser
- * or manually:
- *   cc -std=c11 -Wall -Wextra -Iinclude -Itests \
- *      tests/test_parser.c src/lexer.c src/parser.c src/fs.c src/target.c \
- *      -o .zero/bin/test_parser && .zero/bin/test_parser
  *
- * Exit 0 = all passed. Exit 1 = at least one failure.
- *
- * NOTE: Zero's parser requires every function to declare a return type
- * via `-> <Type>` (parser.c:733). The smallest valid function is therefore
- * `pub fun main() -> Void {}` — not `fun main() {}`.
  */
 
 #include "zero.h"
@@ -161,21 +152,154 @@ static void test_parse_hello_world(void) {
 
   /* The single body statement wraps a check-expression. `check` lowers
    * to STMT_CHECK when used as a statement (parser.c handles this in
-   * parse_statement). Verify the outer statement kind here; the exact
-   * Expr tree shape underneath is left to a future, finer-grained test. */
+   * parse_statement). Verify the outer statement kind here. */
   Stmt *s = fn->body.items[0];
   ASSERT_NOT_NULL(s);
   ASSERT_EQ_INT(s->kind, STMT_CHECK);
-  ASSERT_NOT_NULL(s->expr);
+  ASSERT_EQ_INT(s->expr->kind, EXPR_CALL);
+  ASSERT_NULL(s->expr->text);
+  
+  ASSERT_EQ_INT(s->expr->left->kind, EXPR_MEMBER);
+  ASSERT_EQ_STR(s->expr->left->text, "write");
+  ASSERT_EQ_INT(s->expr->left->left->kind, EXPR_MEMBER);
+  ASSERT_EQ_STR(s->expr->left->left->text, "out");
+  ASSERT_EQ_INT(s->expr->left->left->left->kind, EXPR_IDENT);
+  ASSERT_EQ_STR(s->expr->left->left->left->text, "world");
+
+  ASSERT_EQ_INT(s->expr->args.len, 1);
+  ASSERT_EQ_INT(s->expr->args.items[0]->kind, EXPR_STRING);
+  ASSERT_EQ_STR(s->expr->args.items[0]->text, "hello from zero\n");
+
   z_free_program(&p);
   z_free_tokens(&tokens);
+}
+
+/*
+ * Helper: parse a single expression by wrapping it in a return statement, then return the AST root of that expression.
+ * The Program / TokenVec ownership is handed back via out-params so the caller can free them after asserting on the expression tree.
+ */
+static Expr *parse_return_expr(const char *expr_src, TokenVec *tokens_out,
+                               Program *program_out, ZDiag *diag) {
+  char src[512];
+  snprintf(src, sizeof(src), "fun expr() -> i32 { return %s }", expr_src);
+  *tokens_out = z_tokenize(src, diag);
+  *program_out = z_parse(tokens_out, diag);
+  if (program_out->functions.len == 0) return NULL;
+  Function *fn = &program_out->functions.items[0];
+  if (fn->body.len == 0) return NULL;
+  Stmt *ret = fn->body.items[0];
+  return ret ? ret->expr : NULL;
+}
+
+/* ---------- Precedence-group tests (parse_binary + precedence table) ---------- */
+
+static void test_parse_binary_mul_tighter_than_add(void) {
+  BEGIN_CASE("1 + 2 * 3 parses as 1 + (2 * 3), not (1 + 2) * 3");
+  TokenVec t; Program p; ZDiag diag = {0};
+  Expr *root = parse_return_expr("1 + 2 * 3", &t, &p, &diag);
+  ASSERT_EQ_INT(diag.code, 0);
+  ASSERT_NOT_NULL(root);
+
+  /* root = '+', left=1, right='*' */
+  ASSERT_EQ_INT(root->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->text, "+");
+  ASSERT_NOT_NULL(root->left);
+  ASSERT_EQ_INT(root->left->kind, EXPR_NUMBER);
+  ASSERT_EQ_STR(root->left->text, "1");
+  ASSERT_NOT_NULL(root->right);
+  ASSERT_EQ_INT(root->right->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->right->text, "*");
+  /* deeper: '*' has left=2, right=3 */
+  ASSERT_EQ_STR(root->right->left->text, "2");
+  ASSERT_EQ_STR(root->right->right->text, "3");
+
+  z_free_program(&p);
+  z_free_tokens(&t);
+}
+
+static void test_parse_binary_left_associative(void) {
+  BEGIN_CASE("1 - 2 - 3 parses as (1 - 2) - 3 (left-associative)");
+  TokenVec t; Program p; ZDiag diag = {0};
+  Expr *root = parse_return_expr("1 - 2 - 3", &t, &p, &diag);
+  ASSERT_EQ_INT(diag.code, 0);
+  ASSERT_NOT_NULL(root);
+
+  /* root = '-', left='-'(1,2), right=3 */
+  ASSERT_EQ_INT(root->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->text, "-");
+  ASSERT_NOT_NULL(root->left);
+  ASSERT_EQ_INT(root->left->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->left->text, "-");
+  ASSERT_EQ_STR(root->left->left->text, "1");
+  ASSERT_EQ_STR(root->left->right->text, "2");
+  ASSERT_NOT_NULL(root->right);
+  ASSERT_EQ_INT(root->right->kind, EXPR_NUMBER);
+  ASSERT_EQ_STR(root->right->text, "3");
+
+  z_free_program(&p);
+  z_free_tokens(&t);
+}
+
+static void test_parse_binary_arith_tighter_than_comparison(void) {
+  BEGIN_CASE("1 + 2 == 3 parses as (1 + 2) == 3");
+  TokenVec t; Program p; ZDiag diag = {0};
+  Expr *root = parse_return_expr("1 + 2 == 3", &t, &p, &diag);
+  ASSERT_EQ_INT(diag.code, 0);
+  ASSERT_NOT_NULL(root);
+
+  /* root = '==', left='+'(1,2), right=3 */
+  ASSERT_EQ_INT(root->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->text, "==");
+  ASSERT_NOT_NULL(root->left);
+  ASSERT_EQ_INT(root->left->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->left->text, "+");
+  ASSERT_EQ_STR(root->left->left->text, "1");
+  ASSERT_EQ_STR(root->left->right->text, "2");
+  ASSERT_NOT_NULL(root->right);
+  ASSERT_EQ_STR(root->right->text, "3");
+
+  z_free_program(&p);
+  z_free_tokens(&t);
+}
+
+static void test_parse_binary_and_tighter_than_or(void) {
+  BEGIN_CASE("a || b && c parses as a || (b && c)");
+  TokenVec t; Program p; ZDiag diag = {0};
+  Expr *root = parse_return_expr("a || b && c", &t, &p, &diag);
+  ASSERT_EQ_INT(diag.code, 0);
+  ASSERT_NOT_NULL(root);
+
+  /* root = '||', left=a, right='&&'(b,c) */
+  ASSERT_EQ_INT(root->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->text, "||");
+  ASSERT_NOT_NULL(root->left);
+  ASSERT_EQ_INT(root->left->kind, EXPR_IDENT);
+  ASSERT_EQ_STR(root->left->text, "a");
+  ASSERT_NOT_NULL(root->right);
+  ASSERT_EQ_INT(root->right->kind, EXPR_BINARY);
+  ASSERT_EQ_STR(root->right->text, "&&");
+  ASSERT_EQ_STR(root->right->left->text, "b");
+  ASSERT_EQ_STR(root->right->right->text, "c");
+
+  z_free_program(&p);
+  z_free_tokens(&t);
 }
 
 static void test_parse_error_missing_arrow(void) {
   BEGIN_CASE("missing return arrow sets diag.code (PAR100 family)");
   TokenVec tokens; ZDiag diag = {0};
-  /* Parser requires `-> <Type>` after the parameter list. Omitting it
-   * should trip the `expect(parser, "->", ...)` call in parse_function. */
+  /*
+   * Parser requires `-> <Type>` after the parameter list. Omitting it
+   * should trip the `expect(parser, "->", ...)` call in parse_function.
+   *
+   * KNOWN ISSUE (not fixed here): parser.c:fail() unconditionally
+   * overwrites diag.message, so the message we read below is from the
+   * cascaded parse_type() call ("expected type name"), not the real
+   * root cause ("expected return type after parameters"). The
+   * column=14 also points at '{' instead of the missing arrow site.
+   * A one-line sticky-diag fix in fail() would surface the root
+   * cause; tracking only — do not change behavior here.
+   */
   Program p = parse("fun broken() {}", &tokens, &diag);
   ASSERT_EQ_INT(diag.code, 100);
   ASSERT_EQ_STR(diag.message, "expected type name");
@@ -192,13 +316,24 @@ static void test_parse_error_missing_arrow(void) {
 /* ================== Driver ================== */
 
 int main(void) {
-  test_parse_empty_program();
-  test_parse_minimal_main();
-  test_parse_function_with_params();
-  test_parse_raises_flag();
-  test_parse_let_statement();
-  test_parse_hello_world();
-  test_parse_error_missing_arrow();
+  /* ---- Top-level declarations: Program / Function fields ---- */
+  test_parse_empty_program();          // empty source -> empty Program
+  test_parse_minimal_main();           // smallest function: pub fun main() -> Void {}
+  test_parse_function_with_params();   // param list keeps name + type, in order
+  test_parse_raises_flag();            // raises flag (no explicit error set)
+
+  /* ---- Body statements + real-world example ---- */
+  test_parse_let_statement();          // STMT_LET / STMT_RETURN with nested expr
+  test_parse_hello_world();            // examples/hello.0 end-to-end AST layout
+
+  /* ---- Binary operator precedence + associativity (parse_binary table) ---- */
+  test_parse_binary_mul_tighter_than_add();          // *  tighter than +
+  test_parse_binary_left_associative();              // same-level left-assoc: 1 - 2 - 3
+  test_parse_binary_arith_tighter_than_comparison(); // +  tighter than ==
+  test_parse_binary_and_tighter_than_or();           // && tighter than ||
+
+  /* ---- Error paths ---- */
+  test_parse_error_missing_arrow();    // missing `->` triggers PAR100 (cascade issue noted inside)
 
   return TEST_SUMMARY();
 }

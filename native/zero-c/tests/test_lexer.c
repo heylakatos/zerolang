@@ -2,11 +2,8 @@
  * Unit tests for src/lexer.c (z_tokenize).
  *
  * Build & run from native/zero-c/:
- *   cc -std=c11 -Wall -Wextra -Iinclude \
- *      tests/test_lexer.c src/lexer.c src/fs.c src/target.c \
- *      -o .zero/bin/test_lexer && .zero/bin/test_lexer
+ *   make test-lexer
  *
- * Exit 0 = all passed. Exit 1 = at least one failure.
  */
 
 #include "zero.h"
