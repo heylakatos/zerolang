@@ -1,0 +1,16 @@
+const Foo usize 3
+
+type Foo
+  value i32
+
+fn read i32 value ref<Foo>
+  ret value.value
+
+fn pass Maybe<Foo> value Maybe<Foo>
+  ret value
+
+pub fn main Void
+  let foo Foo Foo . value 7
+  let maybe Maybe<Foo> null
+  let result Maybe<Foo> pass maybe
+  expect (&& (== (read (&foo)) 7) (== result.has false))

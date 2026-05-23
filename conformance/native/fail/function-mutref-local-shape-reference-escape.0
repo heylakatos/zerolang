@@ -1,0 +1,14 @@
+type Box
+  value ref<i32>
+
+type Holder
+  box Box
+
+fn storeLocal Void holder mutref<Holder>
+  let local 1
+  set holder.box Box . value (&local)
+
+pub fn main Void
+  let fallback 0
+  mut holder Holder . box (Box . value (&fallback))
+  storeLocal (&mut holder)

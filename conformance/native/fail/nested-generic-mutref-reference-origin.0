@@ -1,0 +1,15 @@
+type Cell<T: Type>
+  value ref<T>
+
+fn replace<T: Type> Void cell mutref<Cell<T>> next ref<T>
+  set cell.value next
+
+fn wrapper<T: Type> Void cell mutref<Cell<T>> next ref<T>
+  replace<T> cell next
+
+pub fn main Void
+  mut old 1
+  mut next 2
+  mut cell Cell<i32> Cell . value (&old)
+  wrapper<i32> (&mut cell) (&next)
+  set next 3

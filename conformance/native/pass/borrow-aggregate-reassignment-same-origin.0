@@ -1,0 +1,8 @@
+type Box
+  value mutref<i32>
+
+pub fn main Void
+  mut x 1
+  mut box Box . value (&mut x)
+  set box.value &mut x
+  set box Box . value (&mut x)

@@ -1,0 +1,17 @@
+enum Mode
+  left
+  alsoLeft
+
+fn choose ref<i32> mode Mode left ref<i32> right ref<i32>
+  match mode
+    left
+      ret left
+    alsoLeft
+      ret left
+  ret right
+
+pub fn main Void mode Mode
+  let x 1
+  mut y 2
+  let current choose mode (&x) (&y)
+  set y 3

@@ -1,0 +1,9 @@
+fn choose ref<i32> left ref<i32> right ref<i32> ![Done]
+  raise Done
+  ret right
+
+pub fn main Void ![Done]
+  let x 1
+  mut y 2
+  let current check choose (&x) (&y)
+  set y 3

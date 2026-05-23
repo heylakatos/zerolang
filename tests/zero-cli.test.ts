@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const root = process.cwd();
 const zero = join(root, "bin", "zero");
+const nativeZero = join(root, ".zero", "bin", "zero");
 const supportedTargets = [
   "darwin-arm64",
   "darwin-x64",
@@ -18,8 +19,6 @@ const supportedTargets = [
   "linux-arm64",
   "win32-x64.exe",
   "win32-arm64.exe",
-  "wasm32-wasi",
-  "wasm32-web",
 ];
 const artifactSummaryPattern = /\((?:\d+ B|\d+\.\d KiB|\d+\.\d MiB|\d+\.\d GiB), (?:\d+ ms|\d+\.\d s)\)/;
 const runnableDirectTarget =
@@ -34,6 +33,10 @@ function runnableBuildArgs(input: string, out: string) {
 
 function runZero(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
   return execFileAsync(zero, args, { cwd: options.cwd ?? root, env: options.env ?? process.env });
+}
+
+function runNativeZero(args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}) {
+  return execFileAsync(nativeZero, args, { cwd: options.cwd ?? root, env: options.env ?? process.env });
 }
 
 async function collectSkillMdFiles(dir: string): Promise<string[]> {
@@ -58,6 +61,11 @@ async function collectSkillMdFiles(dir: string): Promise<string[]> {
 }
 
 describe("native zero CLI", () => {
+  it("prints a terse plain version", async () => {
+    assert.equal((await runZero(["--version"])).stdout, "zero 0.1.3\n");
+    assert.equal((await runNativeZero(["--version"])).stdout, "zero 0.1.3\n");
+  });
+
   it("checks directly and rejects removed legacy build flags", async () => {
     const check = await runZero(["check", "examples/hello.0"]);
     assert.match(check.stdout, /ok/);
@@ -117,9 +125,8 @@ describe("native zero CLI", () => {
       );
       await writeFile(
         join(src, "main.0"),
-        `pub fun main(world: World) -> Void raises {
-    check world.out.write("hello from demo\\n")
-}
+        `pub fn main Void world World !
+  check world.out.write "hello from demo\\n"
 `,
       );
 
@@ -131,7 +138,7 @@ describe("native zero CLI", () => {
     }
   });
 
-  it("reports graph, size, routes, and targets", async () => {
+  it("reports graph, size, objects, and targets", async () => {
     const graph = JSON.parse((await runZero(["graph", "--json", "examples/point.0"])).stdout);
     assert.equal(graph.shapes[0].name, "Point");
     assert.equal(graph.functions.some((item: { name: string }) => item.name === "main"), true);
@@ -139,9 +146,6 @@ describe("native zero CLI", () => {
     const size = JSON.parse((await runZero(["size", "--json", "examples/point.0"])).stdout);
     assert.equal(size.schemaVersion, 1);
     assert.equal(size.generatedCBytes, 0);
-
-    const routes = JSON.parse((await runZero(["routes", "--json", "examples/web/hello"])).stdout);
-    assert.equal(routes.routes[0].path, "/");
 
     const objOut = join(tmpdir(), `zero-target-${Date.now()}.o`);
     try {
@@ -192,23 +196,39 @@ describe("native zero CLI", () => {
     const languageSkill = JSON.parse((await runZero(["skills", "get", "zero-language", "--json"])).stdout);
     assert.equal(languageSkill.success, true);
     assert.match(languageSkill.data[0].content, /# Zero Language/);
-    assert.match(languageSkill.data[0].content, /pub fun main/);
+    assert.match(languageSkill.data[0].content, /pub fn main/);
 
     const diagnosticSkill = JSON.parse((await runZero(["skills", "get", "zero-diagnostics", "--json"])).stdout);
     assert.equal(diagnosticSkill.success, true);
     assert.match(diagnosticSkill.data[0].content, /fixSafety/);
 
-    const zeroPath = JSON.parse((await runZero(["skills", "path", "zero", "--json"])).stdout);
-    assert.equal(zeroPath.success, true);
-    assert.match(zeroPath.data.path, /skills\/zero$/);
-
-    const languagePath = JSON.parse((await runZero(["skills", "path", "zero-language", "--json"])).stdout);
-    assert.equal(languagePath.success, true);
-    assert.match(languagePath.data.path, /skill-data\/zero-language\.md$/);
-
     const missing = await runZero(["skills", "get", "missing", "--json"]).catch((error) => error);
     assert.notEqual(missing.code, 0);
     assert.equal(JSON.parse(missing.stdout).success, false);
+
+    const removedPath = await runZero(["skills", "path", "zero", "--json"]).catch((error) => error);
+    assert.notEqual(removedPath.code, 0);
+    assert.match(JSON.parse(removedPath.stdout).error, /Unknown skills subcommand: path/);
+
+    const badSkillsFlag = await runZero(["skills", "-x"]).catch((error) => error);
+    assert.notEqual(badSkillsFlag.code, 0);
+    assert.match(badSkillsFlag.stderr, /Unknown skills flag: -x/);
+
+    const badListFlag = await runZero(["skills", "list", "--unknown", "--json"]).catch((error) => error);
+    assert.notEqual(badListFlag.code, 0);
+    assert.match(JSON.parse(badListFlag.stdout).error, /Unknown skills flag: --unknown/);
+
+    const badGetFlag = await runZero(["skills", "get", "zero-language", "--unknown", "--json"]).catch((error) => error);
+    assert.notEqual(badGetFlag.code, 0);
+    assert.match(JSON.parse(badGetFlag.stdout).error, /Unknown skills flag: --unknown/);
+
+    const nativeList = JSON.parse((await runNativeZero(["skills", "list", "--json"])).stdout);
+    assert.equal(nativeList.success, true);
+    assert.equal(nativeList.data.some((skill: { name: string }) => skill.name === "zero-language"), true);
+
+    const nativeLanguageSkill = JSON.parse((await runNativeZero(["skills", "get", "zero-language", "--json"])).stdout);
+    assert.equal(nativeLanguageSkill.success, true);
+    assert.match(nativeLanguageSkill.data[0].content, /# Zero Language/);
   });
 
   it("handles target-specific executable names", async () => {

@@ -1,0 +1,15 @@
+type Holder
+  value ref<i32>
+
+  fn replace Void self mutref<Self> next ref<i32>
+    set self.value next
+
+  fn replaceVia Void self mutref<Self> next ref<i32>
+    self.replace next
+
+pub fn main Void
+  mut x 1
+  let y 2
+  mut holder Holder . value (&y)
+  holder.replaceVia (&x)
+  set x 3

@@ -33,7 +33,6 @@ Use direct emitters. The removed generated-C backend is not a fallback path.
 ```sh
 zero build --emit exe examples/hello.0 --out .zero/out/hello
 zero build --emit obj examples/hello.0 --out .zero/out/hello.o
-zero build --emit wasm --target wasm32-wasi examples/direct-wasm-add.0
 ```
 
 Use `--json` when a tool will read the result:

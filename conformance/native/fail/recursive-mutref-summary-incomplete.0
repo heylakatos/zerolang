@@ -1,0 +1,11 @@
+type Holder
+  value ref<i32>
+
+fn storeRecursive Void holder mutref<Holder> next ref<i32>
+  storeRecursive holder next
+
+pub fn main Void
+  let old 1
+  let next 2
+  mut holder Holder . value (&old)
+  storeRecursive (&mut holder) (&next)

@@ -1,0 +1,5 @@
+fn identity<String: Type> String value String
+  ret value
+
+pub fn main Void
+  let value i32 identity<i32> 1

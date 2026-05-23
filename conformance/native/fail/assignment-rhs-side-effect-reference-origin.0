@@ -1,0 +1,14 @@
+type Holder
+  value ref<i32>
+  count i32
+
+fn replaceValue i32 holder mutref<Holder> next ref<i32>
+  set holder.value next
+  ret 1
+
+pub fn main Void
+  let old 1
+  mut next 2
+  mut holder Holder . value (&old) count 0
+  set holder.count replaceValue (&mut holder) (&next)
+  set next 3

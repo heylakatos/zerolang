@@ -1,0 +1,21 @@
+fn countPrimesThroughTen i32
+  mut prime [11]u8 [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  mut value usize 2
+  while < value 11
+    if == prime[value] 1
+      mut multiple + value value
+      while < multiple 11
+        set prime[multiple] 0
+        set multiple + multiple value
+    set value + value 1
+  mut count 0
+  mut index usize 0
+  while < index 11
+    if == prime[index] 1
+      set count + count 1
+    set index + index 1
+  ret count
+
+pub fn main Void world World !
+  if == (countPrimesThroughTen()) 4
+    check world.out.write "sieve small ok\n"

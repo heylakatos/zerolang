@@ -1,0 +1,11 @@
+type Holder
+  value ref<i32>
+
+pub fn main Void
+  mut next 1
+  mut old 2
+  mut holder Holder . value (&old)
+  if true
+    let selected &mut holder
+    set selected.value &next
+  set next 3

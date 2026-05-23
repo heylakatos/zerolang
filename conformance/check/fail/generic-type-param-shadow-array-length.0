@@ -1,0 +1,5 @@
+const T usize 4
+
+fn caller<T: Type> Void items ref<[T]i32>
+
+pub fn main Void

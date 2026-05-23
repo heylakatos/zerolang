@@ -1,0 +1,15 @@
+type Holder
+  value ref<i32>
+
+fn copyStored Void dst mutref<Holder> src mutref<Holder>
+  set dst.value src.value
+
+pub fn main Void
+  mut x 1
+  let y 2
+  let z 3
+  mut src Holder . value (&x)
+  mut dst Holder . value (&y)
+  copyStored (&mut dst) (&mut src)
+  set dst.value &z
+  set x 4

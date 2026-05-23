@@ -1,0 +1,17 @@
+type Holder
+  value ref<i32>
+
+fn replaceValue i32 holder mutref<Holder> next ref<i32>
+  set holder.value next
+  ret 0
+
+fn maybeReplace Void holder mutref<Holder> next ref<i32>
+  let values [1]
+  let ok rescue (std.mem.get values 0) err (replaceValue holder next)
+
+pub fn main Void
+  mut old 1
+  let next 2
+  mut holder Holder . value (&old)
+  maybeReplace (&mut holder) (&next)
+  set old 3

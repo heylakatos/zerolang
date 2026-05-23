@@ -1,0 +1,17 @@
+interface Storer<T: Type>
+  fn store Void self mutref<T> next ref<i32>
+
+type Holder
+  value ref<i32>
+
+  fn store Void self mutref<Self> next ref<i32>
+    set self.value next
+
+fn storeLocal<T: Storer<T>> Void holder mutref<T>
+  let local 1
+  T.store holder (&local)
+
+pub fn main Void
+  let fallback 0
+  mut holder Holder . value (&fallback)
+  storeLocal<Holder> (&mut holder)

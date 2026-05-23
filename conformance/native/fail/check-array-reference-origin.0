@@ -1,0 +1,8 @@
+pub fn main Maybe<Void> !
+  mut x 1
+  let y 2
+  mut refs [&x]
+  let current check std.mem.get refs 0
+  set refs [&y]
+  set x 2
+  ret null

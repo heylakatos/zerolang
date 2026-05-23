@@ -1,0 +1,20 @@
+type Holder
+  value ref<i32>
+
+  fn replace Void self mutref<Self> next ref<i32>
+    set self.value next
+
+fn choose mutref<Holder> flag Bool left mutref<Holder> right mutref<Holder>
+  if flag
+    ret left
+  ret right
+
+pub fn main Void flag Bool
+  mut x 1
+  let y 2
+  let z 3
+  mut left Holder . value (&x)
+  mut right Holder . value (&y)
+  let selected choose flag (&mut left) (&mut right)
+  selected.replace (&z)
+  set x 4

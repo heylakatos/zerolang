@@ -1,0 +1,9 @@
+type Holder
+  refs [2]ref<i32>
+
+pub fn main Void
+  mut old 1
+  let next 2
+  mut holder Holder . refs ([&old, &next])
+  set holder.refs[0] &next
+  set old 3

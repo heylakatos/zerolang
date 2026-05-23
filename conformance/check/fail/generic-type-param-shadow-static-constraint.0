@@ -1,0 +1,15 @@
+const T usize 4
+
+interface First<T: Type, static N: usize>
+  fn first u8 self ref<T>
+
+type Bytes<static N: usize>
+  items [N]u8
+
+  fn first u8 self ref<Self>
+    ret self.items[0]
+
+fn readFirst<T: First<T,T>> u8 value ref<T>
+  ret T.first value
+
+pub fn main Void

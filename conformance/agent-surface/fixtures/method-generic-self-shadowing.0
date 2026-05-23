@@ -1,0 +1,7 @@
+type Box<T: Type>
+  value T
+
+  fn keep<Self: Type> Self value Self
+    ret value
+
+pub fn main Void

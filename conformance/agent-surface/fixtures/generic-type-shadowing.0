@@ -1,0 +1,7 @@
+type T
+  value i32
+
+fn identity<T: Type> T value T
+  ret value
+
+pub fn main Void

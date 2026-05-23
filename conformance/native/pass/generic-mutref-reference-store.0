@@ -1,0 +1,11 @@
+type Cell<T: Type>
+  value ref<T>
+
+fn store<T: Type> Void cell mutref<Cell<T>> next ref<T>
+  set cell.value next
+
+pub fn main Void
+  let old 1
+  let next 2
+  mut cell Cell<i32> Cell . value (&old)
+  store<i32> (&mut cell) (&next)

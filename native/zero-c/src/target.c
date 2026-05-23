@@ -110,33 +110,7 @@ static const char *fallback_manifest =
 "libcMode = \"sysroot\"\n"
 "exeSuffix = \".exe\"\n"
 "zigTarget = \"aarch64-windows-msvc\"\n"
-"capabilities = [\"memory\", \"stdio\", \"time\", \"rand\"]\n"
-"[[target]]\n"
-"name = \"wasm32-wasi\"\n"
-"aliases = []\n"
-"os = \"wasi\"\n"
-"arch = \"wasm32\"\n"
-"abi = \"wasi\"\n"
-"objectFormat = \"wasm\"\n"
-"linker = \"wasm-ld\"\n"
-"libc = \"wasi\"\n"
-"libcMode = \"bundled-libc\"\n"
-"exeSuffix = \".wasm\"\n"
-"zigTarget = \"wasm32-wasi\"\n"
-"capabilities = [\"memory\", \"stdio\", \"args\", \"env\", \"fs\", \"time\", \"rand\"]\n"
-"[[target]]\n"
-"name = \"wasm32-web\"\n"
-"aliases = []\n"
-"os = \"web\"\n"
-"arch = \"wasm32\"\n"
-"abi = \"emscripten\"\n"
-"objectFormat = \"wasm\"\n"
-"linker = \"emcc\"\n"
-"libc = \"emscripten\"\n"
-"libcMode = \"emscripten\"\n"
-"exeSuffix = \".js\"\n"
-"zigTarget = \"wasm32-emscripten\"\n"
-"capabilities = [\"memory\", \"stdio\", \"env\", \"time\", \"rand\", \"web\"]\n";
+"capabilities = [\"memory\", \"stdio\", \"time\", \"rand\"]\n";
 
 static ZTargetInfo *targets = NULL;
 static size_t target_count = 0;
@@ -189,7 +163,7 @@ static void push_target(ZTargetInfo current) {
   if (!current.object_format) current.object_format = z_strdup("unknown");
   if (!current.linker) current.linker = z_strdup("cc");
   if (!current.capabilities) current.capabilities = z_strdup("\"memory\", \"stdio\"");
-  targets = realloc(targets, (target_count + 2) * sizeof(ZTargetInfo));
+  targets = z_checked_reallocarray(targets, target_count + 2, sizeof(ZTargetInfo));
   targets[target_count++] = current;
   targets[target_count] = (ZTargetInfo){0};
 }
@@ -356,18 +330,11 @@ static const char *target_libc_mode(const ZTargetInfo *target) {
   return z_target_libc_mode(target);
 }
 
-static bool target_uses_emscripten(const ZTargetInfo *target) {
-  return target &&
-         ((target->linker && (strcmp(target->linker, "emcc") == 0 || strcmp(target->linker, "emscripten") == 0)) ||
-          (target->libc_mode && strcmp(target->libc_mode, "emscripten") == 0));
-}
-
 const char *z_direct_object_emitter(const ZTargetInfo *target) {
   if (!target) return "none";
   const char *format = target->object_format ? target->object_format : "";
   const char *arch = target->arch ? target->arch : "";
   const char *os = target->os ? target->os : "";
-  if (strcmp(format, "wasm") == 0 && strcmp(arch, "wasm32") == 0) return "zero-wasm";
   if (strcmp(format, "elf") == 0 && strcmp(arch, "x86_64") == 0 && strcmp(os, "linux") == 0) return "zero-elf64";
   if (strcmp(format, "elf") == 0 && strcmp(arch, "aarch64") == 0 && strcmp(os, "linux") == 0) return "zero-elf-aarch64";
   if (strcmp(format, "macho") == 0 && strcmp(arch, "aarch64") == 0 && strcmp(os, "macos") == 0) return "zero-macho64";
@@ -389,7 +356,6 @@ const char *z_direct_exe_emitter(const ZTargetInfo *target) {
 const char *z_direct_backend_status(const ZTargetInfo *target) {
   if (!target) return "known-unimplemented";
   if (strcmp(z_direct_exe_emitter(target), "none") != 0) return "native-exe";
-  if (strcmp(z_direct_object_emitter(target), "zero-wasm") == 0) return "wasm-module";
   if (strcmp(z_direct_object_emitter(target), "none") != 0) return "native-object";
   return "known-unimplemented";
 }
@@ -408,7 +374,7 @@ const char *z_direct_backend_reason(const ZTargetInfo *target) {
 }
 
 static void append_target_toolchain_json(ZBuf *buf, const ZTargetInfo *target) {
-  const char *driver = z_target_is_host(target) ? "cc" : (target_uses_emscripten(target) ? "emcc" : "target-capable C compiler");
+  const char *driver = z_target_is_host(target) ? "cc" : "target-capable C compiler";
   const char *linker = target->linker && strcmp(target->linker, "zig cc") == 0 ? "target-cc" : (target->linker ? target->linker : "cc");
   zbuf_appendf(
     buf,
@@ -437,6 +403,33 @@ static void append_target_direct_backend_json(ZBuf *buf, const ZTargetInfo *targ
     target && target->arch ? target->arch : "unknown",
     target && target->abi ? target->abi : "",
     z_direct_backend_reason(target)
+  );
+}
+
+static bool target_http_runtime_supported(const ZTargetInfo *target) {
+  const char *object_emitter = z_direct_object_emitter(target);
+  return target &&
+         z_target_is_host(target) &&
+         z_target_has_capability(target, "net") &&
+         (strcmp(object_emitter, "zero-macho64") == 0 || strcmp(object_emitter, "zero-elf64") == 0) &&
+         strcmp(z_direct_exe_emitter(target), "none") != 0 &&
+         ((target->os && strcmp(target->os, "macos") == 0) ||
+          (target->os && strcmp(target->os, "linux") == 0));
+}
+
+void z_append_http_runtime_json(ZBuf *buf, const ZTargetInfo *target) {
+  if (target_http_runtime_supported(target)) {
+    zbuf_append(buf, "{\"status\":\"supported\",\"provider\":\"curl\",\"providerLink\":\"system-library\",\"tlsBoundary\":\"platform-or-c-library\",\"caSource\":\"provider-default\",\"tlsVerification\":true,\"customCa\":{\"supported\":true,\"mode\":\"test-harness\",\"env\":\"ZERO_HTTP_TEST_CA_BUNDLE\"},\"insecureMode\":false,\"protocols\":[\"http\",\"https\"],\"staticLibraries\":[\"zero_runtime.o\",\"zero_http_curl.o\"],\"systemLibraries\":[\"curl\"],\"reason\":\"host direct runtime link plan uses libcurl with verification enabled\"}");
+    return;
+  }
+  const char *reason = "target has no audited HTTP runtime provider";
+  if (target && !z_target_has_capability(target, "net")) reason = "target lacks net capability";
+  else if (target && !z_target_is_host(target)) reason = "HTTP runtime provider is host-only today";
+  else if (target && strcmp(z_direct_object_emitter(target), "zero-macho64") != 0 && strcmp(z_direct_object_emitter(target), "zero-elf64") != 0) reason = "target lacks host runtime relocation support";
+  zbuf_appendf(
+    buf,
+    "{\"status\":\"unsupported\",\"provider\":null,\"providerLink\":\"none\",\"tlsBoundary\":\"none\",\"caSource\":\"none\",\"tlsVerification\":false,\"customCa\":{\"supported\":false,\"mode\":\"none\",\"env\":\"\"},\"insecureMode\":false,\"protocols\":[],\"staticLibraries\":[],\"systemLibraries\":[],\"reason\":\"%s\"}",
+    reason
   );
 }
 
@@ -488,6 +481,8 @@ void z_append_targets_json(ZBuf *buf) {
     append_target_libc_json(buf, &targets[i]);
     zbuf_append(buf, ", \"directBackend\": ");
     append_target_direct_backend_json(buf, &targets[i]);
+    zbuf_append(buf, ", \"httpRuntime\": ");
+    z_append_http_runtime_json(buf, &targets[i]);
     zbuf_appendf(buf, "}%s\n", i + 1 < target_count ? "," : "");
   }
   zbuf_append(buf, "  ]\n}\n");

@@ -1,0 +1,8 @@
+pub fn main Void flag Bool
+  mut x 1
+  let y 2
+  mut refs [&x]
+  while flag
+    set refs [&y]
+    break
+  set x 3

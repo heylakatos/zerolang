@@ -23,8 +23,8 @@ bin/zero fix --plan --json examples/agent-repair-demo/broken.0
 Apply the suggested edit:
 
 ```diff
--    let dst: [4]u8 = [0, 0, 0, 0]
-+    let mut dst: [4]u8 = [0, 0, 0, 0]
+-  let dst [4]u8 [0, 0, 0, 0]
++  mut dst [4]u8 [0, 0, 0, 0]
 ```
 
 Re-run check:
@@ -36,5 +36,5 @@ bin/zero check examples/agent-repair-demo/fixed.0
 Run the scripted demo:
 
 ```sh
-node scripts/agent-repair-demo.mjs
+pnpm run agent:demo
 ```

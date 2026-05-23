@@ -1,0 +1,14 @@
+type Holder
+  value ref<i32>
+
+fn replaceValue i32 holder mutref<Holder> next ref<i32>
+  set holder.value next
+  ret 0
+
+pub fn main Void
+  mut old 1
+  let next 2
+  mut holder Holder . value (&old)
+  let values [1]
+  let value rescue (std.mem.get values 0) err (replaceValue (&mut holder) (&next))
+  set old 3

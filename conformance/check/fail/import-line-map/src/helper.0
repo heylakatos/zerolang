@@ -1,0 +1,2 @@
+pub fn hashPassword u32 bytes Span<u8>
+  ret std.crypto.hash32 bytes

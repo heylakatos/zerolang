@@ -1,0 +1,8 @@
+const T usize 4
+
+type Sized<static N: usize>
+  value i32
+
+fn caller<T: Type> Void item Sized<T>
+
+pub fn main Void

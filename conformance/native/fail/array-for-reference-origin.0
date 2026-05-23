@@ -1,0 +1,7 @@
+pub fn main Void
+  mut x 1
+  let y 2
+  mut refs [&x]
+  for index 0 .. 1
+    set refs [&y]
+  set x 3

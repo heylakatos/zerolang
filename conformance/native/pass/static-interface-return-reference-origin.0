@@ -1,0 +1,15 @@
+interface Reader<T: Type>
+  fn get ref<i32> self ref<T>
+
+type Holder
+  value i32
+
+  fn get ref<i32> self ref<Self>
+    ret &self.value
+
+fn read<T: Reader<T>> ref<i32> value ref<T>
+  ret T.get value
+
+pub fn main Void
+  let holder Holder . value 1
+  let value read<Holder> (&holder)

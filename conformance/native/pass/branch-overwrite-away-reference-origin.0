@@ -1,0 +1,12 @@
+type Holder
+  value ref<i32>
+
+pub fn main Void flag Bool
+  mut old 1
+  let next 2
+  mut holder Holder . value (&old)
+  if flag
+    set holder.value &next
+  else
+    set holder.value &next
+  set old 3

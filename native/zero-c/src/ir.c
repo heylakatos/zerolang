@@ -1,4 +1,7 @@
 #include "zero.h"
+#include "mir_verify.h"
+#include "specialize.h"
+#include "type_core.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -7,17 +10,34 @@
 #include <string.h>
 
 #define IR_READONLY_DATA_BASE 1024u
-#define IR_WASM_PAGE_BYTES 65536u
+#define IR_READONLY_DATA_LIMIT 65536u
+#define IR_SPECIALIZATION_PLAN_LIMIT 1024u
 
 static Expr *clone_expr(const Expr *expr);
 static Stmt *clone_stmt(const Stmt *stmt);
 static void push_function_clone(FunctionVec *vec, const Function *source);
 
-static void push_param_clone(ParamVec *vec, const Param *param) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Param));
+static void *ir_grow_items(void *items, size_t len, size_t *cap, size_t initial, size_t item_size) {
+  if (len + 1 > *cap) {
+    *cap = z_grow_capacity(*cap, len + 1, initial);
+    return z_checked_reallocarray(items, *cap, item_size);
   }
+  return items;
+}
+
+static void *ir_grow_tracked_items(IrProgram *ir, void *items, size_t len, size_t *cap, size_t initial, size_t item_size) {
+  if (len + 1 > *cap) {
+    size_t next_cap = z_grow_capacity(*cap, len + 1, initial);
+    void *next_items = z_checked_reallocarray(items, next_cap, item_size);
+    if (ir) ir->mir_bytes += next_cap * item_size;
+    *cap = next_cap;
+    return next_items;
+  }
+  return items;
+}
+
+static void push_param_clone(ParamVec *vec, const Param *param) {
+  vec->items = ir_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(Param));
   vec->items[vec->len++] = (Param){
     .name = z_strdup(param->name),
     .type = param->type ? z_strdup(param->type) : NULL,
@@ -35,18 +55,12 @@ static ParamVec clone_params(const ParamVec *params) {
 }
 
 static void push_expr_clone(ExprVec *vec, const Expr *expr) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Expr *));
-  }
+  vec->items = ir_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(Expr *));
   vec->items[vec->len++] = clone_expr(expr);
 }
 
 static void push_type_arg_clone(TypeArgVec *vec, const TypeArg *arg) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(TypeArg));
-  }
+  vec->items = ir_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(TypeArg));
   vec->items[vec->len++] = (TypeArg){
     .type = arg->type ? z_strdup(arg->type) : NULL,
     .line = arg->line,
@@ -55,10 +69,7 @@ static void push_type_arg_clone(TypeArgVec *vec, const TypeArg *arg) {
 }
 
 static void push_field_clone(FieldInitVec *vec, const FieldInit *field) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(FieldInit));
-  }
+  vec->items = ir_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(FieldInit));
   vec->items[vec->len++] = (FieldInit){
     .name = z_strdup(field->name),
     .value = clone_expr(field->value),
@@ -69,17 +80,19 @@ static void push_field_clone(FieldInitVec *vec, const FieldInit *field) {
 
 static Expr *clone_expr(const Expr *expr) {
   if (!expr) return NULL;
-  Expr *copy = calloc(1, sizeof(Expr));
+  Expr *copy = z_checked_calloc(1, sizeof(Expr));
   copy->kind = expr->kind;
   copy->text = expr->text ? z_strdup(expr->text) : NULL;
   copy->resolved_type = expr->resolved_type ? z_strdup(expr->resolved_type) : NULL;
   copy->moves_ownership = expr->moves_ownership;
   copy->mutable_borrow = expr->mutable_borrow;
   copy->bool_value = expr->bool_value;
+  copy->array_repeat = expr->array_repeat;
   copy->left = clone_expr(expr->left);
   copy->right = clone_expr(expr->right);
   for (size_t i = 0; i < expr->args.len; i++) push_expr_clone(&copy->args, expr->args.items[i]);
   for (size_t i = 0; i < expr->type_args.len; i++) push_type_arg_clone(&copy->type_args, &expr->type_args.items[i]);
+  for (size_t i = 0; i < expr->checked_type_args.len; i++) push_type_arg_clone(&copy->checked_type_args, &expr->checked_type_args.items[i]);
   for (size_t i = 0; i < expr->fields.len; i++) push_field_clone(&copy->fields, &expr->fields.items[i]);
   copy->line = expr->line;
   copy->column = expr->column;
@@ -87,10 +100,7 @@ static Expr *clone_expr(const Expr *expr) {
 }
 
 static void push_stmt_clone(StmtVec *vec, const Stmt *stmt) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 8 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Stmt *));
-  }
+  vec->items = ir_grow_items(vec->items, vec->len, &vec->cap, 8, sizeof(Stmt *));
   vec->items[vec->len++] = clone_stmt(stmt);
 }
 
@@ -101,10 +111,7 @@ static StmtVec clone_stmts(const StmtVec *stmts) {
 }
 
 static void push_match_arm_clone(MatchArmVec *vec, const MatchArm *arm) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(MatchArm));
-  }
+  vec->items = ir_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(MatchArm));
   vec->items[vec->len++] = (MatchArm){
     .case_name = z_strdup(arm->case_name),
     .range_end = arm->range_end ? z_strdup(arm->range_end) : NULL,
@@ -118,7 +125,7 @@ static void push_match_arm_clone(MatchArmVec *vec, const MatchArm *arm) {
 
 static Stmt *clone_stmt(const Stmt *stmt) {
   if (!stmt) return NULL;
-  Stmt *copy = calloc(1, sizeof(Stmt));
+  Stmt *copy = z_checked_calloc(1, sizeof(Stmt));
   copy->kind = stmt->kind;
   copy->name = stmt->name ? z_strdup(stmt->name) : NULL;
   copy->type = stmt->type ? z_strdup(stmt->type) : NULL;
@@ -149,6 +156,10 @@ static IrTypeKind ir_type_kind(const char *type) {
   if (strcmp(type, "Duration") == 0) return IR_TYPE_I64;
   if (strcmp(type, "RandSource") == 0) return IR_TYPE_U32;
   if (strcmp(type, "ProcStatus") == 0) return IR_TYPE_I32;
+  if (strcmp(type, "Net") == 0 || strcmp(type, "HttpClient") == 0) return IR_TYPE_I32;
+  if (strcmp(type, "HttpResult") == 0) return IR_TYPE_U64;
+  if (strcmp(type, "HttpError") == 0) return IR_TYPE_U32;
+  if (strcmp(type, "HttpHeaderValue") == 0) return IR_TYPE_U64;
   if (strcmp(type, "Fs") == 0 || strcmp(type, "File") == 0 || strcmp(type, "owned<File>") == 0) return IR_TYPE_I32;
   if (strcmp(type, "String") == 0 ||
       strcmp(type, "Span<u8>") == 0 ||
@@ -162,13 +173,30 @@ static IrTypeKind ir_type_kind(const char *type) {
   if (strcmp(type, "Vec") == 0) return IR_TYPE_VEC;
   if (strcmp(type, "BufferedReader") == 0 || strcmp(type, "BufferedWriter") == 0) return IR_TYPE_BYTE_VIEW;
   if (strcmp(type, "Maybe<MutSpan<u8>>") == 0 || strcmp(type, "Maybe<String>") == 0 || strcmp(type, "Maybe<owned<ByteBuf>>") == 0) return IR_TYPE_MAYBE_BYTE_VIEW;
-  if (strcmp(type, "Maybe<u8>") == 0 ||
+  if (strcmp(type, "Maybe<JsonDoc>") == 0 ||
+      strcmp(type, "Maybe<u8>") == 0 ||
       strcmp(type, "Maybe<u16>") == 0 ||
       strcmp(type, "Maybe<usize>") == 0 ||
       strcmp(type, "Maybe<i32>") == 0 ||
       strcmp(type, "Maybe<u32>") == 0 ||
       strcmp(type, "Maybe<owned<File>>") == 0) return IR_TYPE_MAYBE_SCALAR;
   return IR_TYPE_UNSUPPORTED;
+}
+
+static int ir_std_http_error_code(const char *name) {
+  if (!name) return -1;
+  if (strcmp(name, "std.http.errorNone") == 0) return 0;
+  if (strcmp(name, "std.http.errorInvalidUrl") == 0) return 1;
+  if (strcmp(name, "std.http.errorUnsupportedProtocol") == 0) return 2;
+  if (strcmp(name, "std.http.errorDns") == 0) return 3;
+  if (strcmp(name, "std.http.errorConnect") == 0) return 4;
+  if (strcmp(name, "std.http.errorTls") == 0) return 5;
+  if (strcmp(name, "std.http.errorTimeout") == 0) return 6;
+  if (strcmp(name, "std.http.errorTooLarge") == 0) return 7;
+  if (strcmp(name, "std.http.errorProviderUnavailable") == 0) return 8;
+  if (strcmp(name, "std.http.errorIo") == 0) return 9;
+  if (strcmp(name, "std.http.errorInvalidRequest") == 0) return 10;
+  return -1;
 }
 
 static bool ir_type_is_value(IrTypeKind type) {
@@ -188,6 +216,17 @@ static bool ir_type_is_direct_fallible_value(IrTypeKind type) {
   return type == IR_TYPE_VOID || type == IR_TYPE_BOOL || type == IR_TYPE_U8 ||
          type == IR_TYPE_U16 || type == IR_TYPE_USIZE || type == IR_TYPE_I32 ||
          type == IR_TYPE_U32;
+}
+
+static IrTypeKind ir_maybe_scalar_element_type(const char *type) {
+  const char *prefix = "Maybe<";
+  size_t prefix_len = strlen(prefix);
+  size_t len = type ? strlen(type) : 0;
+  if (len <= prefix_len + 1 || strncmp(type, prefix, prefix_len) != 0 || type[len - 1] != '>') return IR_TYPE_UNSUPPORTED;
+  char *inner = z_strndup(type + prefix_len, len - prefix_len - 1);
+  IrTypeKind element = ir_type_kind(inner);
+  free(inner);
+  return ir_type_is_value(element) ? element : IR_TYPE_UNSUPPORTED;
 }
 
 static unsigned ir_error_code_for_name(const char *name) {
@@ -218,10 +257,7 @@ static void ir_type_arg_vec_free(TypeArgVec *args) {
 }
 
 static void ir_type_arg_vec_push_owned(TypeArgVec *args, char *type) {
-  if (args->len + 1 > args->cap) {
-    args->cap = args->cap == 0 ? 4 : args->cap * 2;
-    args->items = realloc(args->items, args->cap * sizeof(TypeArg));
-  }
+  args->items = ir_grow_items(args->items, args->len, &args->cap, 4, sizeof(TypeArg));
   args->items[args->len++] = (TypeArg){.type = type};
 }
 
@@ -499,15 +535,32 @@ static bool ir_parse_fixed_array_type(const char *type, unsigned *out_len, IrTyp
   return ir_parse_fixed_array_type_for_program(NULL, type, out_len, out_element);
 }
 
+void z_backend_blocker_set(ZBackendBlocker *blocker, const char *target, const char *object_format, const char *backend, const char *stage, const char *unsupported_feature) {
+  if (!blocker) return;
+  memset(blocker, 0, sizeof(*blocker));
+  blocker->present = true;
+  snprintf(blocker->target, sizeof(blocker->target), "%s", target ? target : "");
+  snprintf(blocker->object_format, sizeof(blocker->object_format), "%s", object_format ? object_format : "");
+  snprintf(blocker->backend, sizeof(blocker->backend), "%s", backend ? backend : "");
+  snprintf(blocker->stage, sizeof(blocker->stage), "%s", stage ? stage : "");
+  snprintf(blocker->unsupported_feature, sizeof(blocker->unsupported_feature), "%s", unsupported_feature ? unsupported_feature : "");
+}
+
+void z_diag_set_backend_blocker(ZDiag *diag, const ZBackendBlocker *blocker) {
+  if (!diag || !blocker || !blocker->present) return;
+  diag->backend_blocker = *blocker;
+}
+
 static void ir_mark_unsupported(IrProgram *ir, const char *message, int line, int column, const char *actual) {
   if (!ir || !ir->mir_valid) return;
   ir->mir_valid = false;
   ir->mir_line = line > 0 ? line : 1;
   ir->mir_column = column > 0 ? column : 1;
   snprintf(ir->mir_message, sizeof(ir->mir_message), "%s", message ? message : "direct backend lowering failed");
-  snprintf(ir->mir_expected, sizeof(ir->mir_expected), "direct wasm MVP subset");
+  snprintf(ir->mir_expected, sizeof(ir->mir_expected), "direct backend MVP subset");
   snprintf(ir->mir_actual, sizeof(ir->mir_actual), "%s", actual ? actual : "unsupported construct");
   snprintf(ir->mir_help, sizeof(ir->mir_help), "restrict this program to exported primitive arithmetic functions or choose another supported direct target");
+  z_backend_blocker_set(&ir->backend_blocker, NULL, NULL, NULL, "lower", ir->mir_actual);
 }
 
 static bool ir_parse_integer_literal(const char *text, unsigned long long *out) {
@@ -610,7 +663,7 @@ static IrValue *ir_new_maybe_scalar_literal(IrProgram *ir, bool has, IrTypeKind 
 }
 
 static IrValue *ir_new_value(IrProgram *ir, IrValueKind kind, IrTypeKind type, int line, int column) {
-  IrValue *value = calloc(1, sizeof(IrValue));
+  IrValue *value = z_checked_calloc(1, sizeof(IrValue));
   value->kind = kind;
   value->type = type;
   value->line = line;
@@ -642,11 +695,7 @@ static void ir_free_instrs(IrInstr *instrs, size_t len) {
 }
 
 static void ir_function_push_local(IrProgram *ir, IrFunction *fun, const char *name, IrTypeKind type, bool is_param, bool is_array, bool is_record, const char *shape_name, IrTypeKind element_type, unsigned array_len, unsigned byte_size_override, unsigned alignment_override, bool is_mutable, int line, int column) {
-  if (fun->local_len + 1 > fun->local_cap) {
-    fun->local_cap = fun->local_cap == 0 ? 4 : fun->local_cap * 2;
-    fun->locals = realloc(fun->locals, fun->local_cap * sizeof(IrLocal));
-    if (ir) ir->mir_bytes += fun->local_cap * sizeof(IrLocal);
-  }
+  fun->locals = ir_grow_tracked_items(ir, fun->locals, fun->local_len, &fun->local_cap, 4, sizeof(IrLocal));
   unsigned byte_size = byte_size_override ? byte_size_override : (is_array ? ir_type_byte_size(element_type) * array_len : (type == IR_TYPE_BYTE_VIEW || type == IR_TYPE_ALLOC || type == IR_TYPE_VEC ? 16 : (type == IR_TYPE_MAYBE_BYTE_VIEW ? 24 : (type == IR_TYPE_MAYBE_SCALAR ? 16 : 8))));
   unsigned alignment = alignment_override ? alignment_override : (is_array ? ir_type_alignment(element_type) : 8);
   fun->locals[fun->local_len] = (IrLocal){
@@ -737,11 +786,7 @@ static char *ir_stable_id_for_source_function(const SourceInput *input, const Fu
 }
 
 static void ir_value_push_arg(IrProgram *ir, IrValue *value, IrValue *arg) {
-  if (value->arg_len + 1 > value->arg_cap) {
-    value->arg_cap = value->arg_cap == 0 ? 4 : value->arg_cap * 2;
-    value->args = realloc(value->args, value->arg_cap * sizeof(IrValue *));
-    if (ir) ir->mir_bytes += value->arg_cap * sizeof(IrValue *);
-  }
+  value->args = ir_grow_tracked_items(ir, value->args, value->arg_len, &value->arg_cap, 4, sizeof(IrValue *));
   value->args[value->arg_len++] = arg;
 }
 
@@ -761,19 +806,15 @@ static bool ir_add_readonly_data(IrProgram *ir, const unsigned char *bytes, unsi
   }
 
   size_t offset = IR_READONLY_DATA_BASE + ir->readonly_data_bytes;
-  if (offset + len >= IR_WASM_PAGE_BYTES) {
-    ir_mark_unsupported(ir, "direct wasm readonly data exceeds the initial memory page", line, column, "string/data segment");
+  if (offset + len >= IR_READONLY_DATA_LIMIT) {
+    ir_mark_unsupported(ir, "direct backend readonly data exceeds the bootstrap data limit", line, column, "string/data segment");
     return false;
   }
-  if (ir->data_segment_len + 1 > ir->data_segment_cap) {
-    ir->data_segment_cap = ir->data_segment_cap == 0 ? 4 : ir->data_segment_cap * 2;
-    ir->data_segments = realloc(ir->data_segments, ir->data_segment_cap * sizeof(IrDataSegment));
-    ir->mir_bytes += ir->data_segment_cap * sizeof(IrDataSegment);
-  }
+  ir->data_segments = ir_grow_tracked_items(ir, ir->data_segments, ir->data_segment_len, &ir->data_segment_cap, 4, sizeof(IrDataSegment));
   IrDataSegment *segment = &ir->data_segments[ir->data_segment_len++];
   segment->offset = (unsigned)offset;
   segment->len = len;
-  segment->bytes = malloc(len == 0 ? 1 : len);
+  segment->bytes = z_checked_malloc(len == 0 ? 1 : len);
   if (len > 0) memcpy(segment->bytes, bytes, len);
   ir->readonly_data_bytes += len;
   ir->direct_readonly_data_bytes = ir->readonly_data_bytes;
@@ -789,6 +830,11 @@ static bool ir_expr_is_byte_view_source(const Expr *expr) {
     bool is_span = callee && (strcmp(callee, "std.mem.span") == 0 || strcmp(callee, "std.mem.bufBytes") == 0);
     free(callee);
     if (is_span) return true;
+  }
+  if (expr && expr->resolved_type) {
+    unsigned array_len = 0;
+    IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
+    if (ir_parse_fixed_array_type(expr->resolved_type, &array_len, &element_type) && element_type == IR_TYPE_U8) return true;
   }
   return expr && (expr->kind == EXPR_STRING || expr->kind == EXPR_SLICE ||
                   expr->kind == EXPR_BORROW ||
@@ -830,17 +876,75 @@ static bool ir_is_world_stream_write(const IrFunction *fun, const Expr *expr, co
 
 static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunction *fun, const Expr *expr, IrValue **out);
 
+static bool ir_u8_literal_byte(const Expr *expr, unsigned char *out) {
+  if (!expr || !out) return false;
+  if (expr->kind != EXPR_NUMBER && expr->kind != EXPR_CHAR) return false;
+  unsigned long long parsed = 0;
+  if (!ir_parse_integer_literal(expr->text ? expr->text : "0", &parsed) || parsed > 255) return false;
+  *out = (unsigned char)parsed;
+  return true;
+}
+
+static bool ir_lower_array_literal_byte_view(IrProgram *ir, const Expr *expr, IrValue **out) {
+  if (!expr || expr->kind != EXPR_ARRAY_LITERAL) return false;
+  unsigned array_len = 0;
+  IrTypeKind element_type = IR_TYPE_UNSUPPORTED;
+  if (!ir_parse_fixed_array_type(expr->resolved_type, &array_len, &element_type) || element_type != IR_TYPE_U8) {
+    ir_mark_unsupported(ir, "direct backend inline byte array span requires a fixed [N]u8 literal", expr->line, expr->column, expr->resolved_type ? expr->resolved_type : "unknown array literal");
+    return false;
+  }
+  if (expr->array_repeat) {
+    if (expr->args.len != 2) {
+      ir_mark_unsupported(ir, "direct backend inline byte array repeat literal requires value and count", expr->line, expr->column, "array literal");
+      return false;
+    }
+  } else if (expr->args.len != array_len) {
+    ir_mark_unsupported(ir, "direct backend inline byte array literal length must match resolved type", expr->line, expr->column, expr->resolved_type ? expr->resolved_type : "array literal");
+    return false;
+  }
+
+  unsigned char *bytes = z_checked_malloc(array_len == 0 ? 1 : array_len);
+  if (expr->array_repeat) {
+    unsigned char byte = 0;
+    if (!ir_u8_literal_byte(expr->args.items[0], &byte)) {
+      free(bytes);
+      ir_mark_unsupported(ir, "direct backend inline byte array repeat requires a byte literal value", expr->args.items[0] ? expr->args.items[0]->line : expr->line, expr->args.items[0] ? expr->args.items[0]->column : expr->column, "non-byte literal");
+      return false;
+    }
+    memset(bytes, byte, array_len);
+  } else {
+    for (unsigned i = 0; i < array_len; i++) {
+      unsigned char byte = 0;
+      if (!ir_u8_literal_byte(expr->args.items[i], &byte)) {
+        free(bytes);
+        ir_mark_unsupported(ir, "direct backend inline byte array span requires byte literal elements", expr->args.items[i] ? expr->args.items[i]->line : expr->line, expr->args.items[i] ? expr->args.items[i]->column : expr->column, "non-byte literal");
+        return false;
+      }
+      bytes[i] = byte;
+    }
+  }
+
+  unsigned offset = 0;
+  bool added = ir_add_readonly_data(ir, bytes, array_len, expr->line, expr->column, &offset);
+  free(bytes);
+  if (!added) return false;
+  IrValue *value = ir_new_value(ir, IR_VALUE_STRING_LITERAL, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
+  value->data_offset = offset;
+  value->data_len = array_len;
+  *out = value;
+  return true;
+}
+
 static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFunction *fun, const Expr *expr, IrValue **out) {
   if (!expr) {
-    ir_mark_unsupported(ir, "direct wasm byte view is missing", 1, 1, "missing expression");
+    ir_mark_unsupported(ir, "direct backend byte view is missing", 1, 1, "missing expression");
     return false;
   }
   if (expr->kind == EXPR_STRING) {
     const char *text = expr->text ? expr->text : "";
     unsigned offset = 0;
     unsigned len = (unsigned)strlen(text);
-    unsigned char *nul_terminated = malloc((size_t)len + 1);
-    if (!nul_terminated) return false;
+    unsigned char *nul_terminated = z_checked_malloc((size_t)len + 1);
     memcpy(nul_terminated, text, len);
     nul_terminated[len] = 0;
     bool added = ir_add_readonly_data(ir, nul_terminated, len + 1, expr->line, expr->column, &offset);
@@ -851,6 +955,9 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     value->data_len = len;
     *out = value;
     return true;
+  }
+  if (expr->kind == EXPR_ARRAY_LITERAL) {
+    return ir_lower_array_literal_byte_view(ir, expr, out);
   }
   if (expr->kind == EXPR_CALL && expr->args.len == 1) {
     char *callee = ir_expr_callee_name(expr->left);
@@ -900,14 +1007,14 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
       return true;
     }
     if (!local || local->type != IR_TYPE_BYTE_VIEW) {
-      ir_mark_unsupported(ir, "direct wasm byte view identifier is not a byte-view local", expr->line, expr->column, expr->text);
+      ir_mark_unsupported(ir, "direct backend byte view identifier is not a byte-view local", expr->line, expr->column, expr->text);
       return false;
     }
   }
   if (expr->kind == EXPR_MEMBER && expr->left && expr->left->kind == EXPR_IDENT && strcmp(expr->text ? expr->text : "", "value") == 0) {
     const IrLocal *local = ir_function_find_local(fun, expr->left->text);
     if (!local || local->type != IR_TYPE_MAYBE_BYTE_VIEW) {
-      ir_mark_unsupported(ir, "direct wasm maybe byte-view value requires a Maybe byte-view local", expr->line, expr->column, expr->left->text);
+      ir_mark_unsupported(ir, "direct backend maybe byte-view value requires a Maybe byte-view local", expr->line, expr->column, expr->left->text);
       return false;
     }
     IrValue *value = ir_new_value(ir, IR_VALUE_MAYBE_VALUE, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
@@ -917,7 +1024,7 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
   }
   if (expr->kind == EXPR_SLICE) {
     if (!ir_expr_is_byte_view_source(expr->left)) {
-      ir_mark_unsupported(ir, "direct wasm slicing currently supports only string literal byte views", expr->line, expr->column, "non-string slice base");
+      ir_mark_unsupported(ir, "direct backend slicing currently supports only string literal byte views", expr->line, expr->column, "non-string slice base");
       return false;
     }
     IrValue *base = NULL;
@@ -939,7 +1046,7 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
       ir_free_value(base);
       ir_free_value(start);
       ir_free_value(end);
-      ir_mark_unsupported(ir, "direct wasm slice bounds must be integer values", expr->line, expr->column, "non-integer slice bound");
+      ir_mark_unsupported(ir, "direct backend slice bounds must be integer values", expr->line, expr->column, "non-integer slice bound");
       return false;
     }
     IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_SLICE, IR_TYPE_BYTE_VIEW, expr->line, expr->column);
@@ -949,16 +1056,12 @@ static bool ir_lower_byte_view(const Program *program, IrProgram *ir, const IrFu
     *out = value;
     return true;
   }
-  ir_mark_unsupported(ir, "direct wasm byte views currently support string literals and slices", expr->line, expr->column, "unsupported byte view source");
+  ir_mark_unsupported(ir, "direct backend byte views currently support string literals and slices", expr->line, expr->column, "unsupported byte view source");
   return false;
 }
 
 static void ir_instr_vec_push(IrProgram *ir, IrInstr **items, size_t *len, size_t *cap, IrInstr instr) {
-  if (*len + 1 > *cap) {
-    *cap = *cap == 0 ? 4 : *cap * 2;
-    *items = realloc(*items, *cap * sizeof(IrInstr));
-    if (ir) ir->mir_bytes += *cap * sizeof(IrInstr);
-  }
+  *items = ir_grow_tracked_items(ir, *items, *len, cap, 4, sizeof(IrInstr));
   (*items)[(*len)++] = instr;
 }
 
@@ -989,26 +1092,18 @@ static bool ir_compare_op(const char *text, IrCompareOp *out) {
 
 static const TypeArgVec *ir_call_type_args(const Expr *call) {
   if (!call) return NULL;
+  if (call->checked_type_args.len > 0) return &call->checked_type_args;
   if (call->type_args.len > 0) return &call->type_args;
+  if (call->kind == EXPR_CALL && call->left && call->left->checked_type_args.len > 0) return &call->left->checked_type_args;
   if (call->kind == EXPR_CALL && call->left && call->left->type_args.len > 0) return &call->left->type_args;
   return &call->type_args;
 }
 
 static char *ir_specialized_function_name(const Function *fun, const TypeArgVec *type_args) {
-  ZBuf buf;
-  zbuf_init(&buf);
-  zbuf_append(&buf, fun && fun->name ? fun->name : "");
-  for (size_t i = 0; type_args && i < type_args->len; i++) {
-    zbuf_append(&buf, "__");
-    const char *type = type_args->items[i].type ? type_args->items[i].type : "Unknown";
-    for (const char *p = type; *p; p++) {
-      char c = *p;
-      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') zbuf_append_char(&buf, c);
-      else zbuf_append_char(&buf, '_');
-    }
-  }
-  return buf.data;
+  return z_specialized_function_name(fun, type_args);
 }
+
+static char *ir_specialize_type_text(const char *type, const Function *fun, const TypeArgVec *type_args);
 
 static const char *ir_substitute_type_param(const Function *fun, const TypeArgVec *type_args, const char *type) {
   if (!fun || !type_args || !type) return type;
@@ -1027,11 +1122,7 @@ static char *ir_expr_callee_name(const Expr *expr) {
     char *left = ir_expr_callee_name(expr->left);
     size_t left_len = strlen(left);
     size_t text_len = strlen(expr->text ? expr->text : "");
-    char *name = malloc(left_len + text_len + 2);
-    if (!name) {
-      free(left);
-      return z_strdup("");
-    }
+    char *name = z_checked_malloc(left_len + text_len + 2);
     snprintf(name, left_len + text_len + 2, "%s.%s", left, expr->text ? expr->text : "");
     free(left);
     return name;
@@ -1041,7 +1132,7 @@ static char *ir_expr_callee_name(const Expr *expr) {
 
 static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunction *fun, const Expr *expr, IrValue **out) {
   if (!expr) {
-    ir_mark_unsupported(ir, "direct wasm expression is missing", 1, 1, "missing expression");
+    ir_mark_unsupported(ir, "direct backend expression is missing", 1, 1, "missing expression");
     return false;
   }
   switch (expr->kind) {
@@ -1056,7 +1147,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
       unsigned long long parsed = 0;
       if (!ir_parse_integer_literal(expr->text ? expr->text : "0", &parsed) || parsed > 255) {
         ir_free_value(value);
-        ir_mark_unsupported(ir, "direct wasm character literal is malformed", expr->line, expr->column, expr->text ? expr->text : "missing char");
+        ir_mark_unsupported(ir, "direct backend character literal is malformed", expr->line, expr->column, expr->text ? expr->text : "missing char");
         return false;
       }
       value->int_value = parsed;
@@ -1079,12 +1170,12 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
     case EXPR_NUMBER: {
       IrTypeKind type = ir_type_kind(expr->resolved_type);
       if (!ir_type_is_value(type)) {
-        ir_mark_unsupported(ir, "direct wasm numeric expression type is unsupported", expr->line, expr->column, expr->resolved_type);
+        ir_mark_unsupported(ir, "direct backend numeric expression type is unsupported", expr->line, expr->column, expr->resolved_type);
         return false;
       }
       unsigned long long parsed = 0;
       if (!ir_parse_integer_literal(expr->text, &parsed)) {
-        ir_mark_unsupported(ir, "direct wasm integer literal is malformed", expr->line, expr->column, expr->text);
+        ir_mark_unsupported(ir, "direct backend integer literal is malformed", expr->line, expr->column, expr->text);
         return false;
       }
       IrValue *value = ir_new_value(ir, IR_VALUE_INT, type, expr->line, expr->column);
@@ -1092,10 +1183,20 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
       *out = value;
       return true;
     }
+    case EXPR_NULL: {
+      if (ir_type_kind(expr->resolved_type) == IR_TYPE_MAYBE_SCALAR) {
+        IrTypeKind element = ir_maybe_scalar_element_type(expr->resolved_type);
+        if (element == IR_TYPE_UNSUPPORTED) element = IR_TYPE_I32;
+        *out = ir_new_maybe_scalar_literal(ir, false, element, 0, expr->line, expr->column);
+        return true;
+      }
+      ir_mark_unsupported(ir, "direct backend null expression type is unsupported", expr->line, expr->column, expr->resolved_type ? expr->resolved_type : "unknown null type");
+      return false;
+    }
     case EXPR_IDENT: {
       const IrLocal *local = ir_function_find_local(fun, expr->text);
       if (!local) {
-        ir_mark_unsupported(ir, "direct wasm identifier is not a local", expr->line, expr->column, expr->text);
+        ir_mark_unsupported(ir, "direct backend identifier is not a local", expr->line, expr->column, expr->text);
         return false;
       }
       if (local->type == IR_TYPE_BYTE_VIEW) return ir_lower_byte_view(program, ir, fun, expr, out);
@@ -1153,13 +1254,40 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         }
       }
       if (ir_expr_is_byte_view_source(expr)) return ir_lower_byte_view(program, ir, fun, expr, out);
-      ir_mark_unsupported(ir, "direct wasm member access supports Maybe<MutSpan<u8>> .has and .value", expr->line, expr->column, expr->text);
+      ir_mark_unsupported(ir, "direct backend member access supports Maybe<MutSpan<u8>> .has and .value", expr->line, expr->column, expr->text);
       return false;
     }
     case EXPR_STRING:
     case EXPR_SLICE:
       return ir_lower_byte_view(program, ir, fun, expr, out);
     case EXPR_INDEX: {
+      if (expr->left && expr->left->kind == EXPR_MEMBER &&
+          expr->left->left && expr->left->left->kind == EXPR_IDENT) {
+        const IrLocal *record = ir_function_find_local(fun, expr->left->left->text);
+        unsigned field_offset = 0;
+        bool field_is_array = false;
+        unsigned field_array_len = 0;
+        IrTypeKind field_element_type = IR_TYPE_UNSUPPORTED;
+        if (record && record->is_record &&
+            ir_shape_field_storage_info(program, record->shape_name, expr->left->text, &field_offset, NULL, &field_is_array, &field_array_len, &field_element_type) &&
+            field_is_array) {
+          unsigned long long const_index = 0;
+          if (!expr->right || expr->right->kind != EXPR_NUMBER ||
+              !ir_parse_integer_literal(expr->right->text, &const_index)) {
+            ir_mark_unsupported(ir, "direct backend record array field index currently requires a constant index", expr->right ? expr->right->line : expr->line, expr->right ? expr->right->column : expr->column, expr->left->text);
+            return false;
+          }
+          if (const_index >= field_array_len) {
+            ir_mark_unsupported(ir, "direct backend record array field index is out of bounds", expr->right->line, expr->right->column, expr->left->text);
+            return false;
+          }
+          IrValue *value = ir_new_value(ir, IR_VALUE_FIELD_LOAD, field_element_type, expr->line, expr->column);
+          value->local_index = record->index;
+          value->field_offset = field_offset + (unsigned)const_index * ir_type_byte_size(field_element_type);
+          *out = value;
+          return true;
+        }
+      }
       if (ir_expr_is_byte_view_source(expr->left)) {
         IrValue *view = NULL;
         IrValue *index = NULL;
@@ -1341,7 +1469,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         const IrLocal *alloc = ir_function_find_local(fun, expr->args.items[0]->text);
         if (!alloc || alloc->type != IR_TYPE_ALLOC || !alloc->is_mutable) {
           free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.allocBytes expects a mutable FixedBufAlloc local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable allocator");
+          ir_mark_unsupported(ir, "direct backend std.mem.allocBytes expects a mutable FixedBufAlloc local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable allocator");
           return false;
         }
         IrValue *len = NULL;
@@ -1352,7 +1480,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         if (!ir_type_is_value(len->type)) {
           ir_free_value(len);
           free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.allocBytes length must be an integer value", expr->args.items[1]->line, expr->args.items[1]->column, "non-integer length");
+          ir_mark_unsupported(ir, "direct backend std.mem.allocBytes length must be an integer value", expr->args.items[1]->line, expr->args.items[1]->column, "non-integer length");
           return false;
         }
         IrValue *value = ir_new_value(ir, IR_VALUE_ALLOC_BYTES, IR_TYPE_MAYBE_BYTE_VIEW, expr->line, expr->column);
@@ -1513,6 +1641,221 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_VIEW_EQ, IR_TYPE_BOOL, expr->line, expr->column);
         value->left = left;
         value->right = right;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if ((strcmp(callee_name, "std.json.validateBytes") == 0 ||
+           strcmp(callee_name, "std.json.streamTokensBytes") == 0) &&
+          expr->args.len == 1) {
+        IrValue *view = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &view)) {
+          free(callee_name);
+          return false;
+        }
+        IrValueKind kind = strcmp(callee_name, "std.json.validateBytes") == 0 ? IR_VALUE_JSON_VALIDATE_BYTES : IR_VALUE_JSON_STREAM_TOKENS_BYTES;
+        IrTypeKind type = kind == IR_VALUE_JSON_VALIDATE_BYTES ? IR_TYPE_BOOL : IR_TYPE_USIZE;
+        IrValue *value = ir_new_value(ir, kind, type, expr->line, expr->column);
+        value->left = view;
+        if (ir->direct_runtime_helper_count < 1) ir->direct_runtime_helper_count = 1;
+        if (ir->direct_host_runtime_import_count < 1) ir->direct_host_runtime_import_count = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.json.parseBytes") == 0 && expr->args.len == 2) {
+        if (!expr->args.items[0] || expr->args.items[0]->kind != EXPR_IDENT) {
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.json.parseBytes expects a mutable FixedBufAlloc local", expr->args.items[0] ? expr->args.items[0]->line : expr->line, expr->args.items[0] ? expr->args.items[0]->column : expr->column, "non-local allocator");
+          return false;
+        }
+        const IrLocal *alloc = ir_function_find_local(fun, expr->args.items[0]->text);
+        if (!alloc || alloc->type != IR_TYPE_ALLOC || !alloc->is_mutable) {
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.json.parseBytes expects a mutable FixedBufAlloc local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable allocator");
+          return false;
+        }
+        IrValue *view = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[1], &view)) {
+          free(callee_name);
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_JSON_PARSE_BYTES, IR_TYPE_I64, expr->line, expr->column);
+        value->local_index = alloc->index;
+        value->left = view;
+        ir->direct_allocator_helper_count = ir->direct_allocator_helper_count < 2 ? 2 : ir->direct_allocator_helper_count;
+        if (ir->direct_runtime_helper_count < 1) ir->direct_runtime_helper_count = 1;
+        if (ir->direct_host_runtime_import_count < 1) ir->direct_host_runtime_import_count = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.net.host") == 0 && expr->args.len == 0) {
+        IrValue *value = ir_new_value(ir, IR_VALUE_INT, IR_TYPE_I32, expr->line, expr->column);
+        value->int_value = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      int http_error_code = ir_std_http_error_code(callee_name);
+      if (http_error_code >= 0 && expr->args.len == 0) {
+        IrValue *value = ir_new_value(ir, IR_VALUE_INT, IR_TYPE_U32, expr->line, expr->column);
+        value->int_value = (unsigned long long)http_error_code;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.http.client") == 0 && expr->args.len == 1) {
+        IrValue *net = NULL;
+        if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &net)) {
+          free(callee_name);
+          return false;
+        }
+        ir_free_value(net);
+        IrValue *value = ir_new_value(ir, IR_VALUE_INT, IR_TYPE_I32, expr->line, expr->column);
+        value->int_value = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.http.fetch") == 0 && expr->args.len == 4) {
+        IrValue *client = NULL;
+        IrValue *request = NULL;
+        IrValue *response = NULL;
+        IrValue *timeout = NULL;
+        if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &client) ||
+            !ir_lower_byte_view(program, ir, fun, expr->args.items[1], &request) ||
+            !ir_lower_byte_view(program, ir, fun, expr->args.items[2], &response) ||
+            !ir_lower_expr(program, ir, fun, expr->args.items[3], &timeout)) {
+          ir_free_value(client);
+          ir_free_value(request);
+          ir_free_value(response);
+          ir_free_value(timeout);
+          free(callee_name);
+          return false;
+        }
+        ir_free_value(client);
+        if (timeout->type != IR_TYPE_I64) {
+          ir_free_value(request);
+          ir_free_value(response);
+          ir_free_value(timeout);
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend std.http.fetch timeout must be a Duration", expr->args.items[3]->line, expr->args.items[3]->column, "non-Duration timeout");
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_HTTP_FETCH, IR_TYPE_U64, expr->line, expr->column);
+        value->left = request;
+        value->right = response;
+        value->index = timeout;
+        if (ir->direct_runtime_helper_count < 2) ir->direct_runtime_helper_count = 2;
+        if (ir->direct_host_runtime_import_count < 2) ir->direct_host_runtime_import_count = 2;
+        if (ir->direct_http_runtime_import_count < 1) ir->direct_http_runtime_import_count = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if ((strcmp(callee_name, "std.http.resultOk") == 0 ||
+           strcmp(callee_name, "std.http.resultStatus") == 0 ||
+           strcmp(callee_name, "std.http.resultBodyLen") == 0 ||
+           strcmp(callee_name, "std.http.resultError") == 0) && expr->args.len == 1) {
+        IrValue *result = NULL;
+        if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &result)) {
+          free(callee_name);
+          return false;
+        }
+        if (result->type != IR_TYPE_U64) {
+          ir_free_value(result);
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend HTTP result helper expects HttpResult", expr->args.items[0]->line, expr->args.items[0]->column, "non-HttpResult argument");
+          return false;
+        }
+        IrValueKind kind = IR_VALUE_HTTP_RESULT_ERROR;
+        IrTypeKind type = IR_TYPE_U32;
+        if (strcmp(callee_name, "std.http.resultOk") == 0) {
+          kind = IR_VALUE_HTTP_RESULT_OK;
+          type = IR_TYPE_BOOL;
+        } else if (strcmp(callee_name, "std.http.resultStatus") == 0) {
+          kind = IR_VALUE_HTTP_RESULT_STATUS;
+          type = IR_TYPE_U16;
+        } else if (strcmp(callee_name, "std.http.resultBodyLen") == 0) {
+          kind = IR_VALUE_HTTP_RESULT_BODY_LEN;
+          type = IR_TYPE_USIZE;
+        }
+        IrValue *value = ir_new_value(ir, kind, type, expr->line, expr->column);
+        value->left = result;
+        if (ir->direct_runtime_helper_count < 1) ir->direct_runtime_helper_count = 1;
+        if (ir->direct_host_runtime_import_count < 1) ir->direct_host_runtime_import_count = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if ((strcmp(callee_name, "std.http.responseLen") == 0 ||
+           strcmp(callee_name, "std.http.responseHeadersLen") == 0 ||
+           strcmp(callee_name, "std.http.responseBodyOffset") == 0) && expr->args.len == 1) {
+        IrValue *response = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &response)) {
+          free(callee_name);
+          return false;
+        }
+        IrValueKind kind = IR_VALUE_HTTP_RESPONSE_LEN;
+        if (strcmp(callee_name, "std.http.responseHeadersLen") == 0) {
+          kind = IR_VALUE_HTTP_RESPONSE_HEADERS_LEN;
+        } else if (strcmp(callee_name, "std.http.responseBodyOffset") == 0) {
+          kind = IR_VALUE_HTTP_RESPONSE_BODY_OFFSET;
+        }
+        IrValue *value = ir_new_value(ir, kind, IR_TYPE_USIZE, expr->line, expr->column);
+        value->left = response;
+        if (ir->direct_runtime_helper_count < 1) ir->direct_runtime_helper_count = 1;
+        if (ir->direct_host_runtime_import_count < 1) ir->direct_host_runtime_import_count = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if (strcmp(callee_name, "std.http.headerValue") == 0 && expr->args.len == 2) {
+        IrValue *headers = NULL;
+        IrValue *name = NULL;
+        if (!ir_lower_byte_view(program, ir, fun, expr->args.items[0], &headers) ||
+            !ir_lower_byte_view(program, ir, fun, expr->args.items[1], &name)) {
+          ir_free_value(headers);
+          ir_free_value(name);
+          free(callee_name);
+          return false;
+        }
+        IrValue *value = ir_new_value(ir, IR_VALUE_HTTP_HEADER_VALUE, IR_TYPE_U64, expr->line, expr->column);
+        value->left = headers;
+        value->right = name;
+        if (ir->direct_runtime_helper_count < 1) ir->direct_runtime_helper_count = 1;
+        if (ir->direct_host_runtime_import_count < 1) ir->direct_host_runtime_import_count = 1;
+        free(callee_name);
+        *out = value;
+        return true;
+      }
+      if ((strcmp(callee_name, "std.http.headerFound") == 0 ||
+           strcmp(callee_name, "std.http.headerOffset") == 0 ||
+           strcmp(callee_name, "std.http.headerLen") == 0) && expr->args.len == 1) {
+        IrValue *header = NULL;
+        if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &header)) {
+          free(callee_name);
+          return false;
+        }
+        if (header->type != IR_TYPE_U64) {
+          ir_free_value(header);
+          free(callee_name);
+          ir_mark_unsupported(ir, "direct backend HTTP header helper expects HttpHeaderValue", expr->args.items[0]->line, expr->args.items[0]->column, "non-HttpHeaderValue argument");
+          return false;
+        }
+        IrValueKind kind = IR_VALUE_HTTP_HEADER_LEN;
+        IrTypeKind type = IR_TYPE_USIZE;
+        if (strcmp(callee_name, "std.http.headerFound") == 0) {
+          kind = IR_VALUE_HTTP_HEADER_FOUND;
+          type = IR_TYPE_BOOL;
+        } else if (strcmp(callee_name, "std.http.headerOffset") == 0) {
+          kind = IR_VALUE_HTTP_HEADER_OFFSET;
+        }
+        IrValue *value = ir_new_value(ir, kind, type, expr->line, expr->column);
+        value->left = header;
+        if (ir->direct_runtime_helper_count < 1) ir->direct_runtime_helper_count = 1;
+        if (ir->direct_host_runtime_import_count < 1) ir->direct_host_runtime_import_count = 1;
         free(callee_name);
         *out = value;
         return true;
@@ -1927,7 +2270,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         const IrLocal *vec = ir_function_find_local(fun, expr->args.items[0]->left->text);
         if (!vec || vec->type != IR_TYPE_VEC || !vec->is_mutable) {
           free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.vecPush expects a mutable Vec local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable Vec");
+          ir_mark_unsupported(ir, "direct backend std.mem.vecPush expects a mutable Vec local", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable Vec");
           return false;
         }
         IrValue *item = NULL;
@@ -1938,7 +2281,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         if (!item || item->type != IR_TYPE_U8) {
           ir_free_value(item);
           free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.vecPush currently supports only u8 values", expr->args.items[1]->line, expr->args.items[1]->column, "non-u8 value");
+          ir_mark_unsupported(ir, "direct backend std.mem.vecPush currently supports only u8 values", expr->args.items[1]->line, expr->args.items[1]->column, "non-u8 value");
           return false;
         }
         IrValue *value = ir_new_value(ir, IR_VALUE_VEC_PUSH, IR_TYPE_BOOL, expr->line, expr->column);
@@ -1972,7 +2315,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           ir_expr_is_byte_view_source(expr->args.items[1])) {
         if (!ir_expr_is_mutable_byte_view_dest(fun, expr->args.items[0])) {
           free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.copy expects a mutable byte destination", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable byte destination");
+          ir_mark_unsupported(ir, "direct backend std.mem.copy expects a mutable byte destination", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable byte destination");
           return false;
         }
         IrValue *dst = NULL;
@@ -1996,7 +2339,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           expr->args.items[0]) {
         if (!ir_expr_is_mutable_byte_view_dest(fun, expr->args.items[0])) {
           free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.fill expects a mutable byte destination", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable byte destination");
+          ir_mark_unsupported(ir, "direct backend std.mem.fill expects a mutable byte destination", expr->args.items[0]->line, expr->args.items[0]->column, "non-mutable byte destination");
           return false;
         }
         IrValue *dst = NULL;
@@ -2012,63 +2355,12 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           ir_free_value(dst);
           ir_free_value(fill);
           free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.fill value must be u8", expr->args.items[1]->line, expr->args.items[1]->column, "non-u8 fill value");
+          ir_mark_unsupported(ir, "direct backend std.mem.fill value must be u8", expr->args.items[1]->line, expr->args.items[1]->column, "non-u8 fill value");
           return false;
         }
         IrValue *value = ir_new_value(ir, IR_VALUE_BYTE_FILL, IR_TYPE_USIZE, expr->line, expr->column);
         value->left = fill;
         value->right = dst;
-        free(callee_name);
-        *out = value;
-        return true;
-      }
-      if (strcmp(callee_name, "std.mem.peekByte") == 0 &&
-          expr->args.len == 1) {
-        IrValue *ptr = NULL;
-        if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &ptr)) {
-          free(callee_name);
-          return false;
-        }
-        if (!ir_type_is_value(ptr->type)) {
-          ir_free_value(ptr);
-          free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.peekByte pointer must be an integer value", expr->args.items[0]->line, expr->args.items[0]->column, "non-integer pointer");
-          return false;
-        }
-        IrValue *value = ir_new_value(ir, IR_VALUE_MEMORY_PEEK_U8, IR_TYPE_U8, expr->line, expr->column);
-        value->left = ptr;
-        free(callee_name);
-        *out = value;
-        return true;
-      }
-      if (strcmp(callee_name, "std.mem.pokeByte") == 0 &&
-          expr->args.len == 2) {
-        IrValue *ptr = NULL;
-        IrValue *byte = NULL;
-        if (!ir_lower_expr(program, ir, fun, expr->args.items[0], &ptr) ||
-            !ir_lower_expr(program, ir, fun, expr->args.items[1], &byte)) {
-          ir_free_value(ptr);
-          ir_free_value(byte);
-          free(callee_name);
-          return false;
-        }
-        if (!ir_type_is_value(ptr->type)) {
-          ir_free_value(ptr);
-          ir_free_value(byte);
-          free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.pokeByte pointer must be an integer value", expr->args.items[0]->line, expr->args.items[0]->column, "non-integer pointer");
-          return false;
-        }
-        if (byte->type != IR_TYPE_U8) {
-          ir_free_value(ptr);
-          ir_free_value(byte);
-          free(callee_name);
-          ir_mark_unsupported(ir, "direct wasm std.mem.pokeByte value must be u8", expr->args.items[1]->line, expr->args.items[1]->column, "non-u8 value");
-          return false;
-        }
-        IrValue *value = ir_new_value(ir, IR_VALUE_MEMORY_POKE_U8, IR_TYPE_BOOL, expr->line, expr->column);
-        value->left = ptr;
-        value->right = byte;
         free(callee_name);
         *out = value;
         return true;
@@ -2171,24 +2463,22 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
           return false;
         }
       }
-      if (callee->type_params.len > 1) {
-        free(specialized_name);
-        ir_mark_unsupported(ir, "direct backend generic calls currently support one type parameter", expr->line, expr->column, callee->name);
-        return false;
-      }
       if (callee->params.len != expr->args.len) {
         free(specialized_name);
         ir_mark_unsupported(ir, "direct backend call argument count does not match callee", expr->line, expr->column, callee->name);
         return false;
       }
-      const char *return_type_text = generic_call ? ir_substitute_type_param(callee, type_args, callee->return_type) : callee->return_type;
+      char *specialized_return_type = generic_call ? ir_specialize_type_text(callee->return_type, callee, type_args) : NULL;
+      const char *return_type_text = generic_call ? specialized_return_type : callee->return_type;
       IrTypeKind type = ir_type_kind(return_type_text);
       if (callee->raises && !ir_type_is_direct_fallible_value(type)) {
+        free(specialized_return_type);
         free(specialized_name);
         ir_mark_unsupported(ir, "direct backend fallible call return type is unsupported", expr->line, expr->column, callee->return_type);
         return false;
       }
       if (!callee->raises && type != IR_TYPE_VOID && !ir_type_is_direct_abi(type)) {
+        free(specialized_return_type);
         free(specialized_name);
         ir_mark_unsupported(ir, "direct backend call return type is unsupported", expr->line, expr->column, callee->return_type);
         return false;
@@ -2197,9 +2487,12 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
       value->callee_index = callee_index;
       value->element_type = type;
       for (size_t i = 0; i < expr->args.len; i++) {
-        const char *param_type_text = generic_call ? ir_substitute_type_param(callee, type_args, callee->params.items[i].type) : callee->params.items[i].type;
+        char *specialized_param_type = generic_call ? ir_specialize_type_text(callee->params.items[i].type, callee, type_args) : NULL;
+        const char *param_type_text = generic_call ? specialized_param_type : callee->params.items[i].type;
         IrTypeKind expected = ir_type_kind(param_type_text);
         if (!ir_type_is_direct_abi(expected)) {
+          free(specialized_param_type);
+          free(specialized_return_type);
           free(specialized_name);
           ir_free_value(value);
           ir_mark_unsupported(ir, "direct backend call parameter type is unsupported", callee->params.items[i].line, callee->params.items[i].column, callee->params.items[i].type);
@@ -2207,6 +2500,8 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         }
         IrValue *arg = NULL;
         if (!ir_lower_expr(program, ir, fun, expr->args.items[i], &arg)) {
+          free(specialized_param_type);
+          free(specialized_return_type);
           free(specialized_name);
           ir_free_value(value);
           return false;
@@ -2214,12 +2509,16 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         if (arg->type != expected) {
           ir_free_value(arg);
           ir_free_value(value);
+          free(specialized_param_type);
+          free(specialized_return_type);
           free(specialized_name);
           ir_mark_unsupported(ir, "direct backend call argument type does not match parameter", expr->args.items[i]->line, expr->args.items[i]->column, callee->params.items[i].type);
           return false;
         }
         ir_value_push_arg(ir, value, arg);
+        free(specialized_param_type);
       }
+      free(specialized_return_type);
       free(specialized_name);
       *out = value;
       return true;
@@ -2288,12 +2587,12 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
         return true;
       }
       if (!ir_binary_op(expr->text, &op)) {
-        ir_mark_unsupported(ir, "direct wasm binary operator is unsupported", expr->line, expr->column, expr->text);
+        ir_mark_unsupported(ir, "direct backend binary operator is unsupported", expr->line, expr->column, expr->text);
         return false;
       }
       IrTypeKind type = ir_type_kind(expr->resolved_type);
       if (!(type == IR_TYPE_BOOL || ir_type_is_value(type))) {
-        ir_mark_unsupported(ir, "direct wasm binary expression type is unsupported", expr->line, expr->column, expr->resolved_type);
+        ir_mark_unsupported(ir, "direct backend binary expression type is unsupported", expr->line, expr->column, expr->resolved_type);
         return false;
       }
       IrValue *left = NULL;
@@ -2311,7 +2610,7 @@ static bool ir_lower_expr(const Program *program, IrProgram *ir, const IrFunctio
       return true;
     }
     default:
-      ir_mark_unsupported(ir, "direct wasm expression kind is unsupported", expr->line, expr->column, "unsupported expression");
+      ir_mark_unsupported(ir, "direct backend expression kind is unsupported", expr->line, expr->column, "unsupported expression");
       return false;
   }
 }
@@ -2354,6 +2653,29 @@ static bool ir_lower_array_initializer(const Program *program, IrProgram *ir, Ir
   if (!expr || expr->kind != EXPR_ARRAY_LITERAL) {
     ir_mark_unsupported(ir, "direct backend fixed array locals require array literal initialization", line, column, local ? local->name : "array local");
     return false;
+  }
+  if (expr->array_repeat) {
+    if (expr->args.len != 2) {
+      ir_mark_unsupported(ir, "direct backend fixed array repeat literal requires value and count", line, column, local->name);
+      return false;
+    }
+    const Expr *value_expr = expr->args.items[0];
+    for (size_t i = 0; i < local->array_len; i++) {
+      IrValue *index = ir_new_index_literal(ir, (unsigned)i, value_expr->line, value_expr->column);
+      IrValue *value = NULL;
+      if (!ir_lower_expr(program, ir, mir_fun, value_expr, &value)) {
+        ir_free_value(index);
+        return false;
+      }
+      if (value->type != local->element_type) {
+        ir_free_value(index);
+        ir_free_value(value);
+        ir_mark_unsupported(ir, "direct backend array repeat literal element type does not match local type", value_expr->line, value_expr->column, local->name);
+        return false;
+      }
+      ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_INDEX_STORE, .array_index = local->index, .index = index, .value = value, .line = value_expr->line, .column = value_expr->column});
+    }
+    return true;
   }
   if (expr->args.len != local->array_len) {
     ir_mark_unsupported(ir, "direct backend fixed array literal length must match local type", line, column, local->name);
@@ -2416,25 +2738,37 @@ static bool ir_lower_shape_initializer(const Program *program, IrProgram *ir, Ir
       return false;
     }
     if (field_is_array) {
-      if (!field_expr || field_expr->kind != EXPR_ARRAY_LITERAL || field_expr->args.len != field_array_len) {
+      if (!field_expr || field_expr->kind != EXPR_ARRAY_LITERAL) {
         ir_type_arg_vec_free(&shape_args);
         ir_mark_unsupported(ir, "direct backend record array field requires a matching array literal", field_expr ? field_expr->line : line, field_expr ? field_expr->column : column, field->name);
         return false;
       }
-      for (size_t element_index = 0; element_index < field_expr->args.len; element_index++) {
+      if (field_expr->array_repeat) {
+        if (field_expr->args.len != 2) {
+          ir_type_arg_vec_free(&shape_args);
+          ir_mark_unsupported(ir, "direct backend record array field repeat literal requires value and count", field_expr->line, field_expr->column, field->name);
+          return false;
+        }
+      } else if (field_expr->args.len != field_array_len) {
+        ir_type_arg_vec_free(&shape_args);
+        ir_mark_unsupported(ir, "direct backend record array field requires a matching array literal", field_expr->line, field_expr->column, field->name);
+        return false;
+      }
+      for (size_t element_index = 0; element_index < field_array_len; element_index++) {
+        const Expr *element_expr = field_expr->array_repeat ? field_expr->args.items[0] : field_expr->args.items[element_index];
         IrValue *element = NULL;
-        if (!ir_lower_expr(program, ir, mir_fun, field_expr->args.items[element_index], &element)) {
+        if (!ir_lower_expr(program, ir, mir_fun, element_expr, &element)) {
           ir_type_arg_vec_free(&shape_args);
           return false;
         }
         if (element->type != field_element_type) {
           ir_free_value(element);
           ir_type_arg_vec_free(&shape_args);
-          ir_mark_unsupported(ir, "direct backend record array field initializer type does not match element", field_expr->args.items[element_index]->line, field_expr->args.items[element_index]->column, field->name);
+          ir_mark_unsupported(ir, "direct backend record array field initializer type does not match element", element_expr->line, element_expr->column, field->name);
           return false;
         }
         unsigned element_offset = field_offset + (unsigned)element_index * ir_type_byte_size(field_element_type);
-        ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_FIELD_STORE, .local_index = local->index, .field_offset = element_offset, .value = element, .line = field_expr->args.items[element_index]->line, .column = field_expr->args.items[element_index]->column});
+        ir_instr_vec_push(ir, out_items, out_len, out_cap, (IrInstr){.kind = IR_INSTR_FIELD_STORE, .local_index = local->index, .field_offset = element_offset, .value = element, .line = element_expr->line, .column = element_expr->column});
       }
       continue;
     }
@@ -2616,7 +2950,7 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
     IrValue *value = NULL;
     if (mir_fun->return_type == IR_TYPE_VOID) {
       if (stmt->expr) {
-        ir_mark_unsupported(ir, "direct wasm void function cannot return a value", stmt->line, stmt->column, mir_fun->name);
+        ir_mark_unsupported(ir, "direct backend void function cannot return a value", stmt->line, stmt->column, mir_fun->name);
         return false;
       }
     } else if (!stmt->expr && mir_fun->return_type == IR_TYPE_I32) {
@@ -2715,7 +3049,7 @@ static bool ir_lower_stmt_to_vec(const Program *program, IrProgram *ir, IrFuncti
   if (stmt->kind == STMT_MATCH) {
     return ir_lower_enum_match(program, ir, mir_fun, stmt, out_items, out_len, out_cap, saw_return);
   }
-  ir_mark_unsupported(ir, "direct wasm statement kind is unsupported", stmt->line, stmt->column, mir_fun->name);
+  ir_mark_unsupported(ir, "direct backend statement kind is unsupported", stmt->line, stmt->column, mir_fun->name);
   return false;
 }
 
@@ -2727,11 +3061,7 @@ static bool ir_lower_stmt_vec(const Program *program, IrProgram *ir, IrFunction 
 }
 
 static IrFunction *ir_program_push_function(IrProgram *ir, const Function *source, const char *stable_id_text) {
-  if (ir->function_len + 1 > ir->function_cap) {
-    ir->function_cap = ir->function_cap == 0 ? 4 : ir->function_cap * 2;
-    ir->functions = realloc(ir->functions, ir->function_cap * sizeof(IrFunction));
-    ir->mir_bytes += ir->function_cap * sizeof(IrFunction);
-  }
+  ir->functions = ir_grow_tracked_items(ir, ir->functions, ir->function_len, &ir->function_cap, 4, sizeof(IrFunction));
   IrFunction *fun = &ir->functions[ir->function_len++];
   ZBuf stable_id;
   zbuf_init(&stable_id);
@@ -2760,7 +3090,7 @@ static bool ir_collect_function_locals(const Program *program, IrProgram *ir, Ir
     if (hosted_world_main && i == 0 && strcmp(param->type ? param->type : "", "World") == 0) continue;
     IrTypeKind type = ir_type_kind(param->type);
     if (!ir_type_is_direct_abi(type)) {
-      ir_mark_unsupported(ir, "direct wasm parameter type is unsupported", param->line, param->column, param->type);
+      ir_mark_unsupported(ir, "direct backend parameter type is unsupported", param->line, param->column, param->type);
       return false;
     }
     ir_function_push_local(ir, mir_fun, param->name, type, true, false, false, NULL, IR_TYPE_UNSUPPORTED, 0, 0, 0, false, param->line, param->column);
@@ -2809,7 +3139,7 @@ static bool ir_collect_stmt_locals(const Program *program, IrProgram *ir, IrFunc
         continue;
       }
       if (!ir_type_is_direct_local(type)) {
-        ir_mark_unsupported(ir, "direct wasm local type is unsupported", stmt->line, stmt->column, stmt_type ? stmt_type : "inferred unknown");
+        ir_mark_unsupported(ir, "direct backend local type is unsupported", stmt->line, stmt->column, stmt_type ? stmt_type : "inferred unknown");
         return false;
       }
       bool mutable_byte_view = stmt_type && strcmp(stmt_type, "MutSpan<u8>") == 0;
@@ -2825,17 +3155,17 @@ static bool ir_collect_stmt_locals(const Program *program, IrProgram *ir, IrFunc
 
 static bool ir_lower_function_body(const Program *program, IrProgram *ir, IrFunction *mir_fun, const Function *source) {
   if (source->type_params.len > 0 || source->is_test) {
-    ir_mark_unsupported(ir, "direct wasm MVP does not support generics or tests", source->line, source->column, source->name);
+    ir_mark_unsupported(ir, "direct backend MVP does not support generics or tests", source->line, source->column, source->name);
     return false;
   }
   bool hosted_world_main = ir_is_hosted_world_main(source);
   IrTypeKind return_type = hosted_world_main ? IR_TYPE_I32 : ir_type_kind(source->return_type);
   if (!hosted_world_main && source->raises && !ir_type_is_direct_fallible_value(return_type)) {
-    ir_mark_unsupported(ir, "direct wasm fallible return type is unsupported", source->line, source->column, source->return_type);
+    ir_mark_unsupported(ir, "direct backend fallible return type is unsupported", source->line, source->column, source->return_type);
     return false;
   }
   if (!hosted_world_main && !source->raises && return_type != IR_TYPE_VOID && !ir_type_is_direct_abi(return_type)) {
-    ir_mark_unsupported(ir, "direct wasm return type is unsupported", source->line, source->column, source->return_type);
+    ir_mark_unsupported(ir, "direct backend return type is unsupported", source->line, source->column, source->return_type);
     return false;
   }
   if (!ir_collect_function_locals(program, ir, mir_fun, source)) return false;
@@ -2853,7 +3183,7 @@ static bool ir_lower_function_body(const Program *program, IrProgram *ir, IrFunc
     saw_return = true;
   }
   if (return_type != IR_TYPE_VOID && !saw_return) {
-    ir_mark_unsupported(ir, "direct wasm function must return a value", source->line, source->column, source->name);
+    ir_mark_unsupported(ir, "direct backend function must return a value", source->line, source->column, source->name);
     return false;
   }
   return true;
@@ -2868,8 +3198,120 @@ static void ir_free_param_vec_shallow(ParamVec *params) {
   if (params) *params = (ParamVec){0};
 }
 
+static const char *ir_specialization_arg_for_binder(const Function *fun, const TypeArgVec *type_args, ZTypeBinderId binder) {
+  if (!fun || !type_args || binder == Z_TYPE_BINDER_ID_INVALID) return NULL;
+  size_t index = (size_t)binder - 1;
+  if (index >= fun->type_params.len || index >= type_args->len) return NULL;
+  return type_args->items[index].type;
+}
+
+static ZTypeBinderDecl *ir_specialization_binder_decls(const Function *fun) {
+  if (!fun || fun->type_params.len == 0) return NULL;
+  ZTypeBinderDecl *decls = z_checked_calloc(fun->type_params.len, sizeof(ZTypeBinderDecl));
+  for (size_t i = 0; i < fun->type_params.len; i++) {
+    decls[i] = (ZTypeBinderDecl){
+      .name = fun->type_params.items[i].name,
+      .kind = fun->type_params.items[i].is_static ? Z_TYPE_BINDER_STATIC : Z_TYPE_BINDER_TYPE,
+      .id = (ZTypeBinderId)(i + 1),
+      .static_type = fun->type_params.items[i].type ? fun->type_params.items[i].type : "usize"
+    };
+  }
+  return decls;
+}
+
+static void ir_specialize_type_core_into(ZBuf *buf, const ZTypeArena *arena, ZTypeId type, const Function *fun, const TypeArgVec *type_args);
+
+static void ir_specialize_static_value_into(ZBuf *buf, const ZStaticValue *value, const Function *fun, const TypeArgVec *type_args) {
+  if (value && value->kind == Z_STATIC_VALUE_BINDER) {
+    const char *arg = ir_specialization_arg_for_binder(fun, type_args, value->binder);
+    if (arg) {
+      zbuf_append(buf, arg);
+      return;
+    }
+  }
+  char *formatted = z_static_value_format(value);
+  zbuf_append(buf, formatted ? formatted : "Unknown");
+  free(formatted);
+}
+
+static void ir_specialize_type_arg_into(ZBuf *buf, const ZTypeArena *arena, const ZTypeArg *arg, const Function *fun, const TypeArgVec *type_args) {
+  if (!arg) return;
+  if (arg->kind == Z_TYPE_ARG_STATIC) {
+    ir_specialize_static_value_into(buf, &arg->as.static_value, fun, type_args);
+  } else {
+    ir_specialize_type_core_into(buf, arena, arg->as.type, fun, type_args);
+  }
+}
+
+static void ir_specialize_type_core_into(ZBuf *buf, const ZTypeArena *arena, ZTypeId type, const Function *fun, const TypeArgVec *type_args) {
+  ZTypeNodeKind kind = z_type_kind(arena, type);
+  if (kind == Z_TYPE_NODE_NAME) {
+    zbuf_append(buf, z_type_name(arena, type) ? z_type_name(arena, type) : "Unknown");
+  } else if (kind == Z_TYPE_NODE_BINDER) {
+    const char *arg = ir_specialization_arg_for_binder(fun, type_args, z_type_binder(arena, type));
+    zbuf_append(buf, arg ? arg : (z_type_name(arena, type) ? z_type_name(arena, type) : "Unknown"));
+  } else if (kind == Z_TYPE_NODE_CONST) {
+    zbuf_append(buf, "const ");
+    ir_specialize_type_core_into(buf, arena, z_type_const_inner(arena, type), fun, type_args);
+  } else if (kind == Z_TYPE_NODE_ARRAY) {
+    zbuf_append_char(buf, '[');
+    ir_specialize_static_value_into(buf, z_type_array_length(arena, type), fun, type_args);
+    zbuf_append_char(buf, ']');
+    ir_specialize_type_core_into(buf, arena, z_type_array_element(arena, type), fun, type_args);
+  } else if (kind == Z_TYPE_NODE_APPLY) {
+    zbuf_append(buf, z_type_name(arena, type) ? z_type_name(arena, type) : "Unknown");
+    zbuf_append_char(buf, '<');
+    for (size_t i = 0; i < z_type_apply_arg_len(arena, type); i++) {
+      if (i > 0) zbuf_append_char(buf, ',');
+      ir_specialize_type_arg_into(buf, arena, z_type_apply_arg(arena, type, i), fun, type_args);
+    }
+    zbuf_append_char(buf, '>');
+  } else {
+    zbuf_append(buf, "Unknown");
+  }
+}
+
+static char *ir_specialize_static_arg_text(const char *text, const Function *fun, const TypeArgVec *type_args) {
+  if (!text || !fun || !type_args || fun->type_params.len == 0) return NULL;
+  ZTypeBinderDecl *decls = ir_specialization_binder_decls(fun);
+  ZTypeBinderScope scope = {.items = decls, .len = fun->type_params.len};
+  ZStaticValue value = {0};
+  ZTypeParseError error = {0};
+  if (!z_static_value_parse_with_binders(text, &scope, &value, &error) || value.kind != Z_STATIC_VALUE_BINDER) {
+    z_static_value_free(&value);
+    free(decls);
+    return NULL;
+  }
+  ZBuf buf;
+  zbuf_init(&buf);
+  ir_specialize_static_value_into(&buf, &value, fun, type_args);
+  z_static_value_free(&value);
+  free(decls);
+  return buf.data ? buf.data : z_strdup("");
+}
+
 static char *ir_specialize_type_text(const char *type, const Function *fun, const TypeArgVec *type_args) {
-  return z_strdup(ir_substitute_type_param(fun, type_args, type));
+  if (!type) return z_strdup("Unknown");
+  if (!fun || !type_args || fun->type_params.len == 0) return z_strdup(type);
+  char *static_arg = ir_specialize_static_arg_text(type, fun, type_args);
+  if (static_arg) return static_arg;
+  ZTypeBinderDecl *decls = ir_specialization_binder_decls(fun);
+  ZTypeBinderScope scope = {.items = decls, .len = fun->type_params.len};
+  ZTypeArena arena;
+  z_type_arena_init(&arena);
+  ZTypeId parsed = Z_TYPE_ID_INVALID;
+  ZTypeParseError error = {0};
+  if (!z_type_parse_with_binders(&arena, type, &scope, &parsed, &error)) {
+    z_type_arena_free(&arena);
+    free(decls);
+    return z_strdup(ir_substitute_type_param(fun, type_args, type));
+  }
+  ZBuf buf;
+  zbuf_init(&buf);
+  ir_specialize_type_core_into(&buf, &arena, parsed, fun, type_args);
+  z_type_arena_free(&arena);
+  free(decls);
+  return buf.data ? buf.data : z_strdup("");
 }
 
 static void ir_specialize_stmt_types(StmtVec *body, const Function *fun, const TypeArgVec *type_args);
@@ -2880,6 +3322,16 @@ static void ir_specialize_expr_types(Expr *expr, const Function *fun, const Type
     char *substituted = ir_specialize_type_text(expr->resolved_type, fun, type_args);
     free(expr->resolved_type);
     expr->resolved_type = substituted;
+  }
+  for (size_t i = 0; i < expr->type_args.len; i++) {
+    char *substituted = ir_specialize_type_text(expr->type_args.items[i].type, fun, type_args);
+    free(expr->type_args.items[i].type);
+    expr->type_args.items[i].type = substituted;
+  }
+  for (size_t i = 0; i < expr->checked_type_args.len; i++) {
+    char *substituted = ir_specialize_type_text(expr->checked_type_args.items[i].type, fun, type_args);
+    free(expr->checked_type_args.items[i].type);
+    expr->checked_type_args.items[i].type = substituted;
   }
   ir_specialize_expr_types(expr->left, fun, type_args);
   ir_specialize_expr_types(expr->right, fun, type_args);
@@ -2939,63 +3391,93 @@ static bool ir_function_vec_has_name(const FunctionVec *functions, const char *n
   return false;
 }
 
-static void ir_collect_generic_specializations_from_expr(FunctionVec *functions, const Program *program, const Expr *expr);
+static bool ir_collect_generic_specializations_from_expr(FunctionVec *functions, ZSpecializationPlan *plan, IrProgram *ir, const Program *program, const Expr *expr);
 
-static void ir_collect_generic_specializations_from_stmt_vec(FunctionVec *functions, const Program *program, const StmtVec *body) {
+static bool ir_collect_generic_specializations_from_stmt_vec(FunctionVec *functions, ZSpecializationPlan *plan, IrProgram *ir, const Program *program, const StmtVec *body) {
   for (size_t i = 0; body && i < body->len; i++) {
     const Stmt *stmt = body->items[i];
     if (!stmt) continue;
-    ir_collect_generic_specializations_from_expr(functions, program, stmt->target);
-    ir_collect_generic_specializations_from_expr(functions, program, stmt->expr);
-    ir_collect_generic_specializations_from_expr(functions, program, stmt->range_end);
-    ir_collect_generic_specializations_from_stmt_vec(functions, program, &stmt->then_body);
-    ir_collect_generic_specializations_from_stmt_vec(functions, program, &stmt->else_body);
+    if (!ir_collect_generic_specializations_from_expr(functions, plan, ir, program, stmt->target)) return false;
+    if (!ir_collect_generic_specializations_from_expr(functions, plan, ir, program, stmt->expr)) return false;
+    if (!ir_collect_generic_specializations_from_expr(functions, plan, ir, program, stmt->range_end)) return false;
+    if (!ir_collect_generic_specializations_from_stmt_vec(functions, plan, ir, program, &stmt->then_body)) return false;
+    if (!ir_collect_generic_specializations_from_stmt_vec(functions, plan, ir, program, &stmt->else_body)) return false;
     for (size_t arm_index = 0; arm_index < stmt->match_arms.len; arm_index++) {
-      ir_collect_generic_specializations_from_stmt_vec(functions, program, &stmt->match_arms.items[arm_index].body);
+      if (!ir_collect_generic_specializations_from_stmt_vec(functions, plan, ir, program, &stmt->match_arms.items[arm_index].body)) return false;
     }
   }
+  return true;
 }
 
-static void ir_collect_generic_specializations_from_expr(FunctionVec *functions, const Program *program, const Expr *expr) {
-  if (!expr) return;
+static bool ir_collect_generic_specializations_from_expr(FunctionVec *functions, ZSpecializationPlan *plan, IrProgram *ir, const Program *program, const Expr *expr) {
+  if (!expr) return true;
   if (expr->kind == EXPR_CALL && expr->left && expr->left->kind == EXPR_IDENT) {
     const Function *callee = ir_find_source_function(program, expr->left->text, NULL);
     const TypeArgVec *type_args = ir_call_type_args(expr);
-    if (callee && callee->type_params.len > 0 && type_args && type_args->len == callee->type_params.len && callee->type_params.len == 1) {
-      char *specialized_name = ir_specialized_function_name(callee, type_args);
-      if (!ir_function_vec_has_name(functions, specialized_name)) ir_push_specialized_function(functions, callee, type_args);
+    if (callee && callee->type_params.len > 0 && type_args && type_args->len == callee->type_params.len) {
+      char *specialized_name = NULL;
+      ZSpecializationAddResult add_result = z_specialization_plan_add(plan, callee, type_args, &specialized_name);
+      if (add_result == Z_SPECIALIZATION_ADD_LIMIT) {
+        free(specialized_name);
+        ir_mark_unsupported(ir, "direct backend generic specialization plan exceeded its instantiation limit", expr->line, expr->column, callee->name);
+        return false;
+      }
+      if (add_result == Z_SPECIALIZATION_ADD_NAME_COLLISION) {
+        free(specialized_name);
+        ir_mark_unsupported(ir, "direct backend generic specialization name is ambiguous", expr->line, expr->column, callee->name);
+        return false;
+      }
+      if (add_result == Z_SPECIALIZATION_ADD_ADDED) {
+        if (ir_function_vec_has_name(functions, specialized_name)) {
+          free(specialized_name);
+          ir_mark_unsupported(ir, "direct backend generic specialization name collides with an existing function", expr->line, expr->column, callee->name);
+          return false;
+        }
+        ir_push_specialized_function(functions, callee, type_args);
+      }
       free(specialized_name);
     }
   }
-  ir_collect_generic_specializations_from_expr(functions, program, expr->left);
-  ir_collect_generic_specializations_from_expr(functions, program, expr->right);
-  for (size_t i = 0; i < expr->args.len; i++) ir_collect_generic_specializations_from_expr(functions, program, expr->args.items[i]);
-  for (size_t i = 0; i < expr->fields.len; i++) ir_collect_generic_specializations_from_expr(functions, program, expr->fields.items[i].value);
+  if (!ir_collect_generic_specializations_from_expr(functions, plan, ir, program, expr->left)) return false;
+  if (!ir_collect_generic_specializations_from_expr(functions, plan, ir, program, expr->right)) return false;
+  for (size_t i = 0; i < expr->args.len; i++) {
+    if (!ir_collect_generic_specializations_from_expr(functions, plan, ir, program, expr->args.items[i])) return false;
+  }
+  for (size_t i = 0; i < expr->fields.len; i++) {
+    if (!ir_collect_generic_specializations_from_expr(functions, plan, ir, program, expr->fields.items[i].value)) return false;
+  }
+  return true;
 }
 
 static void ir_lower_direct_backend_subset(IrProgram *ir, const Program *program, const SourceInput *input) {
   ir->mir_valid = true;
   ir->mir_line = 1;
   ir->mir_column = 1;
-  snprintf(ir->mir_expected, sizeof(ir->mir_expected), "direct wasm MVP subset");
+  snprintf(ir->mir_expected, sizeof(ir->mir_expected), "direct backend MVP subset");
   snprintf(ir->mir_help, sizeof(ir->mir_help), "restrict this program to exported primitive arithmetic functions or choose another supported direct target");
   ir->mir_bytes = sizeof(IrProgram);
   if (program->choices.len > 0 || program->interfaces.len > 0 || program->aliases.len > 0 ||
       program->consts.len > 0) {
-    ir_mark_unsupported(ir, "direct wasm MVP does not support declarations other than functions", 1, 1, "unsupported top-level declaration");
+    ir_mark_unsupported(ir, "direct backend MVP does not support declarations other than functions", 1, 1, "unsupported top-level declaration");
     return;
   }
   FunctionVec direct_functions = {0};
   for (size_t i = 0; i < program->functions.len; i++) {
     if (!program->functions.items[i].is_test && program->functions.items[i].type_params.len == 0) push_function_clone(&direct_functions, &program->functions.items[i]);
   }
-  for (size_t i = 0; i < program->functions.len; i++) {
-    if (!program->functions.items[i].is_test && program->functions.items[i].type_params.len == 0) {
-      ir_collect_generic_specializations_from_stmt_vec(&direct_functions, program, &program->functions.items[i].body);
+  ZSpecializationPlan specialization_plan;
+  z_specialization_plan_init(&specialization_plan, IR_SPECIALIZATION_PLAN_LIMIT);
+  for (size_t i = 0; i < direct_functions.len; i++) {
+    if (!ir_collect_generic_specializations_from_stmt_vec(&direct_functions, &specialization_plan, ir, program, &direct_functions.items[i].body)) {
+      z_specialization_plan_free(&specialization_plan);
+      Program temp_program = {0};
+      temp_program.functions = direct_functions;
+      z_free_program(&temp_program);
+      return;
     }
   }
-  IrFunctionOrder *order = calloc(direct_functions.len ? direct_functions.len : 1, sizeof(IrFunctionOrder));
-  char **stable_ids = calloc(direct_functions.len ? direct_functions.len : 1, sizeof(char *));
+  IrFunctionOrder *order = z_checked_calloc(direct_functions.len ? direct_functions.len : 1, sizeof(IrFunctionOrder));
+  char **stable_ids = z_checked_calloc(direct_functions.len ? direct_functions.len : 1, sizeof(char *));
   for (size_t i = 0; i < direct_functions.len; i++) {
     stable_ids[i] = ir_stable_id_for_source_function(input, &direct_functions.items[i]);
     order[i] = (IrFunctionOrder){.name = direct_functions.items[i].name, .stable_id = stable_ids[i], .source_index = i};
@@ -3014,15 +3496,27 @@ static void ir_lower_direct_backend_subset(IrProgram *ir, const Program *program
       free(order);
       for (size_t stable_index = 0; stable_index < direct_functions.len; stable_index++) free(stable_ids[stable_index]);
       free(stable_ids);
+      z_specialization_plan_free(&specialization_plan);
       Program temp_program = {0};
       temp_program.functions = direct_functions;
       z_free_program(&temp_program);
       return;
     }
   }
+  if (!z_mir_verify_direct_contracts(ir)) {
+    free(order);
+    for (size_t stable_index = 0; stable_index < direct_functions.len; stable_index++) free(stable_ids[stable_index]);
+    free(stable_ids);
+    z_specialization_plan_free(&specialization_plan);
+    Program temp_program = {0};
+    temp_program.functions = direct_functions;
+    z_free_program(&temp_program);
+    return;
+  }
   free(order);
   for (size_t stable_index = 0; stable_index < direct_functions.len; stable_index++) free(stable_ids[stable_index]);
   free(stable_ids);
+  z_specialization_plan_free(&specialization_plan);
   Program temp_program = {0};
   temp_program.functions = direct_functions;
   z_free_program(&temp_program);
@@ -3034,10 +3528,7 @@ static void ir_lower_direct_backend_subset(IrProgram *ir, const Program *program
 }
 
 static void push_function_clone(FunctionVec *vec, const Function *source) {
-  if (vec->len + 1 > vec->cap) {
-    vec->cap = vec->cap == 0 ? 4 : vec->cap * 2;
-    vec->items = realloc(vec->items, vec->cap * sizeof(Function));
-  }
+  vec->items = ir_grow_items(vec->items, vec->len, &vec->cap, 4, sizeof(Function));
   vec->items[vec->len++] = (Function){
     .name = z_strdup(source->name),
     .test_name = source->test_name ? z_strdup(source->test_name) : NULL,
@@ -3060,10 +3551,7 @@ IrProgram z_lower_program_with_source(const Program *program, const SourceInput 
   IrProgram ir = {0};
   for (size_t i = 0; i < program->c_imports.len; i++) {
     CImport *source = &program->c_imports.items[i];
-    if (ir.program.c_imports.len + 1 > ir.program.c_imports.cap) {
-      ir.program.c_imports.cap = ir.program.c_imports.cap == 0 ? 4 : ir.program.c_imports.cap * 2;
-      ir.program.c_imports.items = realloc(ir.program.c_imports.items, ir.program.c_imports.cap * sizeof(CImport));
-    }
+    ir.program.c_imports.items = ir_grow_items(ir.program.c_imports.items, ir.program.c_imports.len, &ir.program.c_imports.cap, 4, sizeof(CImport));
     ir.program.c_imports.items[ir.program.c_imports.len++] = (CImport){
       .header = source->header ? z_strdup(source->header) : NULL,
       .alias = source->alias ? z_strdup(source->alias) : NULL,
@@ -3073,10 +3561,7 @@ IrProgram z_lower_program_with_source(const Program *program, const SourceInput 
   }
   for (size_t i = 0; i < program->consts.len; i++) {
     ConstDecl *source = &program->consts.items[i];
-    if (ir.program.consts.len + 1 > ir.program.consts.cap) {
-      ir.program.consts.cap = ir.program.consts.cap == 0 ? 4 : ir.program.consts.cap * 2;
-      ir.program.consts.items = realloc(ir.program.consts.items, ir.program.consts.cap * sizeof(ConstDecl));
-    }
+    ir.program.consts.items = ir_grow_items(ir.program.consts.items, ir.program.consts.len, &ir.program.consts.cap, 4, sizeof(ConstDecl));
     ir.program.consts.items[ir.program.consts.len++] = (ConstDecl){
       .name = z_strdup(source->name),
       .type = source->type ? z_strdup(source->type) : NULL,
@@ -3088,10 +3573,7 @@ IrProgram z_lower_program_with_source(const Program *program, const SourceInput 
   }
   for (size_t i = 0; i < program->aliases.len; i++) {
     TypeAlias *source = &program->aliases.items[i];
-    if (ir.program.aliases.len + 1 > ir.program.aliases.cap) {
-      ir.program.aliases.cap = ir.program.aliases.cap == 0 ? 4 : ir.program.aliases.cap * 2;
-      ir.program.aliases.items = realloc(ir.program.aliases.items, ir.program.aliases.cap * sizeof(TypeAlias));
-    }
+    ir.program.aliases.items = ir_grow_items(ir.program.aliases.items, ir.program.aliases.len, &ir.program.aliases.cap, 4, sizeof(TypeAlias));
     ir.program.aliases.items[ir.program.aliases.len++] = (TypeAlias){
       .name = z_strdup(source->name),
       .target = source->target ? z_strdup(source->target) : NULL,
@@ -3102,10 +3584,7 @@ IrProgram z_lower_program_with_source(const Program *program, const SourceInput 
   }
   for (size_t i = 0; i < program->interfaces.len; i++) {
     InterfaceDecl *source = &program->interfaces.items[i];
-    if (ir.program.interfaces.len + 1 > ir.program.interfaces.cap) {
-      ir.program.interfaces.cap = ir.program.interfaces.cap == 0 ? 4 : ir.program.interfaces.cap * 2;
-      ir.program.interfaces.items = realloc(ir.program.interfaces.items, ir.program.interfaces.cap * sizeof(InterfaceDecl));
-    }
+    ir.program.interfaces.items = ir_grow_items(ir.program.interfaces.items, ir.program.interfaces.len, &ir.program.interfaces.cap, 4, sizeof(InterfaceDecl));
     InterfaceDecl cloned = {
       .name = z_strdup(source->name),
       .type_params = clone_params(&source->type_params),
@@ -3120,10 +3599,7 @@ IrProgram z_lower_program_with_source(const Program *program, const SourceInput 
   }
   for (size_t i = 0; i < program->shapes.len; i++) {
     Shape *source = &program->shapes.items[i];
-    if (ir.program.shapes.len + 1 > ir.program.shapes.cap) {
-      ir.program.shapes.cap = ir.program.shapes.cap == 0 ? 4 : ir.program.shapes.cap * 2;
-      ir.program.shapes.items = realloc(ir.program.shapes.items, ir.program.shapes.cap * sizeof(Shape));
-    }
+    ir.program.shapes.items = ir_grow_items(ir.program.shapes.items, ir.program.shapes.len, &ir.program.shapes.cap, 4, sizeof(Shape));
     Shape cloned = {
       .name = z_strdup(source->name),
       .layout = z_strdup(source->layout),
@@ -3140,10 +3616,7 @@ IrProgram z_lower_program_with_source(const Program *program, const SourceInput 
   }
   for (size_t i = 0; i < program->enums.len; i++) {
     EnumDecl *source = &program->enums.items[i];
-    if (ir.program.enums.len + 1 > ir.program.enums.cap) {
-      ir.program.enums.cap = ir.program.enums.cap == 0 ? 4 : ir.program.enums.cap * 2;
-      ir.program.enums.items = realloc(ir.program.enums.items, ir.program.enums.cap * sizeof(EnumDecl));
-    }
+    ir.program.enums.items = ir_grow_items(ir.program.enums.items, ir.program.enums.len, &ir.program.enums.cap, 4, sizeof(EnumDecl));
     ir.program.enums.items[ir.program.enums.len++] = (EnumDecl){
       .name = z_strdup(source->name),
       .type = source->type ? z_strdup(source->type) : NULL,
@@ -3154,10 +3627,7 @@ IrProgram z_lower_program_with_source(const Program *program, const SourceInput 
   }
   for (size_t i = 0; i < program->choices.len; i++) {
     Choice *source = &program->choices.items[i];
-    if (ir.program.choices.len + 1 > ir.program.choices.cap) {
-      ir.program.choices.cap = ir.program.choices.cap == 0 ? 4 : ir.program.choices.cap * 2;
-      ir.program.choices.items = realloc(ir.program.choices.items, ir.program.choices.cap * sizeof(Choice));
-    }
+    ir.program.choices.items = ir_grow_items(ir.program.choices.items, ir.program.choices.len, &ir.program.choices.cap, 4, sizeof(Choice));
     ir.program.choices.items[ir.program.choices.len++] = (Choice){
       .name = z_strdup(source->name),
       .cases = clone_params(&source->cases),

@@ -1,0 +1,5 @@
+pub fn main Void
+  let value bad()
+
+fn bad ref<i32>
+  ret missing

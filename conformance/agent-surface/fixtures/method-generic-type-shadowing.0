@@ -1,0 +1,8 @@
+type Item
+  value i32
+
+type Holder
+  fn keep<Item: Type> Item value Item
+    ret value
+
+pub fn main Void

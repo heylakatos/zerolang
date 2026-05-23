@@ -1,0 +1,18 @@
+interface Storer<T: Type>
+  fn store Void self mutref<T> next ref<i32>
+
+type Holder
+  value ref<i32>
+
+  fn store Void self mutref<Self> next ref<i32>
+    set self.value next
+
+fn through<T: Storer<T>> Void holder mutref<T> next ref<i32>
+  T.store holder next
+
+pub fn main Void
+  mut old 1
+  mut next 2
+  mut holder Holder . value (&old)
+  through<Holder> (&mut holder) (&next)
+  set next 3

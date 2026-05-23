@@ -1,0 +1,11 @@
+type Point
+  x i32
+  y i32
+
+fn field ref<i32> point ref<Point>
+  ret &point.x
+
+pub fn main Void
+  mut point Point . x 1 y 2
+  let current field (&point)
+  set point.y 3

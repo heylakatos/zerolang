@@ -1,0 +1,16 @@
+type Box
+  a ref<i32>
+  b ref<i32>
+
+  fn replaceA Box self mutref<Self> next ref<i32>
+    set self.a next
+    ret Box . a next b self.b
+
+pub fn main Void
+  mut x 1
+  let y 2
+  let z 3
+  mut box Box . a (&z) b (&x)
+  let copy box.replaceA (&y)
+  set box.b &y
+  set x 4

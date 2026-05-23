@@ -2,4 +2,12 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec node "$root/scripts/zero-cli.mjs" "$@"
+native="$root/.zero/bin/zero"
+
+if [[ ! -x "$native" ]]; then
+  echo "zero: native compiler is not built yet" >&2
+  echo "run: make -C native/zero-c" >&2
+  exit 127
+fi
+
+exec "$native" "$@"

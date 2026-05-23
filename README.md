@@ -1,8 +1,130 @@
-# Zero
+# zerolang
 
-Zero is the programming language for agents: a systems language for small native tools, explicit effects, predictable memory, and structured compiler output.
+Experimental programming language for agent workflows.
 
-Zero is experimental and still changing. The compiler, standard library, docs, and examples are useful for trying the language and giving feedback, but the language is not stable yet.
+Built for reliable autonomous software generation.
+
+Optimized for:
+
+- Token efficiency
+- Low memory usage
+- Fast startup
+- Fast builds
+- Low runtime latency
+- Zero dependencies
+
+> **Safety status**
+>
+> Security vulnerabilities should be expected. zerolang is not ready for production systems, sensitive data, or trusted infrastructure. Run and develop it in isolated, disposable environments.
+
+## Agent Workflow Interfaces
+
+A small program shows function definitions, return rows, prefix calls, fallibility, and indentation:
+
+```zero
+fn answer i32
+  ret + 40 2
+
+pub fn main Void world World !
+  if == answer() 42
+    check world.out.write "math works\n"
+```
+
+The compiler exposes the workflow through CLI commands with stable structured output.
+
+### Load Version-Matched Rules
+
+The compiler ships skill text that matches the binary being used:
+
+```bash
+zero skills list
+zero skills get zero-language
+zero skills get zero-diagnostics
+zero skills get zero-stdlib
+```
+
+Print the language guide bundled with the compiler:
+
+```bash
+zero skills get zero-language
+```
+
+### Inspect Compiler Facts
+
+Compiler state is exposed through structured command output instead of prose-only output. The important contract is the stable fields and repair identifiers; today the CLI exposes those fields with `--json`:
+
+```bash
+zero tokens --json examples/hello.0
+zero parse --json examples/hello.0
+zero check --json examples/hello.0
+zero graph --json examples/systems-package
+zero size --json examples/point.0
+```
+
+The JSON contracts include diagnostic codes and spans, public symbols, import edges, target readiness, compile-time sandbox facts, retained helpers, and size retention reasons.
+
+### Compiler-Native Contracts
+
+Most language ecosystems expose some of these facts through separate tools, editor protocols, or library APIs. zerolang keeps the agent-facing inspection and repair path in the compiler CLI.
+
+The inspection and repair surfaces are compiler commands, not editor-only features or a separate analysis service:
+
+| Command | Contract |
+| --- | --- |
+| `zero skills get zero-language` | Version-matched language rules bundled with the compiler binary. |
+| `zero check --json` | Diagnostics with code, span, expected/actual fields, fix safety, repair metadata, compile-time sandbox facts, and target readiness. |
+| `zero parse --json` | A stable parse summary with declarations, function signatures, and body node kinds. |
+| `zero graph --json` | Modules, imports, public symbols, capabilities, effects, ownership facts, helper use, and interface fingerprints. |
+| `zero fix --plan --json` | Typed repair plans that describe proposed fixes without editing files. |
+| `zero size --json` | Retained helpers, size reasons, profile policy, backend facts, and artifact budget data. |
+
+### Repair With Diagnostics
+
+A failing fixture reports a diagnostic with stable fields:
+
+```bash
+zero check --json conformance/check/fail/unknown-name.0
+```
+
+Today that output includes fields like:
+
+```json
+{
+  "code": "NAM003",
+  "message": "unknown identifier 'message'",
+  "expected": "visible local, parameter, function, or builtin",
+  "actual": "no matching visible symbol",
+  "repair": {
+    "id": "declare-missing-symbol"
+  }
+}
+```
+
+Diagnostics can be explained and turned into typed fix plans:
+
+```bash
+zero explain --json TYP009
+zero fix --plan --json examples/agent-repair-demo/broken.0
+```
+
+Run the repair demo:
+
+```bash
+pnpm run agent:demo
+```
+
+See `examples/agent-repair-demo/` for the broken fixture, suggested edit, fixed fixture, and scripted check-explain-plan-rerun flow.
+
+### Compatibility Policy
+
+zerolang is intentionally unstable before 1.0. The repo prefers one current syntax and one formatted style over compatibility layers:
+
+```bash
+zero fmt --check examples/hello.0
+zero check --json examples/hello.0
+```
+
+Before 1.0, the project may make breaking changes to simplify the language, standard library, diagnostics, or inspection APIs for agent use.
 
 ## Quick Start
 
@@ -32,19 +154,6 @@ Expected output:
 math works
 ```
 
-## Learn Zero
-
-- `docs-site/articles/getting-started.md`: build the compiler and run a first program.
-- `docs-site/articles/learn-zero.md`: a practical tour of the language.
-- `docs-site/articles/language-reference.md`: syntax and behavior reference.
-- `examples/README.md`: examples grouped by concept.
-
-Run the docs site locally:
-
-```bash
-npm run docs:dev
-```
-
 ## Common Commands
 
 ```bash
@@ -53,7 +162,6 @@ zero run examples/add.0
 zero build --emit exe --target linux-musl-x64 examples/add.0 --out .zero/out/add
 zero graph --json examples/systems-package
 zero size --json examples/point.0
-zero routes --json examples/web/hello
 zero skills get zero --full
 zero doctor --json
 ```
@@ -61,24 +169,14 @@ zero doctor --json
 ## Validation
 
 ```bash
-npm run docs:test
-npm run conformance
-npm run native:test
-npm run command-contracts
+pnpm run docs:test
+pnpm run conformance
+pnpm run native:test
+pnpm run command-contracts
 ```
 
 Benchmarks run locally by default:
 
 ```bash
-npm run bench
+pnpm run bench
 ```
-
-## Repository Layout
-
-- `native/zero-c/`: native compiler implementation.
-- `compiler-zero/`: Zero-authored compiler sources.
-- `examples/`: runnable Zero source examples.
-- `conformance/`: language and CLI behavior fixtures.
-- `docs-site/`: documentation site.
-- `tests/`: TypeScript tests for CLI behavior.
-- `extensions/vscode/`: editor syntax highlighting for `.0` files.

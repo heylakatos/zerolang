@@ -1,0 +1,4 @@
+pub fn main Void
+  mut x 1
+  let refs [&x]
+  set x 2

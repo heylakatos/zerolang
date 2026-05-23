@@ -1,0 +1,14 @@
+type Box<T: Type>
+  items [1]T
+
+  fn get Maybe<T> self ref<Self>
+    ret std.mem.get self.items 0
+
+pub fn main Void
+  mut x 1
+  let y 2
+  mut box Box<ref<i32>> Box . items ([&x])
+  let maybe box.get()
+  let current maybe.value
+  set box.items [&y]
+  set x 2

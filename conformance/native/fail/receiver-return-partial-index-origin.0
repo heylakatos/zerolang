@@ -1,0 +1,19 @@
+type RefBox
+  item ref<i32>
+
+type Source
+  items [1]ref<i32>
+  other ref<i32>
+
+  fn replaceOther RefBox self mutref<Self> next ref<i32>
+    set self.other next
+    ret RefBox . item self.items[0]
+
+pub fn main Void
+  mut x 1
+  let y 2
+  let z 3
+  mut source Source . items ([&x]) other (&z)
+  let copy source.replaceOther (&y)
+  set source.items [&y]
+  set x 4

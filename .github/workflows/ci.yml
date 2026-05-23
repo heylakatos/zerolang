@@ -23,7 +23,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@10.11.0 --activate
+          corepack prepare pnpm@11.1.3 --activate
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -32,46 +32,48 @@ jobs:
       - name: Build native compiler
         run: make -C native/zero-c
 
-      - run: npm ci
+      - name: Verify embedded skill data
+        run: |
+          node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/embed-skill-data.mts
+          git diff --exit-code native/zero-c/src/embedded_skills.inc
+
+      - run: pnpm install --frozen-lockfile
 
       - name: Smoke test
-        run: npm run check
+        run: pnpm run check
 
       - name: Conformance suite
-        run: npm run conformance:local
+        run: pnpm run conformance:local
 
       - name: Native tests
-        run: npm run native:test:local
+        run: pnpm run native:test:local
 
       - name: Native sanitizer smoke
-        run: npm run native:sanitize
+        run: pnpm run native:sanitize
 
       - name: TypeScript tests
-        run: npm run test:zero
+        run: pnpm run test:zero
 
       - name: Docs tests
-        run: npm run docs:test
-
-      - name: Install docs dependencies
-        run: pnpm --prefix docs-site install --frozen-lockfile
+        run: pnpm run docs:test
 
       - name: Docs production build
-        run: npm run docs:build
+        run: pnpm run docs:build
 
       - name: Extension tests
-        run: npm run test -w zero-lang
+        run: pnpm run extension:test
 
       - name: Command contract snapshots
-        run: npm run command-contracts:local
+        run: pnpm run command-contracts:local
 
       - name: Benchmark smoke
         env:
           VERCEL_OIDC_TOKEN: ${{ secrets.VERCEL_OIDC_TOKEN }}
         run: |
           if [[ -n "${VERCEL_OIDC_TOKEN:-}" ]]; then
-            ZERO_BENCH_RUNS=1 npm run bench
+            ZERO_BENCH_RUNS=1 pnpm run bench
           else
-            ZERO_BENCH_RUNS=1 npm run bench:local
+            ZERO_BENCH_RUNS=1 pnpm run bench:local
           fi
 
       - name: Cross-target smoke
@@ -84,5 +86,7 @@ jobs:
       - name: Release artifact build smoke
         run: |
           mkdir -p .zero/ci-release
+          node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/embed-skill-data.mts
           ZIG_GLOBAL_CACHE_DIR=.zero/zig-global-cache ZIG_LOCAL_CACHE_DIR=.zero/zig-local-cache zig cc -target x86_64-linux-musl -std=c11 -D_POSIX_C_SOURCE=200809L -Os -Inative/zero-c/include native/zero-c/src/*.c -o .zero/ci-release/zero-linux-musl-x64
           ./.zero/ci-release/zero-linux-musl-x64 --version
+          ./.zero/ci-release/zero-linux-musl-x64 skills list --json

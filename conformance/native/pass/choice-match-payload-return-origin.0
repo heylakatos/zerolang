@@ -1,0 +1,15 @@
+choice Slot
+  some ref<i32>
+  none
+
+fn get ref<i32> slot Slot fallback ref<i32>
+  match slot
+    some borrowed
+      ret borrowed
+    none
+      ret fallback
+
+pub fn main Void
+  let value 1
+  let slot Slot Slot.some (&value)
+  let _borrowed get slot (&value)

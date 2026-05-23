@@ -1,0 +1,16 @@
+type Holder
+  value ref<i32>
+
+fn replaceValue Bool holder mutref<Holder> next ref<i32>
+  set holder.value next
+  ret true
+
+fn maybeReplace Void flag Bool holder mutref<Holder> next ref<i32>
+  let ok && flag (replaceValue holder next)
+
+pub fn main Void flag Bool
+  mut old 1
+  let next 2
+  mut holder Holder . value (&old)
+  maybeReplace flag (&mut holder) (&next)
+  set old 3

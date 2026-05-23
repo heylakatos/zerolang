@@ -1,0 +1,10 @@
+type RefBag
+  refs [1]ref<i32>
+
+pub fn main Void
+  mut x 1
+  mut y 2
+  mut bag RefBag RefBag . refs ([&x])
+  let current bag.refs[0]
+  set bag.refs [&y]
+  set x 3

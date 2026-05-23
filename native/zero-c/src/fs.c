@@ -3,11 +3,55 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+static void z_allocation_fatal(const char *operation) {
+  fprintf(stderr, "zero: fatal: out of memory while %s\n", operation ? operation : "allocating memory");
+  exit(70);
+}
+
+static size_t z_checked_allocation_size(size_t count, size_t item_size, const char *operation) {
+  if (count == 0 || item_size == 0) return 1;
+  if (count > SIZE_MAX / item_size) z_allocation_fatal(operation);
+  return count * item_size;
+}
+
+void *z_checked_malloc(size_t size) {
+  void *ptr = malloc(size == 0 ? 1 : size);
+  if (!ptr) z_allocation_fatal("allocating memory");
+  return ptr;
+}
+
+void *z_checked_calloc(size_t count, size_t item_size) {
+  size_t size = z_checked_allocation_size(count, item_size, "allocating memory");
+  void *ptr = calloc(1, size);
+  if (!ptr) z_allocation_fatal("allocating memory");
+  return ptr;
+}
+
+void *z_checked_reallocarray(void *ptr, size_t count, size_t item_size) {
+  size_t size = z_checked_allocation_size(count, item_size, "growing memory");
+  void *next = realloc(ptr, size);
+  if (!next) z_allocation_fatal("growing memory");
+  return next;
+}
+
+size_t z_grow_capacity(size_t current, size_t required, size_t initial) {
+  size_t next = current == 0 ? (initial == 0 ? 1 : initial) : current;
+  while (next < required) {
+    if (next > SIZE_MAX / 2) {
+      next = required;
+      break;
+    }
+    next *= 2;
+  }
+  return next;
+}
 
 void zbuf_init(ZBuf *buf) {
   buf->data = NULL;
@@ -16,10 +60,11 @@ void zbuf_init(ZBuf *buf) {
 }
 
 void zbuf_append_char(ZBuf *buf, char ch) {
-  if (buf->len + 2 > buf->cap) {
-    size_t next = buf->cap == 0 ? 64 : buf->cap * 2;
-    while (buf->len + 2 > next) next *= 2;
-    buf->data = realloc(buf->data, next);
+  if (buf->len > SIZE_MAX - 2) z_allocation_fatal("growing buffer");
+  size_t required = buf->len + 2;
+  if (required > buf->cap) {
+    size_t next = z_grow_capacity(buf->cap, required, 64);
+    buf->data = z_checked_reallocarray(buf->data, next, sizeof(char));
     buf->cap = next;
   }
   buf->data[buf->len++] = ch;
@@ -41,7 +86,7 @@ void zbuf_appendf(ZBuf *buf, const char *fmt, ...) {
     va_end(args);
     return;
   }
-  char *tmp = malloc((size_t)needed + 1);
+  char *tmp = z_checked_malloc((size_t)needed + 1);
   vsnprintf(tmp, (size_t)needed + 1, fmt, args);
   va_end(args);
   zbuf_append(buf, tmp);
@@ -61,7 +106,8 @@ char *z_strdup(const char *text) {
 }
 
 char *z_strndup(const char *text, size_t len) {
-  char *copy = malloc(len + 1);
+  if (len == SIZE_MAX) z_allocation_fatal("copying string");
+  char *copy = z_checked_malloc(len + 1);
   memcpy(copy, text, len);
   copy[len] = 0;
   return copy;
@@ -91,8 +137,13 @@ char *z_read_file(const char *path, ZDiag *diag) {
   }
   fseek(file, 0, SEEK_END);
   long size = ftell(file);
+  if (size < 0) {
+    diag_io(diag, path, "read");
+    fclose(file);
+    return NULL;
+  }
   rewind(file);
-  char *data = malloc((size_t)size + 1);
+  char *data = z_checked_malloc((size_t)size + 1);
   size_t read = fread(data, 1, (size_t)size, file);
   fclose(file);
   data[read] = 0;
@@ -140,11 +191,6 @@ bool z_write_binary_file(const char *path, const unsigned char *data, size_t len
   return true;
 }
 
-static bool is_directory(const char *path) {
-  struct stat st;
-  return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
 static bool ends_with(const char *text, const char *suffix) {
   size_t text_len = strlen(text);
   size_t suffix_len = strlen(suffix);
@@ -185,11 +231,11 @@ static char *normalize_path_text(const char *path) {
       if (segment_count > 0 && strcmp(segments[segment_count - 1], "..") != 0) {
         segment_count--;
       } else if (!absolute) {
-        segments = realloc(segments, (segment_count + 1) * sizeof(char *));
+        segments = z_checked_reallocarray(segments, segment_count + 1, sizeof(char *));
         segments[segment_count++] = start;
       }
     } else {
-      segments = realloc(segments, (segment_count + 1) * sizeof(char *));
+      segments = z_checked_reallocarray(segments, segment_count + 1, sizeof(char *));
       segments[segment_count++] = start;
     }
     if (!saved) break;
@@ -228,36 +274,8 @@ static unsigned long long fs_mix_hash_text(unsigned long long hash, const char *
   return hash;
 }
 
-static void source_input_push_file(SourceInput *input, const char *path) {
-  input->source_files = realloc(input->source_files, (input->source_file_count + 1) * sizeof(char *));
-  input->source_files[input->source_file_count++] = z_strdup(path);
-}
-
-static void source_input_push_import(SourceInput *input, const char *name) {
-  input->imports = realloc(input->imports, (input->import_count + 1) * sizeof(char *));
-  input->imports[input->import_count++] = z_strdup(name);
-}
-
-static void source_input_push_module(SourceInput *input, const char *name, const char *path) {
-  input->module_names = realloc(input->module_names, (input->module_count + 1) * sizeof(char *));
-  input->module_paths = realloc(input->module_paths, (input->module_count + 1) * sizeof(char *));
-  input->module_names[input->module_count] = z_strdup(name);
-  input->module_paths[input->module_count] = z_strdup(path);
-  input->module_count++;
-}
-
-static void source_input_push_import_edge(SourceInput *input, const char *from, const char *to, const char *path) {
-  input->import_from = realloc(input->import_from, (input->import_edge_count + 1) * sizeof(char *));
-  input->import_to = realloc(input->import_to, (input->import_edge_count + 1) * sizeof(char *));
-  input->import_paths = realloc(input->import_paths, (input->import_edge_count + 1) * sizeof(char *));
-  input->import_from[input->import_edge_count] = z_strdup(from);
-  input->import_to[input->import_edge_count] = z_strdup(to);
-  input->import_paths[input->import_edge_count] = z_strdup(path ? path : "");
-  input->import_edge_count++;
-}
-
 static void source_input_push_dependency(SourceInput *input, const ZManifestDependency *dep, const char *resolved_manifest, const char *resolved_name, const char *resolved_version, const char *status, bool direct) {
-  input->dependencies = realloc(input->dependencies, (input->dependency_count + 1) * sizeof(SourceDependency));
+  input->dependencies = z_checked_reallocarray(input->dependencies, input->dependency_count + 1, sizeof(SourceDependency));
   SourceDependency *item = &input->dependencies[input->dependency_count++];
   memset(item, 0, sizeof(*item));
   item->name = z_strdup(dep && dep->name ? dep->name : "");
@@ -289,292 +307,6 @@ static const char *source_input_package_version(const SourceInput *input, const 
     }
   }
   return NULL;
-}
-
-static bool source_input_push_symbol(SourceInput *input, const char *module, const char *kind, const char *name, bool is_public, ZDiag *diag) {
-  if (is_public) {
-    for (size_t i = 0; i < input->symbol_count; i++) {
-      if (input->symbol_public[i] && strcmp(input->symbol_names[i], name) == 0 && strcmp(input->symbol_modules[i], module) != 0) {
-        diag->code = 7003;
-        diag->path = input->source_file;
-        diag->line = 1;
-        diag->column = 1;
-        snprintf(diag->message, sizeof(diag->message), "duplicate public symbol '%s'", name);
-        snprintf(diag->expected, sizeof(diag->expected), "unique public symbol names across imported modules");
-        snprintf(diag->actual, sizeof(diag->actual), "%s also exported by %s", name, input->symbol_modules[i]);
-        snprintf(diag->help, sizeof(diag->help), "rename one symbol or keep it private inside its module");
-        return false;
-      }
-    }
-  }
-  input->symbol_names = realloc(input->symbol_names, (input->symbol_count + 1) * sizeof(char *));
-  input->symbol_modules = realloc(input->symbol_modules, (input->symbol_count + 1) * sizeof(char *));
-  input->symbol_kinds = realloc(input->symbol_kinds, (input->symbol_count + 1) * sizeof(char *));
-  input->symbol_public = realloc(input->symbol_public, (input->symbol_count + 1) * sizeof(bool));
-  input->symbol_names[input->symbol_count] = z_strdup(name);
-  input->symbol_modules[input->symbol_count] = z_strdup(module);
-  input->symbol_kinds[input->symbol_count] = z_strdup(kind ? kind : "unknown");
-  input->symbol_public[input->symbol_count] = is_public;
-  input->symbol_count++;
-  return true;
-}
-
-static char *module_name_from_path(const char *src_root, const char *path) {
-  const char *relative = path;
-  size_t root_len = src_root ? strlen(src_root) : 0;
-  if (src_root && strncmp(path, src_root, root_len) == 0) {
-    relative = path + root_len;
-    if (*relative == '/') relative++;
-  } else {
-    const char *slash = strrchr(path, '/');
-    relative = slash ? slash + 1 : path;
-  }
-  size_t len = strlen(relative);
-  if (len > 2 && strcmp(relative + len - 2, ".0") == 0) len -= 2;
-  if (len >= 4 && strcmp(relative + len - 4, "/mod") == 0) len -= 4;
-  ZBuf buf;
-  zbuf_init(&buf);
-  for (size_t i = 0; i < len; i++) zbuf_append_char(&buf, relative[i] == '/' ? '.' : relative[i]);
-  if (buf.len == 0) zbuf_append(&buf, "main");
-  return buf.data;
-}
-
-static bool source_input_has_file(SourceInput *input, const char *path) {
-  for (size_t i = 0; i < input->source_file_count; i++) {
-    if (strcmp(input->source_files[i], path) == 0) return true;
-  }
-  return false;
-}
-
-static bool import_stack_contains(char **stack, size_t len, const char *path) {
-  for (size_t i = 0; i < len; i++) {
-    if (strcmp(stack[i], path) == 0) return true;
-  }
-  return false;
-}
-
-static char *module_path_to_source(const char *src_root, const char *module_name) {
-  ZBuf relative;
-  zbuf_init(&relative);
-  for (const char *cursor = module_name; *cursor; cursor++) {
-    zbuf_append_char(&relative, *cursor == '.' ? '/' : *cursor);
-  }
-  zbuf_append(&relative, ".0");
-  char *file_path = join_path(src_root, relative.data);
-  if (file_exists(file_path)) {
-    zbuf_free(&relative);
-    return file_path;
-  }
-  free(file_path);
-  if (relative.len >= 2 && strcmp(relative.data + relative.len - 2, ".0") == 0) {
-    relative.data[relative.len - 2] = 0;
-    relative.len -= 2;
-  }
-  char *dir_path = join_path(src_root, relative.data);
-  char *mod_path = join_path(dir_path, "mod.0");
-  free(dir_path);
-  zbuf_free(&relative);
-  if (file_exists(mod_path)) return mod_path;
-  free(mod_path);
-  return NULL;
-}
-
-static void append_source_without_imports(ZBuf *buf, const char *path, const char *source) {
-  zbuf_append(buf, "// file: ");
-  zbuf_append(buf, path);
-  zbuf_append(buf, "\n");
-  const char *line = source;
-  while (*line) {
-    const char *end = strchr(line, '\n');
-    size_t len = end ? (size_t)(end - line) : strlen(line);
-    const char *start = line;
-    while (len > 0 && isspace((unsigned char)*start)) {
-      start++;
-      len--;
-    }
-    bool is_import = (len >= 4 && strncmp(start, "use ", 4) == 0) || (len >= 7 && strncmp(start, "import ", 7) == 0);
-    if (!is_import) zbuf_appendf(buf, "%.*s\n", (int)(end ? (size_t)(end - line) : strlen(line)), line);
-    if (!end) break;
-    line = end + 1;
-  }
-  zbuf_append(buf, "\n");
-}
-
-static bool resolve_imported_source(const char *path, const char *src_root, SourceInput *input, ZBuf *combined, ZDiag *diag, char ***stack, size_t *stack_len);
-
-static bool scan_top_level_symbols(const char *source, const char *module_name, SourceInput *input, ZDiag *diag) {
-  const char *line = source;
-  while (*line && diag->code == 0) {
-    const char *end = strchr(line, '\n');
-    size_t len = end ? (size_t)(end - line) : strlen(line);
-    const char *start = line;
-    while (len > 0 && isspace((unsigned char)*start)) {
-      start++;
-      len--;
-    }
-    bool is_public = false;
-    if (len > 4 && strncmp(start, "pub ", 4) == 0) {
-      is_public = true;
-      start += 4;
-      len -= 4;
-      while (len > 0 && isspace((unsigned char)*start)) {
-        start++;
-        len--;
-      }
-    }
-    if (len > 7 && strncmp(start, "extern ", 7) == 0) {
-      start += 7;
-      len -= 7;
-      while (len > 0 && isspace((unsigned char)*start)) {
-        start++;
-        len--;
-      }
-    } else if (len > 7 && strncmp(start, "packed ", 7) == 0) {
-      start += 7;
-      len -= 7;
-      while (len > 0 && isspace((unsigned char)*start)) {
-        start++;
-        len--;
-      }
-    }
-    const char *after_keyword = NULL;
-    const char *kind = NULL;
-    const char *keywords[] = {"fun ", "shape ", "interface ", "enum ", "choice ", "const ", "type ", NULL};
-    const char *kinds[] = {"function", "shape", "interface", "enum", "choice", "const", "alias", NULL};
-    for (int i = 0; keywords[i]; i++) {
-      size_t keyword_len = strlen(keywords[i]);
-      if (len > keyword_len && strncmp(start, keywords[i], keyword_len) == 0) {
-        after_keyword = start + keyword_len;
-        kind = kinds[i];
-        break;
-      }
-    }
-    if (after_keyword) {
-      size_t name_len = 0;
-      while (after_keyword[name_len] && (isalnum((unsigned char)after_keyword[name_len]) || after_keyword[name_len] == '_')) name_len++;
-      if (name_len > 0) {
-        char *name = z_strndup(after_keyword, name_len);
-        bool ok = source_input_push_symbol(input, module_name, kind, name, is_public, diag);
-        free(name);
-        if (!ok) return false;
-      }
-    }
-    if (!end) break;
-    line = end + 1;
-  }
-  return diag->code == 0;
-}
-
-static void format_cycle_chain(const char *src_root, char **stack, size_t stack_len, const char *path, ZBuf *out) {
-  bool started = false;
-  for (size_t i = 0; i < stack_len; i++) {
-    if (!started && strcmp(stack[i], path) != 0) continue;
-    started = true;
-    if (out->len > 0) zbuf_append(out, " -> ");
-    char *module = module_name_from_path(src_root, stack[i]);
-    zbuf_append(out, module);
-    free(module);
-  }
-  if (out->len > 0) zbuf_append(out, " -> ");
-  char *module = module_name_from_path(src_root, path);
-  zbuf_append(out, module);
-  free(module);
-}
-
-static bool scan_imports_and_append_dependencies(const char *source, const char *src_root, const char *current_module, SourceInput *input, ZBuf *combined, ZDiag *diag, char ***stack, size_t *stack_len) {
-  const char *line = source;
-  while (*line && diag->code == 0) {
-    const char *end = strchr(line, '\n');
-    size_t len = end ? (size_t)(end - line) : strlen(line);
-    const char *start = line;
-    while (len > 0 && isspace((unsigned char)*start)) {
-      start++;
-      len--;
-    }
-    const char *module = NULL;
-    size_t prefix_len = 0;
-    if (len >= 4 && strncmp(start, "use ", 4) == 0) {
-      module = start + 4;
-      prefix_len = 4;
-    } else if (len >= 7 && strncmp(start, "import ", 7) == 0) {
-      module = start + 7;
-      prefix_len = 7;
-    }
-    if (module) {
-      size_t module_len = len - prefix_len;
-      while (module_len > 0 && isspace((unsigned char)module[module_len - 1])) module_len--;
-      const char *as_kw = NULL;
-      for (size_t i = 0; i + 4 <= module_len; i++) {
-        if (strncmp(module + i, " as ", 4) == 0) {
-          as_kw = module + i;
-          break;
-        }
-      }
-      if (as_kw) module_len = (size_t)(as_kw - module);
-      if (module_len >= 4 && strncmp(module, "std.", 4) == 0) {
-        if (!end) break;
-        line = end + 1;
-        continue;
-      }
-      char *module_name = z_strndup(module, module_len);
-      source_input_push_import(input, module_name);
-      char *module_path = module_path_to_source(src_root, module_name);
-      if (!module_path) {
-        diag->code = 7001;
-        diag->path = input->source_file;
-        diag->line = 1;
-        diag->column = 1;
-        snprintf(diag->message, sizeof(diag->message), "unknown package-local import '%s'", module_name);
-        snprintf(diag->expected, sizeof(diag->expected), "src/%s.0 or src/%s/mod.0", module_name, module_name);
-        snprintf(diag->actual, sizeof(diag->actual), "missing source file");
-        snprintf(diag->help, sizeof(diag->help), "create the module source file or remove the import");
-        free(module_name);
-        return false;
-      }
-      source_input_push_import_edge(input, current_module, module_name, module_path);
-      bool ok = resolve_imported_source(module_path, src_root, input, combined, diag, stack, stack_len);
-      free(module_path);
-      free(module_name);
-      if (!ok) return false;
-    }
-    if (!end) break;
-    line = end + 1;
-  }
-  return diag->code == 0;
-}
-
-static bool resolve_imported_source(const char *path, const char *src_root, SourceInput *input, ZBuf *combined, ZDiag *diag, char ***stack, size_t *stack_len) {
-  if (source_input_has_file(input, path)) return true;
-  if (import_stack_contains(*stack, *stack_len, path)) {
-    ZBuf chain;
-    zbuf_init(&chain);
-    format_cycle_chain(src_root, *stack, *stack_len, path, &chain);
-    diag->code = 7002;
-    diag->path = input->source_file;
-    diag->line = 1;
-    diag->column = 1;
-    snprintf(diag->message, sizeof(diag->message), "import cycle detected");
-    snprintf(diag->actual, sizeof(diag->actual), "%s", chain.data ? chain.data : path);
-    snprintf(diag->help, sizeof(diag->help), "break the module cycle by moving shared declarations into a third module");
-    zbuf_free(&chain);
-    return false;
-  }
-  char *source = z_read_file(path, diag);
-  if (!source) return false;
-  char *module_name = module_name_from_path(src_root, path);
-  *stack = realloc(*stack, (*stack_len + 1) * sizeof(char *));
-  (*stack)[(*stack_len)++] = z_strdup(path);
-  bool ok = scan_imports_and_append_dependencies(source, src_root, module_name, input, combined, diag, stack, stack_len);
-  free((*stack)[--(*stack_len)]);
-  if (ok) ok = scan_top_level_symbols(source, module_name, input, diag);
-  if (ok) {
-    source_input_push_file(input, path);
-    source_input_push_module(input, module_name, path);
-    append_source_without_imports(combined, path, source);
-  }
-  free(module_name);
-  free(source);
-  return ok;
 }
 
 static const char *json_skip_ws(const char *cursor) {
@@ -768,12 +500,12 @@ static char *json_get_array_path(const char *json, const char **path, size_t pat
 }
 
 static void manifest_push_c_lib(ZManifest *manifest, ZManifestCLib lib) {
-  manifest->c_libs = realloc(manifest->c_libs, (manifest->c_lib_count + 1) * sizeof(ZManifestCLib));
+  manifest->c_libs = z_checked_reallocarray(manifest->c_libs, manifest->c_lib_count + 1, sizeof(ZManifestCLib));
   manifest->c_libs[manifest->c_lib_count++] = lib;
 }
 
 static void manifest_push_dependency(ZManifest *manifest, ZManifestDependency dep) {
-  manifest->dependencies = realloc(manifest->dependencies, (manifest->dependency_count + 1) * sizeof(ZManifestDependency));
+  manifest->dependencies = z_checked_reallocarray(manifest->dependencies, manifest->dependency_count + 1, sizeof(ZManifestDependency));
   manifest->dependencies[manifest->dependency_count++] = dep;
 }
 
@@ -1007,6 +739,8 @@ static unsigned long long source_dependency_graph_hash(const SourceInput *input)
   return hash;
 }
 
+static bool resolve_manifest_dependencies(const char *manifest_path, const ZManifest *manifest, SourceInput *out, ZDiag *diag, char ***stack, size_t *stack_len, bool direct);
+
 static bool write_package_lockfile(SourceInput *input) {
   input->dependency_graph_hash = source_dependency_graph_hash(input);
   ZBuf lock;
@@ -1045,6 +779,51 @@ static bool write_package_lockfile(SourceInput *input) {
   bool ok = z_write_file(input->lockfile_path, lock.data ? lock.data : "", &ignored);
   zbuf_free(&lock);
   return ok;
+}
+
+bool z_resolve_package_metadata(const char *manifest_path, const char *manifest, const ZManifest *parsed_manifest, SourceInput *out, ZDiag *diag) {
+  if (!manifest_path || !parsed_manifest || !out) return false;
+  if (parsed_manifest->kind && strcmp(parsed_manifest->kind, "exe") != 0) {
+    diag->code = 2002;
+    diag->path = z_strdup(manifest_path);
+    diag->line = 1;
+    diag->column = 1;
+    snprintf(diag->message, sizeof(diag->message), "unsupported target kind '%s'", parsed_manifest->kind);
+    snprintf(diag->expected, sizeof(diag->expected), "targets.cli.kind = \"exe\"");
+    snprintf(diag->actual, sizeof(diag->actual), "%s", parsed_manifest->kind);
+    snprintf(diag->help, sizeof(diag->help), "use an exe target for the native bootstrap compiler");
+    return false;
+  }
+  if (!parsed_manifest->main_path) {
+    diag->code = 2;
+    diag->path = z_strdup(manifest_path);
+    diag->line = 1;
+    diag->column = 1;
+    snprintf(diag->message, sizeof(diag->message), "zero.json is missing targets.cli.main");
+    return false;
+  }
+
+  SourceInput metadata = {0};
+  metadata.manifest_path = z_strdup(manifest_path);
+  metadata.package_root = dirname_of(manifest_path);
+  metadata.package_name = z_strdup(parsed_manifest->package_name ? parsed_manifest->package_name : "");
+  metadata.package_version = z_strdup(parsed_manifest->package_version ? parsed_manifest->package_version : "");
+  metadata.manifest_hash = fs_fnv1a_text(manifest);
+
+  char **dependency_stack = NULL;
+  size_t dependency_stack_len = 0;
+  dependency_stack = z_checked_reallocarray(dependency_stack, 1, sizeof(char *));
+  dependency_stack[dependency_stack_len++] = z_strdup(manifest_path);
+  bool deps_ok = resolve_manifest_dependencies(manifest_path, parsed_manifest, &metadata, diag, &dependency_stack, &dependency_stack_len, true);
+  while (dependency_stack_len > 0) free(dependency_stack[--dependency_stack_len]);
+  free(dependency_stack);
+  if (!deps_ok) {
+    z_free_source(&metadata);
+    return false;
+  }
+  write_package_lockfile(&metadata);
+  *out = metadata;
+  return true;
 }
 
 static bool resolve_manifest_dependencies(const char *manifest_path, const ZManifest *manifest, SourceInput *out, ZDiag *diag, char ***stack, size_t *stack_len, bool direct) {
@@ -1094,7 +873,7 @@ static bool resolve_manifest_dependencies(const char *manifest_path, const ZMani
       return false;
     }
     source_input_push_dependency(out, dep, dep_manifest_path, resolved_name, resolved_version, "path-resolved", direct);
-    *stack = realloc(*stack, (*stack_len + 1) * sizeof(char *));
+    *stack = z_checked_reallocarray(*stack, *stack_len + 1, sizeof(char *));
     (*stack)[(*stack_len)++] = z_strdup(dep_manifest_path);
     bool ok = resolve_manifest_dependencies(dep_manifest_path, &parsed_dep, out, diag, stack, stack_len, false);
     free((*stack)[--(*stack_len)]);
@@ -1106,118 +885,21 @@ static bool resolve_manifest_dependencies(const char *manifest_path, const ZMani
   return true;
 }
 
-bool z_resolve_source(const char *input, SourceInput *out, ZDiag *diag) {
-  char *manifest_path = NULL;
-  if (is_directory(input)) {
-    manifest_path = join_path(input, "zero.json");
-  } else if (ends_with(input, "zero.json")) {
-    manifest_path = z_strdup(input);
+bool z_map_source_diag(const SourceInput *input, ZDiag *diag) {
+  if (!input || !diag || diag->line <= 0 || input->source_line_count == 0) return false;
+  size_t index = (size_t)diag->line - 1;
+  if (index >= input->source_line_count) return false;
+  diag->path = input->source_line_paths[index];
+  diag->line = input->source_line_numbers[index] > 0 ? input->source_line_numbers[index] : 1;
+  for (size_t i = 0; i < diag->borrow_trace_count; i++) {
+    ZBorrowTrace *trace = &diag->borrow_traces[i];
+    if (trace->binding_line <= 0) continue;
+    size_t binding_index = (size_t)trace->binding_line - 1;
+    if (binding_index >= input->source_line_count) continue;
+    trace->binding_decl_path = input->source_line_paths[binding_index];
+    trace->binding_line = input->source_line_numbers[binding_index] > 0 ? input->source_line_numbers[binding_index] : 1;
   }
-
-  if (manifest_path) {
-    char *manifest = z_read_file(manifest_path, diag);
-    if (!manifest) {
-      // Keep manifest_path alive for the diagnostic; callers print it after return.
-      return false;
-    }
-    ZManifest parsed_manifest = {0};
-    if (!z_parse_manifest_json(manifest, &parsed_manifest, diag)) {
-      diag->path = manifest_path;
-      free(manifest);
-      // Keep manifest_path alive for the diagnostic; callers print it after return.
-      return false;
-    }
-    if (parsed_manifest.kind && strcmp(parsed_manifest.kind, "exe") != 0) {
-      diag->code = 2002;
-      diag->path = manifest_path;
-      diag->line = 1;
-      diag->column = 1;
-      snprintf(diag->message, sizeof(diag->message), "unsupported target kind '%s'", parsed_manifest.kind);
-      snprintf(diag->expected, sizeof(diag->expected), "targets.cli.kind = \"exe\"");
-      snprintf(diag->actual, sizeof(diag->actual), "%s", parsed_manifest.kind);
-      snprintf(diag->help, sizeof(diag->help), "use an exe target for the native bootstrap compiler");
-      z_free_manifest(&parsed_manifest);
-      free(manifest);
-      // Keep manifest_path alive for the diagnostic; callers print it after return.
-      return false;
-    }
-    if (!parsed_manifest.main_path) {
-      diag->code = 2;
-      diag->path = manifest_path;
-      diag->line = 1;
-      diag->column = 1;
-      snprintf(diag->message, sizeof(diag->message), "zero.json is missing targets.cli.main");
-      z_free_manifest(&parsed_manifest);
-      free(manifest);
-      // Keep manifest_path alive for the diagnostic; callers print it after return.
-      return false;
-    }
-    char *dir = dirname_of(manifest_path);
-    out->manifest_path = z_strdup(manifest_path);
-    out->package_root = z_strdup(dir);
-    out->package_name = z_strdup(parsed_manifest.package_name ? parsed_manifest.package_name : "");
-    out->package_version = z_strdup(parsed_manifest.package_version ? parsed_manifest.package_version : "");
-    out->manifest_hash = fs_fnv1a_text(manifest);
-    char **dependency_stack = NULL;
-    size_t dependency_stack_len = 0;
-    dependency_stack = realloc(dependency_stack, sizeof(char *));
-    dependency_stack[dependency_stack_len++] = z_strdup(manifest_path);
-    bool deps_ok = resolve_manifest_dependencies(manifest_path, &parsed_manifest, out, diag, &dependency_stack, &dependency_stack_len, true);
-    while (dependency_stack_len > 0) free(dependency_stack[--dependency_stack_len]);
-    free(dependency_stack);
-    if (!deps_ok) {
-      free(dir);
-      z_free_manifest(&parsed_manifest);
-      free(manifest);
-      // Keep manifest_path alive for the diagnostic; callers print it after return.
-      return false;
-    }
-    write_package_lockfile(out);
-    out->source_file = join_path(dir, parsed_manifest.main_path);
-    if (!file_exists(out->source_file)) {
-      diag->code = 2002;
-      diag->path = manifest_path;
-      diag->line = 1;
-      diag->column = 1;
-      snprintf(diag->message, sizeof(diag->message), "target main source does not exist");
-      snprintf(diag->expected, sizeof(diag->expected), "%s", out->source_file);
-      snprintf(diag->actual, sizeof(diag->actual), "missing source file");
-      snprintf(diag->help, sizeof(diag->help), "create the main source file or update targets.cli.main");
-      free(dir);
-      z_free_manifest(&parsed_manifest);
-      free(manifest);
-      // Keep manifest_path alive for the diagnostic; callers print it after return.
-      return false;
-    }
-    ZBuf source;
-    zbuf_init(&source);
-    char *src_dir = join_path(dir, "src");
-    char **stack = NULL;
-    size_t stack_len = 0;
-    resolve_imported_source(out->source_file, src_dir, out, &source, diag, &stack, &stack_len);
-    free(stack);
-    free(src_dir);
-    out->source = diag->code == 0 ? source.data : NULL;
-    if (diag->code != 0) zbuf_free(&source);
-    free(dir);
-    z_free_manifest(&parsed_manifest);
-    free(manifest);
-    free(manifest_path);
-    return out->source != NULL;
-  }
-
-  out->source_file = z_strdup(input);
-  ZBuf source;
-  zbuf_init(&source);
-  char *dir = dirname_of(input);
-  char **stack = NULL;
-  size_t stack_len = 0;
-  resolve_imported_source(out->source_file, dir, out, &source, diag, &stack, &stack_len);
-  free(stack);
-  free(dir);
-  out->source = diag->code == 0 ? source.data : NULL;
-  if (diag->code != 0) zbuf_free(&source);
-  return out->source != NULL;
+  return true;
 }
 
 void z_free_source(SourceInput *input) {
@@ -1229,6 +911,7 @@ void z_free_source(SourceInput *input) {
   free(input->package_version);
   free(input->lockfile_path);
   for (size_t i = 0; i < input->source_file_count; i++) free(input->source_files[i]);
+  for (size_t i = 0; i < input->source_line_count; i++) free(input->source_line_paths[i]);
   for (size_t i = 0; i < input->import_count; i++) free(input->imports[i]);
   for (size_t i = 0; i < input->module_count; i++) {
     free(input->module_names[i]);
@@ -1238,6 +921,7 @@ void z_free_source(SourceInput *input) {
     free(input->import_from[i]);
     free(input->import_to[i]);
     free(input->import_paths[i]);
+    free(input->import_source_paths[i]);
   }
   for (size_t i = 0; i < input->symbol_count; i++) {
     free(input->symbol_names[i]);
@@ -1255,12 +939,18 @@ void z_free_source(SourceInput *input) {
     free(input->dependencies[i].status);
   }
   free(input->source_files);
+  free(input->source_line_paths);
+  free(input->source_line_numbers);
   free(input->imports);
   free(input->module_names);
   free(input->module_paths);
   free(input->import_from);
   free(input->import_to);
   free(input->import_paths);
+  free(input->import_source_paths);
+  free(input->import_lines);
+  free(input->import_columns);
+  free(input->import_lengths);
   free(input->symbol_names);
   free(input->symbol_modules);
   free(input->symbol_kinds);
@@ -1296,12 +986,6 @@ static bool dir_exists_for_cc(const char *path) {
 
 static bool profile_should_strip_artifact(const char *profile);
 
-static bool target_uses_emscripten(const ZTargetInfo *target) {
-  return target &&
-         ((target->linker && (strcmp(target->linker, "emcc") == 0 || strcmp(target->linker, "emscripten") == 0)) ||
-          (target->libc_mode && strcmp(target->libc_mode, "emscripten") == 0));
-}
-
 static const char *sysroot_status_for(const ZTargetInfo *target, const char *env_name, const char *sysroot) {
   if (!z_target_requires_sysroot(target)) return "not-required";
   if (!env_name || !env_name[0] || !sysroot || !sysroot[0]) return "missing";
@@ -1315,7 +999,6 @@ ZToolchainPlan z_plan_toolchain(const char *cc, const char *profile, const ZTarg
   const char *env_override = getenv("ZERO_CC");
   if (env_override && !env_override[0]) env_override = NULL;
   bool host_target = !target || z_target_is_host(target);
-  bool emscripten_target = target_uses_emscripten(target);
   const char *sysroot_env = target && z_target_requires_sysroot(target) ? z_target_sysroot_env_name(target) : "";
   const char *sysroot = sysroot_env && sysroot_env[0] ? getenv(sysroot_env) : NULL;
   const char *sysroot_status = sysroot_status_for(target, sysroot_env, sysroot);
@@ -1346,15 +1029,6 @@ ZToolchainPlan z_plan_toolchain(const char *cc, const char *profile, const ZTarg
     plan.driver_kind = "override-cc";
     plan.selection_source = "env";
     plan.compiler = env_override;
-    return plan;
-  }
-
-  if (emscripten_target) {
-    plan.driver_kind = "emcc";
-    plan.selection_source = "target-manifest";
-    plan.compiler = "emcc";
-    plan.uses_target_flag = false;
-    plan.strip_artifact = false;
     return plan;
   }
 
@@ -1389,11 +1063,6 @@ static bool validate_toolchain_plan(const ZToolchainPlan *plan, const ZTargetInf
     return false;
   }
 
-  if (strcmp(plan->driver_kind, "emcc") == 0 && !command_exists("emcc")) {
-    fprintf(stderr, "target '%s' requires emcc; install Emscripten or pass --cc/ZERO_CC for a browser-capable C compiler\n", target->name);
-    return false;
-  }
-
   if (strcmp(plan->driver_kind, "host-cc") == 0 && !command_exists("cc")) {
     fprintf(stderr, "host target requires cc; install a native C compiler or pass --cc/ZERO_CC\n");
     return false;
@@ -1415,30 +1084,57 @@ static bool profile_should_strip_artifact(const char *profile) {
   return !profile || strcmp(profile, "release") == 0 || strcmp(profile, "release-small") == 0 || strcmp(profile, "small") == 0 || strcmp(profile, "tiny") == 0;
 }
 
+static void append_toolchain_driver_command(ZBuf *cmd, const ZToolchainPlan *plan) {
+  if (strcmp(plan->driver_kind, "override-cc") == 0) {
+    zbuf_appendf(cmd, "'%s'", plan->compiler);
+  } else if (strcmp(plan->driver_kind, "host-cc") == 0) {
+    zbuf_append(cmd, "cc");
+  } else {
+    zbuf_append(cmd, "mkdir -p .zero/zig-global-cache .zero/zig-local-cache && ZIG_GLOBAL_CACHE_DIR=.zero/zig-global-cache ZIG_LOCAL_CACHE_DIR=.zero/zig-local-cache zig cc");
+    zbuf_appendf(cmd, " -target '%s'", plan->target_triple);
+  }
+}
+
+bool z_toolchain_compile_c_object(const ZToolchainPlan *plan, const char *profile, const ZTargetInfo *target, const char *c_file, const char *object_file, const char *include_dir, const char *extra_c_flags) {
+  if (!validate_toolchain_plan(plan, target)) return false;
+
+  ZBuf cmd;
+  zbuf_init(&cmd);
+  append_toolchain_driver_command(&cmd, plan);
+  zbuf_appendf(&cmd, " %s", profile_c_flags(profile));
+  if (extra_c_flags && extra_c_flags[0]) zbuf_appendf(&cmd, " %s", extra_c_flags);
+  if (include_dir && include_dir[0]) zbuf_appendf(&cmd, " -I '%s'", include_dir);
+  zbuf_appendf(&cmd, " -c '%s' -o '%s'", c_file, object_file);
+  bool ok = system(cmd.data) == 0;
+  zbuf_free(&cmd);
+  return ok;
+}
+
+bool z_toolchain_link_objects(const ZToolchainPlan *plan, const ZTargetInfo *target, const char *const *object_files, size_t object_count, const char *exe_file, const char *pre_link_flags, const char *post_object_flags) {
+  if (!validate_toolchain_plan(plan, target)) return false;
+
+  ZBuf cmd;
+  zbuf_init(&cmd);
+  append_toolchain_driver_command(&cmd, plan);
+  if (pre_link_flags && pre_link_flags[0]) zbuf_appendf(&cmd, " %s", pre_link_flags);
+  for (size_t i = 0; i < object_count; i++) {
+    if (object_files[i] && object_files[i][0]) zbuf_appendf(&cmd, " '%s'", object_files[i]);
+  }
+  zbuf_appendf(&cmd, " -o '%s'", exe_file);
+  if (post_object_flags && post_object_flags[0]) zbuf_appendf(&cmd, " %s", post_object_flags);
+  bool ok = system(cmd.data) == 0;
+  zbuf_free(&cmd);
+  return ok;
+}
+
 bool z_run_cc(const char *c_file, const char *exe_file, const char *cc, const char *profile, const ZTargetInfo *target) {
   ZToolchainPlan plan = z_plan_toolchain(cc, profile, target);
-  const char *opt = profile_c_flags(profile);
-
   if (!validate_toolchain_plan(&plan, target)) return false;
 
   ZBuf cmd;
   zbuf_init(&cmd);
-  if (strcmp(plan.driver_kind, "override-cc") == 0) {
-    zbuf_appendf(&cmd, "'%s' %s '%s' -o '%s'", plan.compiler, opt, c_file, exe_file);
-  } else if (strcmp(plan.driver_kind, "host-cc") == 0) {
-    zbuf_appendf(&cmd, "cc %s '%s' -o '%s'", opt, c_file, exe_file);
-  } else if (strcmp(plan.driver_kind, "emcc") == 0) {
-    zbuf_appendf(&cmd, "emcc %s '%s' -o '%s'", opt, c_file, exe_file);
-  } else {
-    zbuf_appendf(
-      &cmd,
-      "mkdir -p .zero/zig-global-cache .zero/zig-local-cache && ZIG_GLOBAL_CACHE_DIR=.zero/zig-global-cache ZIG_LOCAL_CACHE_DIR=.zero/zig-local-cache zig cc -target '%s' %s '%s' -o '%s'",
-      plan.target_triple,
-      opt,
-      c_file,
-      exe_file
-    );
-  }
+  append_toolchain_driver_command(&cmd, &plan);
+  zbuf_appendf(&cmd, " %s '%s' -o '%s'", profile_c_flags(profile), c_file, exe_file);
   bool ok = system(cmd.data) == 0;
   zbuf_free(&cmd);
   if (!ok) {

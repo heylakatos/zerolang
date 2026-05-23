@@ -1,0 +1,11 @@
+choice Slot
+  some ref<i32>
+  none
+
+fn pass Slot slot Slot
+  ret slot
+
+pub fn main Void
+  let value 1
+  let slot Slot Slot.some (&value)
+  let _copy pass slot

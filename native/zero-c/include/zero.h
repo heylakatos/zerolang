@@ -10,6 +10,27 @@ typedef struct {
   size_t cap;
 } ZBuf;
 
+#define Z_BORROW_TRACE_MAX 16
+
+typedef struct {
+  char root[128];
+  char path[256];
+  char kind[16];
+  char binding[128];
+  const char *binding_decl_path;
+  int binding_line;
+  int binding_column;
+} ZBorrowTrace;
+
+typedef struct {
+  bool present;
+  char target[64];
+  char object_format[32];
+  char backend[64];
+  char stage[32];
+  char unsupported_feature[128];
+} ZBackendBlocker;
+
 typedef struct {
   int code;
   char code_text[16];
@@ -17,6 +38,11 @@ typedef struct {
   char expected[128];
   char actual[128];
   char help[256];
+  ZBorrowTrace borrow_traces[Z_BORROW_TRACE_MAX];
+  size_t borrow_trace_count;
+  bool borrow_trace_truncated;
+  char borrow_repair[256];
+  ZBackendBlocker backend_blocker;
   const char *path;
   int line;
   int column;
@@ -24,29 +50,76 @@ typedef struct {
 } ZDiag;
 
 typedef enum {
-  TOK_IDENT,
-  TOK_KEYWORD,
-  TOK_STRING,
-  TOK_CHAR,
-  TOK_NUMBER,
-  TOK_SYMBOL,
-  TOK_EOF
-} TokenKind;
+  Z_ROW_TOKEN_WORD,
+  Z_ROW_TOKEN_STRING,
+  Z_ROW_TOKEN_CHAR,
+  Z_ROW_TOKEN_NUMBER,
+  Z_ROW_TOKEN_SYMBOL,
+  Z_ROW_TOKEN_COMMENT,
+  Z_ROW_TOKEN_NEWLINE,
+  Z_ROW_TOKEN_INDENT,
+  Z_ROW_TOKEN_DEDENT,
+  Z_ROW_TOKEN_EOF
+} ZRowTokenKind;
 
 typedef struct {
-  TokenKind kind;
+  ZRowTokenKind kind;
   char *text;
   int line;
   int column;
   size_t offset;
   size_t length;
-} Token;
+} ZRowToken;
 
 typedef struct {
-  Token *items;
+  ZRowToken *items;
   size_t len;
   size_t cap;
-} TokenVec;
+} ZRowTokenVec;
+
+typedef struct {
+  size_t row_count;
+  size_t comment_count;
+  size_t blank_line_count;
+  size_t max_indent_depth;
+} ZRowSyntaxFacts;
+
+#define Z_ROW_NO_PARENT ((size_t)-1)
+
+typedef enum {
+  Z_ROW_TRIVIA_LEADING_COMMENT,
+  Z_ROW_TRIVIA_TRAILING_COMMENT,
+  Z_ROW_TRIVIA_BLOCK_COMMENT,
+  Z_ROW_TRIVIA_BLANK_LINE
+} ZRowTriviaKind;
+
+typedef struct {
+  ZRowTriviaKind kind;
+  size_t row;
+  size_t parent;
+  size_t token;
+  size_t indent_depth;
+  int line;
+  int column;
+} ZRowTrivia;
+
+typedef struct {
+  size_t parent;
+  size_t first_token;
+  size_t token_count;
+  size_t indent_depth;
+  int line;
+  int column;
+} ZRowNode;
+
+typedef struct {
+  ZRowNode *items;
+  size_t len;
+  size_t cap;
+  ZRowTrivia *trivia;
+  size_t trivia_len;
+  size_t trivia_cap;
+} ZRowTree;
 
 typedef enum {
   // 标识符表达式：引用一个变量、参数、函数或类型名
@@ -170,6 +243,9 @@ struct Expr {
   bool mutable_borrow;
   // 仅 EXPR_BOOL 用: 保存 true / false 字面量的实际值
   bool bool_value;
+  // 仅 EXPR_ARRAY_LITERAL 用: true 表示 [v; n] 的 repeat 形式（args 只有 1 个元素，
+  // 实际长度由别处提供），false 表示 [a, b, c] 的逐元素形式
+  bool array_repeat;
   // 左子表达式，含义随 .kind 变：
   // - EXPR_BINARY: 左操作数
   // - EXPR_MEMBER: 被访问的对象（a.b 里的 a）
@@ -191,6 +267,8 @@ struct Expr {
   // 调用点的显式泛型类型参数
   // 例: add<i32>(1, 2) 里的 <i32>
   TypeArgVec type_args;
+  // checker 解析完泛型绑定后的类型参数（即便用户没写 <T>，checker 也能从参数推导填入）[checker]
+  TypeArgVec checked_type_args;
   // 仅 EXPR_SHAPE_LITERAL 用: shape 字面量的字段初始化列表
   // 例: Point { x: 40, y: 2 } 里的 [x=40, y=2]
   FieldInitVec fields;
@@ -448,9 +526,26 @@ typedef struct {
   size_t cap;
 } CImportVec;
 
-/* Program 是顶层 AST 节点：一个 .0 源文件（或一个包）parse 出来后，
- * 各种顶层声明被分门别类放进下面 8 个 vec 中。每个 vec 按出现顺序保存。 */
 typedef struct {
+  char *module;
+  char *alias;
+  int line;
+  int column;
+  int end_column;
+} UseImport;
+
+typedef struct {
+  UseImport *items;
+  size_t len;
+  size_t cap;
+} UseImportVec;
+
+/* Program 是顶层 AST 节点：一个 .0 源文件（或一个包）parse 出来后，
+ * 各种顶层声明被分门别类放进下面 9 个 vec 中。每个 vec 按出现顺序保存。 */
+typedef struct {
+  // use 模块导入：包内或 std 路径，可带 `as alias`
+  // 例：use std.mem, use my.utils as u
+  UseImportVec use_imports;
   // C 头文件外部导入（让 Zero 调 C 函数）
   // 例：extern c "math.h" as cmath
   CImportVec c_imports;
@@ -521,8 +616,6 @@ typedef enum {
   IR_VALUE_BYTE_COPY,
   IR_VALUE_BYTE_FILL,
   IR_VALUE_CRC32_BYTES,
-  IR_VALUE_MEMORY_PEEK_U8,
-  IR_VALUE_MEMORY_POKE_U8,
   IR_VALUE_FIXED_BUF_ALLOC,
   IR_VALUE_VEC_INIT,
   IR_VALUE_VEC_PUSH,
@@ -561,6 +654,21 @@ typedef enum {
   IR_VALUE_FS_DIR_ENTRY_COUNT,
   IR_VALUE_FS_TEMP_NAME,
   IR_VALUE_FS_ATOMIC_WRITE,
+  IR_VALUE_JSON_PARSE_BYTES,
+  IR_VALUE_JSON_VALIDATE_BYTES,
+  IR_VALUE_JSON_STREAM_TOKENS_BYTES,
+  IR_VALUE_HTTP_FETCH,
+  IR_VALUE_HTTP_RESULT_OK,
+  IR_VALUE_HTTP_RESULT_STATUS,
+  IR_VALUE_HTTP_RESULT_BODY_LEN,
+  IR_VALUE_HTTP_RESULT_ERROR,
+  IR_VALUE_HTTP_RESPONSE_LEN,
+  IR_VALUE_HTTP_RESPONSE_HEADERS_LEN,
+  IR_VALUE_HTTP_RESPONSE_BODY_OFFSET,
+  IR_VALUE_HTTP_HEADER_VALUE,
+  IR_VALUE_HTTP_HEADER_FOUND,
+  IR_VALUE_HTTP_HEADER_OFFSET,
+  IR_VALUE_HTTP_HEADER_LEN,
   IR_VALUE_FIELD_LOAD,
   IR_VALUE_CHECK,
   IR_VALUE_RESCUE
@@ -701,6 +809,7 @@ typedef struct {
   char mir_actual[128];
   char mir_message[256];
   char mir_help[256];
+  ZBackendBlocker backend_blocker;
   int mir_line;
   int mir_column;
   size_t mir_bytes;
@@ -712,6 +821,8 @@ typedef struct {
   size_t direct_allocator_helper_count;
   size_t direct_buffer_helper_count;
   size_t direct_runtime_helper_count;
+  size_t direct_host_runtime_import_count;
+  size_t direct_http_runtime_import_count;
 } IrProgram;
 
 typedef struct {
@@ -745,9 +856,15 @@ typedef struct {
   char **import_from;
   char **import_to;
   char **import_paths;
+  char **import_source_paths;
+  int *import_lines;
+  int *import_columns;
+  int *import_lengths;
   char **symbol_names;
   char **symbol_modules;
   char **symbol_kinds;
+  char **source_line_paths;
+  int *source_line_numbers;
   SourceDependency *dependencies;
   bool *symbol_public;
   size_t source_file_count;
@@ -755,6 +872,7 @@ typedef struct {
   size_t module_count;
   size_t import_edge_count;
   size_t symbol_count;
+  size_t source_line_count;
   size_t dependency_count;
   long long resolve_ms;
   long long parse_ms;
@@ -773,6 +891,8 @@ typedef struct {
   size_t direct_allocator_helper_count;
   size_t direct_buffer_helper_count;
   size_t direct_runtime_helper_count;
+  size_t direct_host_runtime_import_count;
+  size_t direct_http_runtime_import_count;
   bool parse_cache_hit;
   bool interface_cache_hit;
   bool check_cache_hit;
@@ -851,42 +971,55 @@ void zbuf_append_char(ZBuf *buf, char ch);
 void zbuf_appendf(ZBuf *buf, const char *fmt, ...);
 void zbuf_free(ZBuf *buf);
 
+void *z_checked_malloc(size_t size);
+void *z_checked_calloc(size_t count, size_t item_size);
+void *z_checked_reallocarray(void *ptr, size_t count, size_t item_size);
+size_t z_grow_capacity(size_t current, size_t required, size_t initial);
 char *z_strdup(const char *text);
 char *z_strndup(const char *text, size_t len);
 char *z_read_file(const char *path, ZDiag *diag);
 bool z_write_file(const char *path, const char *text, ZDiag *diag);
 bool z_write_binary_file(const char *path, const unsigned char *data, size_t len, ZDiag *diag);
-bool z_resolve_source(const char *input, SourceInput *out, ZDiag *diag);
+bool z_map_source_diag(const SourceInput *input, ZDiag *diag);
 void z_free_source(SourceInput *input);
 bool z_parse_manifest_json(const char *manifest, ZManifest *out, ZDiag *diag);
+bool z_resolve_package_metadata(const char *manifest_path, const char *manifest, const ZManifest *parsed_manifest, SourceInput *out, ZDiag *diag);
 void z_free_manifest(ZManifest *manifest);
 char *z_default_out_path(const char *source_file);
 ZToolchainPlan z_plan_toolchain(const char *cc, const char *profile, const ZTargetInfo *target);
+bool z_toolchain_compile_c_object(const ZToolchainPlan *plan, const char *profile, const ZTargetInfo *target, const char *c_file, const char *object_file, const char *include_dir, const char *extra_c_flags);
+bool z_toolchain_link_objects(const ZToolchainPlan *plan, const ZTargetInfo *target, const char *const *object_files, size_t object_count, const char *exe_file, const char *pre_link_flags, const char *post_object_flags);
 bool z_run_cc(const char *c_file, const char *exe_file, const char *cc, const char *profile, const ZTargetInfo *target);
 
-TokenVec z_tokenize(const char *source, ZDiag *diag);
-void z_free_tokens(TokenVec *tokens);
+ZRowTokenVec z_row_tokenize(const char *source, ZDiag *diag);
+bool z_row_analyze_layout(const ZRowTokenVec *tokens, ZRowSyntaxFacts *facts, ZDiag *diag);
+bool z_row_parse_layout(const ZRowTokenVec *tokens, ZRowTree *tree, ZDiag *diag);
+Program z_parse_row(const ZRowTokenVec *tokens, const ZRowTree *tree, ZDiag *diag);
+char *z_format_row_layout(const ZRowTokenVec *tokens, const ZRowTree *tree);
+void z_free_row_tree(ZRowTree *tree);
+void z_free_row_tokens(ZRowTokenVec *tokens);
 
-Program z_parse(TokenVec *tokens, ZDiag *diag);
 void z_free_program(Program *program);
 
 bool z_check_program(const Program *program, ZDiag *diag);
 void z_set_check_target(const ZTargetInfo *target);
 ZMetaCacheStats z_meta_cache_stats(void);
+void z_backend_blocker_set(ZBackendBlocker *blocker, const char *target, const char *object_format, const char *backend, const char *stage, const char *unsupported_feature);
+void z_diag_set_backend_blocker(ZDiag *diag, const ZBackendBlocker *blocker);
 IrProgram z_lower_program(const Program *program);
 IrProgram z_lower_program_with_source(const Program *program, const SourceInput *input);
 void z_free_ir_program(IrProgram *program);
-bool z_emit_wasm_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 bool z_emit_elf64_object_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 bool z_emit_elf64_exe_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 bool z_emit_elf_aarch64_object_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 bool z_emit_elf_aarch64_exe_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
+size_t z_macho64_stack_bytes_from_ir(const IrProgram *program);
+size_t z_macho64_max_frame_bytes_from_ir(const IrProgram *program);
 bool z_emit_macho64_object_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 bool z_emit_macho64_exe_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 bool z_emit_coff_x64_object_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 bool z_emit_coff_x64_exe_from_ir(const IrProgram *program, ZBuf *out, ZDiag *diag);
 
-bool z_discover_routes_json(const char *input, char **json, ZDiag *diag);
 const char *z_host_target(void);
 size_t z_target_count(void);
 const ZTargetInfo *z_target_at(size_t index);
@@ -901,6 +1034,7 @@ const char *z_direct_backend_status(const ZTargetInfo *target);
 const char *z_direct_object_emitter(const ZTargetInfo *target);
 const char *z_direct_exe_emitter(const ZTargetInfo *target);
 const char *z_direct_backend_reason(const ZTargetInfo *target);
+void z_append_http_runtime_json(ZBuf *buf, const ZTargetInfo *target);
 void z_append_targets_json(ZBuf *buf);
 void z_append_target_names_json(ZBuf *buf);
 

@@ -1,0 +1,14 @@
+type Box
+  value ref<i32>
+  count i32
+
+  fn countRef ref<i32> self ref<Self>
+    ret &self.count
+
+pub fn main Void
+  mut x 1
+  let y 2
+  mut box Box . value (&x) count 0
+  let current box.countRef()
+  set box.value &y
+  set x 3

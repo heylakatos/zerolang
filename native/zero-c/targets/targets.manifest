@@ -109,31 +109,3 @@ libcMode = "sysroot"
 exeSuffix = ".exe"
 zigTarget = "aarch64-windows-msvc"
 capabilities = ["memory", "stdio", "time", "rand"]
-
-[[target]]
-name = "wasm32-wasi"
-aliases = []
-os = "wasi"
-arch = "wasm32"
-abi = "wasi"
-objectFormat = "wasm"
-linker = "wasm-ld"
-libc = "wasi"
-libcMode = "bundled-libc"
-exeSuffix = ".wasm"
-zigTarget = "wasm32-wasi"
-capabilities = ["memory", "stdio", "args", "env", "fs", "time", "rand"]
-
-[[target]]
-name = "wasm32-web"
-aliases = []
-os = "web"
-arch = "wasm32"
-abi = "emscripten"
-objectFormat = "wasm"
-linker = "emcc"
-libc = "emscripten"
-libcMode = "emscripten"
-exeSuffix = ".js"
-zigTarget = "wasm32-emscripten"
-capabilities = ["memory", "stdio", "env", "time", "rand", "web"]

@@ -1,47 +1,12 @@
 #include "zero.h"
+#include "elf_emit_state.h"
+#include "elf_format.h"
+#include "x64_emit.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static void elf_append_u8(ZBuf *buf, unsigned value) {
-  zbuf_append_char(buf, (char)(value & 0xff));
-}
-
-static void elf_append_u16(ZBuf *buf, uint16_t value) {
-  elf_append_u8(buf, value);
-  elf_append_u8(buf, value >> 8);
-}
-
-static void elf_append_u32(ZBuf *buf, uint32_t value) {
-  elf_append_u8(buf, value);
-  elf_append_u8(buf, value >> 8);
-  elf_append_u8(buf, value >> 16);
-  elf_append_u8(buf, value >> 24);
-}
-
-static void elf_append_u64(ZBuf *buf, uint64_t value) {
-  elf_append_u32(buf, (uint32_t)value);
-  elf_append_u32(buf, (uint32_t)(value >> 32));
-}
-
-static void elf_append_bytes(ZBuf *buf, const unsigned char *bytes, size_t len) {
-  for (size_t i = 0; i < len; i++) elf_append_u8(buf, bytes[i]);
-}
-
-static void elf_append_zeros(ZBuf *buf, size_t len) {
-  for (size_t i = 0; i < len; i++) elf_append_u8(buf, 0);
-}
-
-static size_t elf_align(size_t value, size_t alignment) {
-  size_t remainder = alignment ? value % alignment : 0;
-  return remainder == 0 ? value : value + (alignment - remainder);
-}
-
-static void elf_pad_to(ZBuf *buf, size_t offset) {
-  while (buf->len < offset) elf_append_u8(buf, 0);
-}
 
 static bool elf_diag(ZDiag *diag, const char *message, int line, int column, const char *actual) {
   diag->code = 4004;
@@ -64,6 +29,7 @@ static bool elf_ir_diag(ZDiag *diag, const IrProgram *ir) {
   snprintf(diag->expected, sizeof(diag->expected), "direct ELF64 object MVP subset");
   snprintf(diag->actual, sizeof(diag->actual), "%s", ir && ir->mir_actual[0] ? ir->mir_actual : "unsupported construct");
   snprintf(diag->help, sizeof(diag->help), "choose a supported direct target or restrict this program to exported primitive integer arithmetic functions");
+  if (ir) z_diag_set_backend_blocker(diag, &ir->backend_blocker);
   return false;
 }
 
@@ -104,48 +70,14 @@ static unsigned elf_local_offset(const IrFunction *fun, unsigned local_index) {
   return (local_index + 1) * 8;
 }
 
-static void elf_emit_rbp_disp_reg(ZBuf *code, unsigned opcode, unsigned reg, unsigned offset, bool wide) {
-  if (wide || reg >= 8) {
-    unsigned rex = wide ? 0x48 : 0x40;
-    if (reg >= 8) rex |= 0x04;
-    elf_append_u8(code, rex);
-  }
-  elf_append_u8(code, opcode);
-  unsigned reg_low = reg & 7;
-  if (offset <= 127) {
-    elf_append_u8(code, 0x40 | (reg_low << 3) | 0x05);
-    elf_append_u8(code, (unsigned char)(-(int)offset));
-  } else {
-    elf_append_u8(code, 0x80 | (reg_low << 3) | 0x05);
-    elf_append_u32(code, (uint32_t)(-(int32_t)offset));
-  }
-}
-
-static void elf_emit_load_rbp_positive_reg(ZBuf *code, unsigned reg, unsigned offset, bool wide) {
-  if (wide || reg >= 8) {
-    unsigned rex = wide ? 0x48 : 0x40;
-    if (reg >= 8) rex |= 0x04;
-    elf_append_u8(code, rex);
-  }
-  elf_append_u8(code, 0x8b);
-  unsigned reg_low = reg & 7;
-  if (offset <= 127) {
-    elf_append_u8(code, 0x40 | (reg_low << 3) | 0x05);
-    elf_append_u8(code, (unsigned char)offset);
-  } else {
-    elf_append_u8(code, 0x80 | (reg_low << 3) | 0x05);
-    elf_append_u32(code, offset);
-  }
-}
-
 static void elf_emit_load_local_rax(ZBuf *code, const IrFunction *fun, unsigned local_index) {
   bool wide = fun && local_index < fun->local_len && elf_type_is_i64(fun->locals[local_index].type);
-  elf_emit_rbp_disp_reg(code, 0x8b, 0, elf_local_offset(fun, local_index), wide);
+  z_x64_emit_rbp_disp_reg(code, 0x8b, 0, elf_local_offset(fun, local_index), wide);
 }
 
 static void elf_emit_store_local_from_reg(ZBuf *code, const IrFunction *fun, unsigned local_index, unsigned reg) {
   bool wide = fun && local_index < fun->local_len && elf_type_is_i64(fun->locals[local_index].type);
-  elf_emit_rbp_disp_reg(code, 0x89, reg, elf_local_offset(fun, local_index), wide);
+  z_x64_emit_rbp_disp_reg(code, 0x89, reg, elf_local_offset(fun, local_index), wide);
 }
 
 static unsigned elf_record_field_disp(const IrLocal *local, unsigned field_offset) {
@@ -156,23 +88,23 @@ static unsigned elf_record_field_disp(const IrLocal *local, unsigned field_offse
 static void elf_emit_load_field_rax(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type) {
   unsigned disp = elf_record_field_disp(local, field_offset);
   if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) {
-    elf_append_u8(code, 0x0f);
-    elf_emit_rbp_disp_reg(code, 0xb6, 0, disp, false);
+    z_x64_append_u8(code, 0x0f);
+    z_x64_emit_rbp_disp_reg(code, 0xb6, 0, disp, false);
   } else if (elf_type_is_i64(type)) {
-    elf_emit_rbp_disp_reg(code, 0x8b, 0, disp, true);
+    z_x64_emit_rbp_disp_reg(code, 0x8b, 0, disp, true);
   } else {
-    elf_emit_rbp_disp_reg(code, 0x8b, 0, disp, false);
+    z_x64_emit_rbp_disp_reg(code, 0x8b, 0, disp, false);
   }
 }
 
 static void elf_emit_store_field_from_rax(ZBuf *code, const IrLocal *local, unsigned field_offset, IrTypeKind type) {
   unsigned disp = elf_record_field_disp(local, field_offset);
   if (type == IR_TYPE_U8 || type == IR_TYPE_BOOL) {
-    elf_emit_rbp_disp_reg(code, 0x88, 0, disp, false);
+    z_x64_emit_rbp_disp_reg(code, 0x88, 0, disp, false);
   } else if (elf_type_is_i64(type)) {
-    elf_emit_rbp_disp_reg(code, 0x89, 0, disp, true);
+    z_x64_emit_rbp_disp_reg(code, 0x89, 0, disp, true);
   } else {
-    elf_emit_rbp_disp_reg(code, 0x89, 0, disp, false);
+    z_x64_emit_rbp_disp_reg(code, 0x89, 0, disp, false);
   }
 }
 
@@ -183,50 +115,11 @@ static unsigned elf_type_byte_size(IrTypeKind type) {
 }
 
 static void elf_emit_lea_array_base_rax(ZBuf *code, const IrLocal *local) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x8d);
-  elf_append_u8(code, 0x85);
-  elf_append_u32(code, (uint32_t)(-(int32_t)local->frame_offset));
+  z_x64_emit_rbp_disp_reg(code, 0x8d, 0, local->frame_offset, true);
 }
 
 static void elf_emit_scale_index_into_rax(ZBuf *code, IrTypeKind element_type) {
-  unsigned size = elf_type_byte_size(element_type);
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x8d);
-  if (size == 1) {
-    elf_append_u8(code, 0x04);
-    elf_append_u8(code, 0x08);
-  } else if (size == 4) {
-    elf_append_u8(code, 0x04);
-    elf_append_u8(code, 0x88);
-  } else {
-    elf_append_u8(code, 0x04);
-    elf_append_u8(code, 0xc8);
-  }
-}
-
-static size_t elf_emit_jmp32_placeholder(ZBuf *code, unsigned opcode) {
-  elf_append_u8(code, opcode);
-  size_t patch = code->len;
-  elf_append_u32(code, 0);
-  return patch;
-}
-
-static size_t elf_emit_jcc32_placeholder(ZBuf *code, unsigned condition) {
-  elf_append_u8(code, 0x0f);
-  elf_append_u8(code, condition);
-  size_t patch = code->len;
-  elf_append_u32(code, 0);
-  return patch;
-}
-
-static void elf_patch_rel32(ZBuf *code, size_t patch_offset, size_t target_offset) {
-  int64_t rel = (int64_t)target_offset - (int64_t)(patch_offset + 4);
-  uint32_t value = (uint32_t)(int32_t)rel;
-  code->data[patch_offset] = (char)(value & 0xff);
-  code->data[patch_offset + 1] = (char)((value >> 8) & 0xff);
-  code->data[patch_offset + 2] = (char)((value >> 16) & 0xff);
-  code->data[patch_offset + 3] = (char)((value >> 24) & 0xff);
+  z_x64_emit_lea_base_index_scale_disp_reg(code, 0, 0, 1, elf_type_byte_size(element_type), 0);
 }
 
 static unsigned elf_setcc_opcode(IrCompareOp op, bool uns) {
@@ -241,30 +134,22 @@ static unsigned elf_setcc_opcode(IrCompareOp op, bool uns) {
   return 0x94;
 }
 
-typedef struct {
-  size_t patch_offset;
-  unsigned callee_index;
-} ElfCallPatch;
-
-typedef struct {
-  size_t patch_offset;
-  unsigned data_offset;
-} ElfRodataPatch;
-
-typedef struct {
-  const IrProgram *ir;
-  size_t *function_offsets;
-  size_t function_count;
-  ElfCallPatch *call_patches;
-  size_t call_patch_len;
-  size_t call_patch_cap;
-  ElfRodataPatch *rodata_patches;
-  size_t rodata_patch_len;
-  size_t rodata_patch_cap;
-  bool emit_rodata_relocations;
-  unsigned rodata_base_offset;
-  uint64_t rodata_addr;
-} ElfEmitContext;
+static ElfRuntimeHelper elf_runtime_helper_for_value(IrValueKind kind) {
+  switch (kind) {
+    case IR_VALUE_HTTP_RESULT_OK: return ELF_RUNTIME_HTTP_RESULT_OK;
+    case IR_VALUE_HTTP_RESULT_STATUS: return ELF_RUNTIME_HTTP_RESULT_STATUS;
+    case IR_VALUE_HTTP_RESULT_BODY_LEN: return ELF_RUNTIME_HTTP_RESULT_BODY_LEN;
+    case IR_VALUE_HTTP_RESULT_ERROR: return ELF_RUNTIME_HTTP_RESULT_ERROR;
+    case IR_VALUE_HTTP_RESPONSE_LEN: return ELF_RUNTIME_HTTP_RESPONSE_LEN;
+    case IR_VALUE_HTTP_RESPONSE_HEADERS_LEN: return ELF_RUNTIME_HTTP_RESPONSE_HEADERS_LEN;
+    case IR_VALUE_HTTP_RESPONSE_BODY_OFFSET: return ELF_RUNTIME_HTTP_RESPONSE_BODY_OFFSET;
+    case IR_VALUE_HTTP_HEADER_VALUE: return ELF_RUNTIME_HTTP_HEADER_VALUE;
+    case IR_VALUE_HTTP_HEADER_FOUND: return ELF_RUNTIME_HTTP_HEADER_FOUND;
+    case IR_VALUE_HTTP_HEADER_OFFSET: return ELF_RUNTIME_HTTP_HEADER_OFFSET;
+    case IR_VALUE_HTTP_HEADER_LEN: return ELF_RUNTIME_HTTP_HEADER_LEN;
+    default: return ELF_RUNTIME_HELPER_COUNT;
+  }
+}
 
 static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag);
 static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag);
@@ -277,57 +162,32 @@ static bool elf_function_propagates_to_process_exit(const IrFunction *fun) {
                   fun->value_return_type == IR_TYPE_VOID));
 }
 
-static bool elf_record_call_patch(ElfEmitContext *ctx, size_t patch_offset, unsigned callee_index, ZDiag *diag, const IrValue *value) {
-  if (!ctx || callee_index >= ctx->function_count) {
-    return elf_diag(diag, "direct ELF64 call target index is out of range", value ? value->line : 1, value ? value->column : 1, "invalid callee");
-  }
-  if (ctx->call_patch_len + 1 > ctx->call_patch_cap) {
-    ctx->call_patch_cap = ctx->call_patch_cap == 0 ? 8 : ctx->call_patch_cap * 2;
-    ElfCallPatch *items = realloc(ctx->call_patches, ctx->call_patch_cap * sizeof(ElfCallPatch));
-    if (!items) return elf_diag(diag, "direct ELF64 call patch allocation failed", value ? value->line : 1, value ? value->column : 1, "allocation failed");
-    ctx->call_patches = items;
-  }
-  ctx->call_patches[ctx->call_patch_len++] = (ElfCallPatch){.patch_offset = patch_offset, .callee_index = callee_index};
-  return true;
+static bool elf_function_seeds_process_args(const IrFunction *fun, const ElfEmitContext *ctx) {
+  return ctx && ctx->seed_main_process_args &&
+         fun && fun->is_exported && fun->name && strcmp(fun->name, "main") == 0;
 }
 
-static bool elf_record_rodata_patch(ElfEmitContext *ctx, size_t patch_offset, unsigned data_offset, ZDiag *diag, const IrValue *value) {
-  if (!ctx) return elf_diag(diag, "direct ELF64 readonly data patch requires an emit context", value ? value->line : 1, value ? value->column : 1, "missing context");
-  if (ctx->rodata_patch_len + 1 > ctx->rodata_patch_cap) {
-    ctx->rodata_patch_cap = ctx->rodata_patch_cap == 0 ? 8 : ctx->rodata_patch_cap * 2;
-    ElfRodataPatch *items = realloc(ctx->rodata_patches, ctx->rodata_patch_cap * sizeof(ElfRodataPatch));
-    if (!items) return elf_diag(diag, "direct ELF64 readonly data patch allocation failed", value ? value->line : 1, value ? value->column : 1, "allocation failed");
-    ctx->rodata_patches = items;
+static unsigned elf_base_stack_size(const IrFunction *fun) {
+  return (unsigned)z_elf_align(fun ? fun->frame_bytes : 0, 16);
+}
+
+static unsigned elf_total_stack_size(const IrFunction *fun, const ElfEmitContext *ctx) {
+  unsigned base = elf_base_stack_size(fun);
+  return base + (elf_function_seeds_process_args(fun, ctx) ? 32u : 0u);
+}
+
+static void elf_emit_epilogue(ZBuf *code, const IrFunction *fun, const ElfEmitContext *ctx) {
+  if (elf_function_seeds_process_args(fun, ctx)) {
+    unsigned base = elf_base_stack_size(fun);
+    z_x64_emit_rbp_disp_reg(code, 0x8b, 13, base + 8, true);
+    z_x64_emit_rbp_disp_reg(code, 0x8b, 14, base + 16, true);
+    z_x64_emit_rbp_disp_reg(code, 0x8b, 15, base + 24, true);
   }
-  ctx->rodata_patches[ctx->rodata_patch_len++] = (ElfRodataPatch){.patch_offset = patch_offset, .data_offset = data_offset};
-  return true;
+  z_x64_emit_epilogue(code);
 }
 
-static void elf_patch_call_patches(ZBuf *code, const ElfEmitContext *ctx) {
-  for (size_t i = 0; i < ctx->call_patch_len; i++) {
-    const ElfCallPatch *patch = &ctx->call_patches[i];
-    elf_patch_rel32(code, patch->patch_offset, ctx->function_offsets[patch->callee_index]);
-  }
-}
-
-static void elf_patch_rodata_patches(ZBuf *code, const ElfEmitContext *ctx) {
-  for (size_t i = 0; ctx && i < ctx->rodata_patch_len; i++) {
-    const ElfRodataPatch *patch = &ctx->rodata_patches[i];
-    uint64_t addr = ctx->rodata_addr + (patch->data_offset - ctx->rodata_base_offset);
-    for (unsigned b = 0; b < 8; b++) {
-      code->data[patch->patch_offset + b] = (char)((addr >> (8 * b)) & 0xff);
-    }
-  }
-}
-
-static void elf_emit_epilogue(ZBuf *code) {
-  elf_append_u8(code, 0xc9);
-  elf_append_u8(code, 0xc3);
-}
-
-static void elf_emit_pop_reg64(ZBuf *code, unsigned reg) {
-  if (reg >= 8) elf_append_u8(code, 0x41);
-  elf_append_u8(code, 0x58 + (reg & 7));
+static void elf_emit_push_rax(ZBuf *code) {
+  z_x64_emit_push_rax(code);
 }
 
 static void elf_emit_store_local_slot_reg(ZBuf *code, const IrLocal *local, unsigned slot_offset, unsigned reg, bool wide);
@@ -335,109 +195,72 @@ static void elf_emit_store_local_slot_rax(ZBuf *code, const IrLocal *local, unsi
 static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrValue *view, ElfEmitContext *ctx, ZDiag *diag);
 
 static void elf_emit_strlen_rax_to_ecx(ZBuf *code) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x89);
-  elf_append_u8(code, 0xc2);
-  elf_append_u8(code, 0x31);
-  elf_append_u8(code, 0xc9);
+  z_x64_emit_mov_rdx_from_rax(code);
+  z_x64_emit_xor_ecx_ecx(code);
   size_t loop = code->len;
-  elf_append_u8(code, 0x80);
-  elf_append_u8(code, 0x3c);
-  elf_append_u8(code, 0x0a);
-  elf_append_u8(code, 0x00);
-  size_t done = elf_emit_jcc32_placeholder(code, 0x84);
-  elf_append_u8(code, 0xff);
-  elf_append_u8(code, 0xc1);
-  size_t back = elf_emit_jmp32_placeholder(code, 0xe9);
-  elf_patch_rel32(code, back, loop);
-  elf_patch_rel32(code, done, code->len);
+  z_x64_emit_cmp_base_index_u8(code, 2, 1, 0);
+  size_t done = z_x64_emit_jcc32_placeholder(code, 0x84);
+  z_x64_emit_inc_ecx(code);
+  size_t back = z_x64_emit_jmp32_placeholder(code, 0xe9);
+  z_x64_patch_rel32(code, back, loop);
+  z_x64_patch_rel32(code, done, code->len);
 }
 
 static void elf_emit_maybe_clear(ZBuf *code, const IrLocal *local) {
-  elf_append_u8(code, 0x31);
-  elf_append_u8(code, 0xc0);
+  z_x64_emit_xor_eax_eax(code);
   elf_emit_store_local_slot_reg(code, local, 0, 0, false);
   elf_emit_store_local_slot_reg(code, local, 8, 0, true);
   elf_emit_store_local_slot_reg(code, local, 16, 0, false);
 }
 
 static void elf_emit_maybe_scalar_clear(ZBuf *code, const IrLocal *local) {
-  elf_append_u8(code, 0x31);
-  elf_append_u8(code, 0xc0);
+  z_x64_emit_xor_eax_eax(code);
   elf_emit_store_local_slot_reg(code, local, 0, 0, false);
   elf_emit_store_local_slot_reg(code, local, 8, 0, true);
 }
 
 static void elf_emit_maybe_scalar_store_rax(ZBuf *code, const IrLocal *local) {
-  elf_append_u8(code, 0x50);
-  elf_append_u8(code, 0xb8);
-  elf_append_u32(code, 1);
+  z_x64_emit_push_rax(code);
+  z_x64_emit_mov_eax_u32(code, 1);
   elf_emit_store_local_slot_reg(code, local, 0, 0, false);
-  elf_append_u8(code, 0x58);
+  z_x64_emit_pop_rax(code);
   elf_emit_store_local_slot_rax(code, local, 8);
 }
 
 static size_t elf_emit_js_placeholder(ZBuf *code) {
-  elf_append_u8(code, 0x0f);
-  elf_append_u8(code, 0x88);
+  z_x64_append_u8(code, 0x0f);
+  z_x64_append_u8(code, 0x88);
   size_t patch = code->len;
-  elf_append_u32(code, 0);
+  z_x64_append_u32(code, 0);
   return patch;
-}
-
-static void elf_emit_bool_from_nonnegative_rax(ZBuf *code) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x85);
-  elf_append_u8(code, 0xc0);
-  elf_append_u8(code, 0x0f);
-  elf_append_u8(code, 0x99);
-  elf_append_u8(code, 0xc0);
-  elf_append_u8(code, 0x0f);
-  elf_append_u8(code, 0xb6);
-  elf_append_u8(code, 0xc0);
 }
 
 static bool elf_emit_openat_path(ZBuf *code, const IrFunction *fun, const IrValue *path, unsigned flags, unsigned mode, ElfEmitContext *ctx, ZDiag *diag) {
   if (!elf_emit_byte_view_ptr(code, fun, path, ctx, diag)) return false;
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x89);
-  elf_append_u8(code, 0xc6);
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0xbf);
-  elf_append_u64(code, 0xffffffffffffff9cULL);
-  elf_append_u8(code, 0xba);
-  elf_append_u32(code, flags);
-  elf_append_u8(code, 0x41);
-  elf_append_u8(code, 0xba);
-  elf_append_u32(code, mode);
-  elf_append_u8(code, 0xb8);
-  elf_append_u32(code, 257);
-  elf_append_u8(code, 0x0f);
-  elf_append_u8(code, 0x05);
+  z_x64_emit_mov_rsi_from_rax(code);
+  z_x64_emit_mov_reg_u64(code, 7, 0xffffffffffffff9cULL);
+  z_x64_emit_mov_reg_u32(code, 2, flags);
+  z_x64_emit_mov_reg_u32(code, 10, mode);
+  z_x64_emit_mov_eax_u32(code, 257);
+  z_x64_emit_syscall(code);
   return true;
 }
 
 static void elf_emit_close_rax_fd(ZBuf *code) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x89);
-  elf_append_u8(code, 0xc7);
-  elf_append_u8(code, 0xb8);
-  elf_append_u32(code, 3);
-  elf_append_u8(code, 0x0f);
-  elf_append_u8(code, 0x05);
+  z_x64_emit_mov_rdi_from_rax(code);
+  z_x64_emit_mov_eax_u32(code, 3);
+  z_x64_emit_syscall(code);
 }
 
 static bool elf_emit_bounds_checked_address(ZBuf *code, const IrFunction *fun, const IrLocal *local, const IrValue *index, ElfEmitContext *ctx, ZDiag *diag) {
   if (!local || !local->is_array) return elf_diag(diag, "direct ELF64 indexed access requires fixed array local", index ? index->line : 1, index ? index->column : 1, "non-array local");
   if (!elf_emit_value(code, fun, index, ctx, diag)) return false;
-  elf_append_u8(code, 0x3d);
-  elf_append_u32(code, local->array_len);
-  size_t ok_patch = elf_emit_jcc32_placeholder(code, 0x82);
-  elf_append_u8(code, 0x0f);
-  elf_append_u8(code, 0x0b);
-  elf_patch_rel32(code, ok_patch, code->len);
-  elf_append_u8(code, 0x89);
-  elf_append_u8(code, 0xc1);
+  z_x64_append_u8(code, 0x3d);
+  z_x64_append_u32(code, local->array_len);
+  size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x82);
+  z_x64_emit_ud2(code);
+  z_x64_patch_rel32(code, ok_patch, code->len);
+  z_x64_emit_mov_rcx_from_rax(code, false);
   elf_emit_lea_array_base_rax(code, local);
   elf_emit_scale_index_into_rax(code, local->element_type);
   return true;
@@ -502,70 +325,87 @@ static bool elf_byte_view_const_byte(const IrProgram *ir, const IrFunction *fun,
 }
 
 static void elf_emit_error_condition_from_rax(ZBuf *code) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0x89);
-  elf_append_u8(code, 0xc1);
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0xc1);
-  elf_append_u8(code, 0xe9);
-  elf_append_u8(code, 32);
-  elf_append_u8(code, 0x85);
-  elf_append_u8(code, 0xc9);
+  z_x64_emit_mov_rcx_from_rax(code, true);
+  z_x64_emit_shr_rcx_imm8(code, 32);
+  z_x64_emit_test_ecx_ecx(code);
 }
 
 static void elf_emit_packed_error_rax(ZBuf *code, unsigned code_value) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0xb8);
-  elf_append_u64(code, ((uint64_t)code_value) << 32);
+  z_x64_emit_mov_rax_u64(code, ((uint64_t)code_value) << 32);
 }
 
 static bool elf_emit_rodata_ptr_rax(ZBuf *code, unsigned data_offset, ElfEmitContext *ctx, ZDiag *diag, const IrValue *value) {
-  elf_append_u8(code, 0x48);
-  elf_append_u8(code, 0xb8);
-  size_t imm_offset = code->len;
   unsigned compact_offset = ctx ? data_offset - ctx->rodata_base_offset : data_offset;
-  elf_append_u64(code, ctx && ctx->emit_rodata_relocations ? 0 : (ctx ? ctx->rodata_addr : 0) + compact_offset);
-  return elf_record_rodata_patch(ctx, imm_offset, data_offset, diag, value);
+  size_t imm_offset = z_x64_emit_mov_rax_u64_patchable(code, ctx && ctx->emit_rodata_relocations ? 0 : (ctx ? ctx->rodata_addr : 0) + compact_offset);
+  return z_elf_record_rodata_patch(ctx, imm_offset, data_offset, diag, value);
 }
 
 static void elf_emit_store_local_slot_rax(ZBuf *code, const IrLocal *local, unsigned slot_offset) {
   unsigned disp = local && local->frame_offset >= slot_offset ? local->frame_offset - slot_offset : 0;
-  elf_emit_rbp_disp_reg(code, 0x89, 0, disp, true);
+  z_x64_emit_rbp_disp_reg(code, 0x89, 0, disp, true);
 }
 
 static void elf_emit_store_local_slot_reg(ZBuf *code, const IrLocal *local, unsigned slot_offset, unsigned reg, bool wide) {
   unsigned disp = local && local->frame_offset >= slot_offset ? local->frame_offset - slot_offset : 0;
-  elf_emit_rbp_disp_reg(code, 0x89, reg, disp, wide);
+  z_x64_emit_rbp_disp_reg(code, 0x89, reg, disp, wide);
 }
 
 static void elf_emit_load_local_slot_rax(ZBuf *code, const IrLocal *local, unsigned slot_offset) {
   unsigned disp = local && local->frame_offset >= slot_offset ? local->frame_offset - slot_offset : 0;
-  elf_emit_rbp_disp_reg(code, 0x8b, 0, disp, true);
+  z_x64_emit_rbp_disp_reg(code, 0x8b, 0, disp, true);
 }
 
 static void elf_emit_load_local_slot_reg(ZBuf *code, const IrLocal *local, unsigned slot_offset, unsigned reg, bool wide) {
   unsigned disp = local && local->frame_offset >= slot_offset ? local->frame_offset - slot_offset : 0;
-  elf_emit_rbp_disp_reg(code, 0x8b, reg, disp, wide);
+  z_x64_emit_rbp_disp_reg(code, 0x8b, reg, disp, wide);
 }
 
 static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrValue *view, ElfEmitContext *ctx, ZDiag *diag);
 static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrValue *view, ElfEmitContext *ctx, ZDiag *diag);
 
+static bool elf_emit_json_parse_bytes_call(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
+  elf_emit_push_rax(code);
+  if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
+  elf_emit_push_rax(code);
+  z_x64_emit_pop_reg64(code, 6);
+  z_x64_emit_pop_reg64(code, 7);
+  size_t patch = z_x64_emit_call32_placeholder(code);
+  return z_elf_record_value_runtime_patch(ctx, ELF_RUNTIME_JSON_PARSE_BYTES, patch, diag, value);
+}
+
 static bool elf_emit_byte_view_len(ZBuf *code, const IrFunction *fun, const IrValue *view, ElfEmitContext *ctx, ZDiag *diag) {
   unsigned len = 0;
   if (elf_byte_view_const_len(fun, view, &len)) {
-    elf_append_u8(code, 0xb8);
-    elf_append_u32(code, len);
+    z_x64_emit_mov_eax_u32(code, len);
     return true;
   }
   if (view && view->kind == IR_VALUE_BYTE_SLICE && view->index && view->right) {
     unsigned start = 0;
     unsigned end = 0;
     if (elf_const_u32_value(view->index, &start) && elf_const_u32_value(view->right, &end) && start <= end) {
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, end - start);
+      z_x64_emit_mov_eax_u32(code, end - start);
       return true;
     }
+  }
+  if (view && view->kind == IR_VALUE_BYTE_SLICE && view->right) {
+    unsigned start = 0;
+    if ((!view->index || elf_const_u32_value(view->index, &start)) &&
+        !elf_const_u32_value(view->right, NULL)) {
+      if (!elf_emit_value(code, fun, view->right, ctx, diag)) return false;
+      if (start > 0) {
+        z_x64_emit_sub_rax_u32(code, start, true);
+      }
+      return true;
+    }
+  }
+  if (view && view->kind == IR_VALUE_BYTE_SLICE && view->index && view->right) {
+    if (!elf_emit_value(code, fun, view->index, ctx, diag)) return false;
+    elf_emit_push_rax(code);
+    if (!elf_emit_value(code, fun, view->right, ctx, diag)) return false;
+    z_x64_emit_pop_reg64(code, 1);
+    z_x64_emit_sub_reg_reg(code, 0, 1, true);
+    return true;
   }
   if (view && view->kind == IR_VALUE_LOCAL && view->local_index < fun->local_len && fun->locals[view->local_index].type == IR_TYPE_BYTE_VIEW) {
     elf_emit_load_local_slot_rax(code, &fun->locals[view->local_index], 8);
@@ -600,273 +440,35 @@ static bool elf_emit_byte_view_ptr(ZBuf *code, const IrFunction *fun, const IrVa
   }
   if (view->kind == IR_VALUE_BYTE_SLICE) {
     if (!elf_emit_byte_view_ptr(code, fun, view->left, ctx, diag)) return false;
-    elf_append_u8(code, 0x50);
+    z_x64_emit_push_rax(code);
     if (view->index) {
       if (!elf_emit_value(code, fun, view->index, ctx, diag)) return false;
     } else {
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 0);
+      z_x64_emit_mov_eax_u32(code, 0);
     }
-    elf_append_u8(code, 0x59);
-    elf_append_u8(code, 0x48);
-    elf_append_u8(code, 0x01);
-    elf_append_u8(code, 0xc8);
+    z_x64_emit_pop_reg64(code, 1);
+    z_x64_emit_add_rax_rcx(code, true);
     return true;
   }
   return elf_diag(diag, "direct ELF64 value is not a supported byte view", view->line, view->column, "unsupported byte view");
 }
 
-static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
-  if (!value) return elf_diag(diag, "direct ELF64 expression is missing", 1, 1, "missing expression");
-  if (!elf_type_is_supported_scalar(value->type) && !((value->kind == IR_VALUE_CALL || value->kind == IR_VALUE_CHECK) && value->type == IR_TYPE_VOID) &&
-      value->kind != IR_VALUE_MAYBE_HAS && value->kind != IR_VALUE_VEC_LEN && value->kind != IR_VALUE_VEC_CAPACITY &&
-      value->kind != IR_VALUE_VEC_PUSH && value->kind != IR_VALUE_ARGS_LEN &&
-      value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE) {
-    return elf_diag(diag, "direct ELF64 object backend currently supports only primitive integer values", value->line, value->column, elf_type_name(value->type));
-  }
+static bool elf_emit_fs_basic_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
   switch (value->kind) {
-    case IR_VALUE_BOOL:
-    case IR_VALUE_INT:
-      if (elf_type_is_i64(value->type)) {
-        elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0xb8);
-        elf_append_u64(code, (uint64_t)value->int_value);
-      } else {
-        elf_append_u8(code, 0xb8);
-        elf_append_u32(code, (uint32_t)value->int_value);
-      }
-      return true;
-    case IR_VALUE_LOCAL:
-      if (value->local_index >= fun->local_len) {
-        return elf_diag(diag, "direct ELF64 local index is out of range", value->line, value->column, "invalid local");
-      }
-      if (fun->locals[value->local_index].is_array) {
-        return elf_diag(diag, "direct ELF64 cannot use fixed array locals as scalar values", value->line, value->column, "array local");
-      }
-      elf_emit_load_local_rax(code, fun, value->local_index);
-      return true;
-    case IR_VALUE_BINARY: {
-      bool wide = elf_type_is_i64(value->type);
-      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
-      if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
-      if (wide) elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc1);
-      elf_append_u8(code, 0x58);
-      if (value->binary_op == IR_BIN_ADD) {
-        if (wide) elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x01);
-        elf_append_u8(code, 0xc8);
-      } else if (value->binary_op == IR_BIN_SUB) {
-        if (wide) elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x29);
-        elf_append_u8(code, 0xc8);
-      } else if (value->binary_op == IR_BIN_MUL) {
-        if (wide) elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x0f);
-        elf_append_u8(code, 0xaf);
-        elf_append_u8(code, 0xc1);
-      } else if (value->binary_op == IR_BIN_AND || value->binary_op == IR_BIN_OR) {
-        if (wide) elf_append_u8(code, 0x48);
-        elf_append_u8(code, value->binary_op == IR_BIN_AND ? 0x21 : 0x09);
-        elf_append_u8(code, 0xc8);
-      } else if (value->binary_op == IR_BIN_DIV) {
-        if (elf_type_is_unsigned(value->type)) {
-          if (wide) elf_append_u8(code, 0x48);
-          elf_append_u8(code, 0x31);
-          elf_append_u8(code, 0xd2);
-          if (wide) elf_append_u8(code, 0x48);
-          elf_append_u8(code, 0xf7);
-          elf_append_u8(code, 0xf1);
-        } else {
-          if (wide) {
-            elf_append_u8(code, 0x48);
-            elf_append_u8(code, 0x99);
-          } else {
-            elf_append_u8(code, 0x99);
-          }
-          if (wide) elf_append_u8(code, 0x48);
-          elf_append_u8(code, 0xf7);
-          elf_append_u8(code, 0xf9);
-        }
-      } else if (value->binary_op == IR_BIN_MOD) {
-        if (elf_type_is_unsigned(value->type)) {
-          if (wide) elf_append_u8(code, 0x48);
-          elf_append_u8(code, 0x31);
-          elf_append_u8(code, 0xd2);
-          if (wide) elf_append_u8(code, 0x48);
-          elf_append_u8(code, 0xf7);
-          elf_append_u8(code, 0xf1);
-        } else {
-          if (wide) {
-            elf_append_u8(code, 0x48);
-            elf_append_u8(code, 0x99);
-          } else {
-            elf_append_u8(code, 0x99);
-          }
-          if (wide) elf_append_u8(code, 0x48);
-          elf_append_u8(code, 0xf7);
-          elf_append_u8(code, 0xf9);
-        }
-        if (wide) elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xd0);
-      } else {
-        return elf_diag(diag, "direct ELF64 binary operator is unsupported", value->line, value->column, "unsupported operator");
-      }
-      return true;
-    }
-    case IR_VALUE_COMPARE: {
-      if (!value->left || !value->right || !elf_type_is_supported_scalar(value->left->type) || value->left->type != value->right->type) {
-        return elf_diag(diag, "direct ELF64 comparison operands must have the same supported integer type", value->line, value->column, "unsupported comparison");
-      }
-      bool wide = elf_type_is_i64(value->left->type);
-      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
-      if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
-      if (wide) elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc1);
-      elf_append_u8(code, 0x58);
-      if (wide) elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc8);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, elf_setcc_opcode(value->compare_op, elf_type_is_unsigned(value->left->type)));
-      elf_append_u8(code, 0xc0);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0xb6);
-      elf_append_u8(code, 0xc0);
-      return true;
-    }
-    case IR_VALUE_CALL: {
-      static const unsigned param_regs[] = {7, 6, 2, 1, 8, 9};
-      if (value->arg_len > 6) return elf_diag(diag, "direct ELF64 call supports at most six arguments", value->line, value->column, "too many arguments");
-      for (size_t i = 0; i < value->arg_len; i++) {
-        if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
-        elf_append_u8(code, 0x50);
-      }
-      for (size_t i = value->arg_len; i > 0; i--) {
-        elf_emit_pop_reg64(code, param_regs[i - 1]);
-      }
-      size_t patch = elf_emit_jmp32_placeholder(code, 0xe8);
-      return elf_record_call_patch(ctx, patch, value->callee_index, diag, value);
-    }
-    case IR_VALUE_MEMORY_PEEK_U8:
-      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0xb6);
-      elf_append_u8(code, 0x00);
-      return true;
-    case IR_VALUE_MEMORY_POKE_U8:
-      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
-      if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x59);
-      elf_append_u8(code, 0x88);
-      elf_append_u8(code, 0x01);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 1);
-      return true;
-    case IR_VALUE_ARGS_LEN:
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x07);
-      return true;
-    case IR_VALUE_TIME_WALL_SECONDS:
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xff);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 201);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      return true;
-    case IR_VALUE_TIME_MONOTONIC:
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x83);
-      elf_append_u8(code, 0xec);
-      elf_append_u8(code, 0x10);
-      elf_append_u8(code, 0xbf);
-      elf_append_u32(code, 1);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xe6);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 228);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x04);
-      elf_append_u8(code, 0x24);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x69);
-      elf_append_u8(code, 0xc0);
-      elf_append_u32(code, 1000000000u);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x03);
-      elf_append_u8(code, 0x44);
-      elf_append_u8(code, 0x24);
-      elf_append_u8(code, 0x08);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x83);
-      elf_append_u8(code, 0xc4);
-      elf_append_u8(code, 0x10);
-      return true;
-    case IR_VALUE_TIME_AS_MS:
-      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0xc1);
-      elf_append_u32(code, 1000000u);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x99);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xf7);
-      elf_append_u8(code, 0xf9);
-      return true;
-    case IR_VALUE_RAND_NEXT_U32:
-      if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 std.rand.nextU32 local is out of range", value->line, value->column, "invalid RandSource");
-      elf_emit_load_local_rax(code, fun, value->local_index);
-      elf_append_u8(code, 0x69);
-      elf_append_u8(code, 0xc0);
-      elf_append_u32(code, 1664525u);
-      elf_append_u8(code, 0x05);
-      elf_append_u32(code, 1013904223u);
-      elf_emit_store_local_from_reg(code, fun, value->local_index, 0);
-      return true;
-    case IR_VALUE_RAND_ENTROPY_U32:
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xff);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 201);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x35);
-      elf_append_u32(code, 0x9e3779b9u);
-      return true;
     case IR_VALUE_FS_HOST:
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_xor_eax_eax(code);
       return true;
-    case IR_VALUE_FS_OPEN:
-    case IR_VALUE_FS_CREATE: {
+    case IR_VALUE_FS_OPEN: case IR_VALUE_FS_CREATE: {
       bool create = value->kind == IR_VALUE_FS_CREATE;
       if (!elf_emit_openat_path(code, fun, value->left, create ? 577 : 0, create ? 0644 : 0, ctx, diag)) return false;
       if (value->type == IR_TYPE_I64) {
-        elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x85);
-        elf_append_u8(code, 0xc0);
+        z_x64_emit_test_rax_rax(code, true);
         size_t fail = elf_emit_js_placeholder(code);
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
-        size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-        elf_patch_rel32(code, fail, code->len);
+        z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
+        size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+        z_x64_patch_rel32(code, fail, code->len);
         elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
-        elf_patch_rel32(code, end, code->len);
+        z_x64_patch_rel32(code, end, code->len);
       }
       return true;
     }
@@ -875,437 +477,476 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       elf_emit_load_local_rax(code, fun, value->local_index);
       elf_emit_close_rax_fd(code);
       return true;
-    case IR_VALUE_FS_EXISTS:
-    case IR_VALUE_FS_IS_DIR: {
+    case IR_VALUE_FS_EXISTS: case IR_VALUE_FS_IS_DIR: {
       unsigned flags = value->kind == IR_VALUE_FS_IS_DIR ? 65536u : 0u;
       if (!elf_emit_openat_path(code, fun, value->left, flags, 0, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_test_rax_rax(code, true);
       size_t fail = elf_emit_js_placeholder(code);
       elf_emit_close_rax_fd(code);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 1);
-      size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, fail, code->len);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 0);
-      elf_patch_rel32(code, end, code->len);
+      z_x64_emit_mov_eax_u32(code, 1);
+      size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, fail, code->len);
+      z_x64_emit_mov_eax_u32(code, 0);
+      z_x64_patch_rel32(code, end, code->len);
       return true;
     }
     case IR_VALUE_FS_REMOVE:
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 87);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_emit_bool_from_nonnegative_rax(code);
+      z_x64_emit_mov_rdi_from_rax(code);
+      z_x64_emit_mov_eax_u32(code, 87);
+      z_x64_emit_syscall(code);
+      z_x64_emit_bool_from_nonnegative_rax(code);
       return true;
     case IR_VALUE_FS_REMOVE_DIR:
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 84);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_emit_bool_from_nonnegative_rax(code);
+      z_x64_emit_mov_rdi_from_rax(code);
+      z_x64_emit_mov_eax_u32(code, 84);
+      z_x64_emit_syscall(code);
+      z_x64_emit_bool_from_nonnegative_rax(code);
       return true;
     case IR_VALUE_FS_MAKE_DIR:
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0xbe);
-      elf_append_u32(code, 0755);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 83);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_emit_bool_from_nonnegative_rax(code);
+      z_x64_emit_mov_rdi_from_rax(code);
+      z_x64_emit_mov_reg_u32(code, 6, 0755);
+      z_x64_emit_mov_eax_u32(code, 83);
+      z_x64_emit_syscall(code);
+      z_x64_emit_bool_from_nonnegative_rax(code);
       return true;
     case IR_VALUE_FS_RENAME:
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc6);
-      elf_append_u8(code, 0x5f);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 82);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_emit_bool_from_nonnegative_rax(code);
+      z_x64_emit_mov_rsi_from_rax(code);
+      z_x64_emit_pop_reg64(code, 7);
+      z_x64_emit_mov_eax_u32(code, 82);
+      z_x64_emit_syscall(code);
+      z_x64_emit_bool_from_nonnegative_rax(code);
       return true;
+    default: return elf_diag(diag, "direct ELF64 filesystem value kind is invalid for this helper", value->line, value->column, "invalid filesystem value");
+  }
+}
+
+static bool elf_emit_fs_dir_entry_count_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
     case IR_VALUE_FS_DIR_ENTRY_COUNT: {
       if (!elf_emit_openat_path(code, fun, value->left, 65536, 0, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_test_rax_rax(code, true);
       size_t open_fail = elf_emit_js_placeholder(code);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x81);
-      elf_append_u8(code, 0xec);
-      elf_append_u32(code, 1040);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0x84);
-      elf_append_u8(code, 0x24);
-      elf_append_u32(code, 1024);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0x84);
-      elf_append_u8(code, 0x24);
-      elf_append_u32(code, 1032);
-      elf_append_u32(code, 0);
+      z_x64_emit_sub_rsp(code, 1040);
+      z_x64_emit_store_rsp_offset_reg(code, 0, 1024, true);
+      z_x64_emit_mov_rsp_offset_u32(code, 1032, 0, true);
       size_t read_loop = code->len;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0xbc);
-      elf_append_u8(code, 0x24);
-      elf_append_u32(code, 1024);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8d);
-      elf_append_u8(code, 0x34);
-      elf_append_u8(code, 0x24);
-      elf_append_u8(code, 0xba);
-      elf_append_u32(code, 1024);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 217);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_load_rsp_offset_reg(code, 7, 1024, true);
+      z_x64_emit_lea_rsp_offset_reg(code, 6, 0);
+      z_x64_emit_mov_reg_u32(code, 2, 1024);
+      z_x64_emit_mov_eax_u32(code, 217);
+      z_x64_emit_syscall(code);
+      z_x64_emit_test_rax_rax(code, true);
       size_t read_fail = elf_emit_js_placeholder(code);
-      size_t done = elf_emit_jcc32_placeholder(code, 0x84);
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xe1);
-      elf_append_u8(code, 0x4c);
-      elf_append_u8(code, 0x8d);
-      elf_append_u8(code, 0x04);
-      elf_append_u8(code, 0x04);
+      size_t done = z_x64_emit_jcc32_placeholder(code, 0x84);
+      z_x64_emit_mov_reg_from_reg(code, 9, 4, true);
+      z_x64_emit_lea_base_index_scale_disp_reg(code, 8, 4, 0, 1, 0);
       size_t scan_loop = code->len;
-      elf_append_u8(code, 0x4d);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc1);
-      size_t scan_done = elf_emit_jcc32_placeholder(code, 0x83);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xff);
-      elf_append_u8(code, 0x84);
-      elf_append_u8(code, 0x24);
-      elf_append_u32(code, 1032);
-      elf_append_u8(code, 0x41);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0xb7);
-      elf_append_u8(code, 0x41);
-      elf_append_u8(code, 0x10);
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0x01);
-      elf_append_u8(code, 0xc1);
-      size_t scan_back = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, scan_back, scan_loop);
-      elf_patch_rel32(code, scan_done, code->len);
-      size_t loop_back = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, loop_back, read_loop);
-      elf_patch_rel32(code, done, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x84);
-      elf_append_u8(code, 0x24);
-      elf_append_u32(code, 1024);
+      z_x64_emit_cmp_reg_reg(code, 9, 8, true);
+      size_t scan_done = z_x64_emit_jcc32_placeholder(code, 0x83);
+      z_x64_emit_inc_rsp_offset64(code, 1032);
+      z_x64_emit_movzx_reg32_ptr_reg_disp_u16(code, 0, 9, 16);
+      z_x64_emit_add_reg_reg(code, 9, 0, true);
+      size_t scan_back = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, scan_back, scan_loop);
+      z_x64_patch_rel32(code, scan_done, code->len);
+      size_t loop_back = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, loop_back, read_loop);
+      z_x64_patch_rel32(code, done, code->len);
+      z_x64_emit_load_rsp_offset_reg(code, 0, 1024, true);
       elf_emit_close_rax_fd(code);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x84);
-      elf_append_u8(code, 0x24);
-      elf_append_u32(code, 1032);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x81);
-      elf_append_u8(code, 0xc4);
-      elf_append_u32(code, 1040);
-      size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, read_fail, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x84);
-      elf_append_u8(code, 0x24);
-      elf_append_u32(code, 1024);
+      z_x64_emit_load_rsp_offset_reg(code, 0, 1032, true);
+      z_x64_emit_add_rsp(code, 1040);
+      size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, read_fail, code->len);
+      z_x64_emit_load_rsp_offset_reg(code, 0, 1024, true);
       elf_emit_close_rax_fd(code);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x81);
-      elf_append_u8(code, 0xc4);
-      elf_append_u32(code, 1040);
-      elf_patch_rel32(code, open_fail, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0xc0);
-      elf_append_u32(code, 0xffffffffu);
-      elf_patch_rel32(code, end, code->len);
+      z_x64_emit_add_rsp(code, 1040);
+      z_x64_patch_rel32(code, open_fail, code->len);
+      z_x64_emit_mov_reg_i32(code, 0, -1);
+      z_x64_patch_rel32(code, end, code->len);
       return true;
     }
+    default: return elf_diag(diag, "direct ELF64 filesystem value kind is invalid for this helper", value->line, value->column, "invalid filesystem value");
+  }
+}
+
+static bool elf_emit_fs_atomic_write_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
     case IR_VALUE_FS_ATOMIC_WRITE: {
       if (!value->left || !value->right || !value->index) return elf_diag(diag, "direct ELF64 std.fs.atomicWrite requires path, temp path, and bytes", value->line, value->column, "missing argument");
       if (!elf_emit_openat_path(code, fun, value->right, 577, 0644, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_test_rax_rax(code, true);
       size_t open_fail = elf_emit_js_placeholder(code);
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->index, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->index, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x74);
-      elf_append_u8(code, 0x24);
-      elf_append_u8(code, 0x08);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x7c);
-      elf_append_u8(code, 0x24);
-      elf_append_u8(code, 0x10);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 1);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_push_rax(code);
+      z_x64_emit_mov_rdx_from_rax(code);
+      z_x64_emit_load_rsp_offset_reg(code, 6, 8, true);
+      z_x64_emit_load_rsp_offset_reg(code, 7, 16, true);
+      z_x64_emit_mov_eax_u32(code, 1);
+      z_x64_emit_syscall(code);
+      z_x64_emit_test_rax_rax(code, true);
       size_t write_fail = elf_emit_js_placeholder(code);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x3b);
-      elf_append_u8(code, 0x04);
-      elf_append_u8(code, 0x24);
-      size_t short_write = elf_emit_jcc32_placeholder(code, 0x85);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x7c);
-      elf_append_u8(code, 0x24);
-      elf_append_u8(code, 0x10);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 3);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x83);
-      elf_append_u8(code, 0xc4);
-      elf_append_u8(code, 0x18);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_cmp_rax_rsp_offset(code, 0);
+      size_t short_write = z_x64_emit_jcc32_placeholder(code, 0x85);
+      z_x64_emit_load_rsp_offset_reg(code, 7, 16, true);
+      z_x64_emit_mov_eax_u32(code, 3);
+      z_x64_emit_syscall(code);
+      z_x64_emit_add_rsp(code, 24);
+      z_x64_emit_test_rax_rax(code, true);
       size_t close_fail = elf_emit_js_placeholder(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc6);
-      elf_append_u8(code, 0x5f);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 82);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_emit_bool_from_nonnegative_rax(code);
-      size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, write_fail, code->len);
-      elf_patch_rel32(code, short_write, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x8b);
-      elf_append_u8(code, 0x7c);
-      elf_append_u8(code, 0x24);
-      elf_append_u8(code, 0x10);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 3);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x83);
-      elf_append_u8(code, 0xc4);
-      elf_append_u8(code, 0x18);
-      elf_patch_rel32(code, open_fail, code->len);
-      elf_patch_rel32(code, close_fail, code->len);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 0);
-      elf_patch_rel32(code, end, code->len);
+      z_x64_emit_mov_rsi_from_rax(code);
+      z_x64_emit_pop_reg64(code, 7);
+      z_x64_emit_mov_eax_u32(code, 82);
+      z_x64_emit_syscall(code);
+      z_x64_emit_bool_from_nonnegative_rax(code);
+      size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, write_fail, code->len);
+      z_x64_patch_rel32(code, short_write, code->len);
+      z_x64_emit_load_rsp_offset_reg(code, 7, 16, true);
+      z_x64_emit_mov_eax_u32(code, 3);
+      z_x64_emit_syscall(code);
+      z_x64_emit_add_rsp(code, 24);
+      z_x64_patch_rel32(code, open_fail, code->len);
+      z_x64_patch_rel32(code, close_fail, code->len);
+      z_x64_emit_mov_eax_u32(code, 0);
+      z_x64_patch_rel32(code, end, code->len);
       return true;
     }
+    default: return elf_diag(diag, "direct ELF64 filesystem value kind is invalid for this helper", value->line, value->column, "invalid filesystem value");
+  }
+}
+
+static bool elf_emit_fs_file_handle_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
     case IR_VALUE_FS_FILE_LEN:
       if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 std.fs.fileLen local is out of range", value->line, value->column, "invalid File");
       elf_emit_load_local_rax(code, fun, value->local_index);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xf6);
-      elf_append_u8(code, 0xba);
-      elf_append_u32(code, 2);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 8);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
+      z_x64_emit_mov_rdi_from_rax(code);
+      z_x64_emit_xor_reg_reg(code, 6, true);
+      z_x64_emit_mov_reg_u32(code, 2, 2);
+      z_x64_emit_mov_eax_u32(code, 8);
+      z_x64_emit_syscall(code);
       if (value->type == IR_TYPE_I64) {
-        elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x85);
-        elf_append_u8(code, 0xc0);
+        z_x64_emit_test_rax_rax(code, true);
         size_t fail = elf_emit_js_placeholder(code);
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
-        size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-        elf_patch_rel32(code, fail, code->len);
+        z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
+        size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+        z_x64_patch_rel32(code, fail, code->len);
         elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
-        elf_patch_rel32(code, end, code->len);
+        z_x64_patch_rel32(code, end, code->len);
       }
       return true;
     case IR_VALUE_FS_READ_FILE:
       if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 std.fs.read local is out of range", value->line, value->column, "invalid File");
       elf_emit_load_local_rax(code, fun, value->local_index);
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
-      elf_append_u8(code, 0x5e);
-      elf_append_u8(code, 0x5f);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xc0);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
+      z_x64_emit_mov_rdx_from_rax(code);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_pop_reg64(code, 7);
+      z_x64_emit_xor_eax_eax(code);
+      z_x64_emit_syscall(code);
       if (value->type == IR_TYPE_I64) {
-        elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x85);
-        elf_append_u8(code, 0xc0);
+        z_x64_emit_test_rax_rax(code, true);
         size_t fail = elf_emit_js_placeholder(code);
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
-        size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-        elf_patch_rel32(code, fail, code->len);
+        z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
+        size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+        z_x64_patch_rel32(code, fail, code->len);
         elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
-        elf_patch_rel32(code, end, code->len);
+        z_x64_patch_rel32(code, end, code->len);
       }
       return true;
     case IR_VALUE_FS_WRITE_ALL_FILE:
       if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 std.fs.writeAll local is out of range", value->line, value->column, "invalid File");
       elf_emit_load_local_rax(code, fun, value->local_index);
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
-      elf_append_u8(code, 0x5e);
-      elf_append_u8(code, 0x5f);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 1);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x59);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc8);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x94);
-      elf_append_u8(code, 0xc0);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0xb6);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_push_rax(code);
+      z_x64_emit_mov_rdx_from_rax(code);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_pop_reg64(code, 7);
+      z_x64_emit_mov_eax_u32(code, 1);
+      z_x64_emit_syscall(code);
+      z_x64_emit_pop_reg64(code, 1);
+      z_x64_emit_cmp_rax_rcx(code, false);
+      z_x64_emit_setcc_al_to_bool(code, 0x94);
       if (value->type == IR_TYPE_I64) {
-        elf_append_u8(code, 0x85);
-        elf_append_u8(code, 0xc0);
-        size_t success = elf_emit_jcc32_placeholder(code, 0x85);
+        z_x64_emit_test_rax_rax(code, false);
+        size_t success = z_x64_emit_jcc32_placeholder(code, 0x85);
         elf_emit_packed_error_rax(code, value->error_code ? value->error_code : IR_ERROR_UNKNOWN);
-        size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-        elf_patch_rel32(code, success, code->len);
-        elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x31);
-        elf_append_u8(code, 0xc0);
-        elf_patch_rel32(code, end, code->len);
+        size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+        z_x64_patch_rel32(code, success, code->len);
+        z_x64_emit_xor_rax_rax(code);
+        z_x64_patch_rel32(code, end, code->len);
       }
       return true;
-    case IR_VALUE_FS_READ_PATH:
-    case IR_VALUE_FS_READ_BYTES_PATH: {
+    default: return elf_diag(diag, "direct ELF64 filesystem value kind is invalid for this helper", value->line, value->column, "invalid filesystem value");
+  }
+}
+
+static bool elf_emit_fs_path_io_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
+    case IR_VALUE_FS_READ_PATH: case IR_VALUE_FS_READ_BYTES_PATH: {
       if (!elf_emit_openat_path(code, fun, value->left, 0, 0, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_test_rax_rax(code, true);
       size_t open_fail = elf_emit_js_placeholder(code);
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
-      elf_append_u8(code, 0x5e);
-      elf_append_u8(code, 0x5f);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xc0);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x50);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xf8);
+      z_x64_emit_mov_rdx_from_rax(code);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_pop_reg64(code, 7);
+      z_x64_emit_xor_eax_eax(code);
+      z_x64_emit_syscall(code);
+      z_x64_emit_push_rax(code);
+      z_x64_emit_mov_rax_from_rdi(code);
       elf_emit_close_rax_fd(code);
-      elf_append_u8(code, 0x58);
-      size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, open_fail, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0xc0);
-      elf_append_u32(code, 0xffffffffu);
-      elf_patch_rel32(code, end, code->len);
+      z_x64_emit_pop_rax(code);
+      size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, open_fail, code->len);
+      z_x64_emit_mov_reg_i32(code, 0, -1);
+      z_x64_patch_rel32(code, end, code->len);
       return true;
     }
-    case IR_VALUE_FS_WRITE_PATH:
-    case IR_VALUE_FS_WRITE_BYTES_PATH: {
+    case IR_VALUE_FS_WRITE_PATH: case IR_VALUE_FS_WRITE_BYTES_PATH: {
       if (!elf_emit_openat_path(code, fun, value->left, 577, 0644, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x85);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_test_rax_rax(code, true);
       size_t open_fail = elf_emit_js_placeholder(code);
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
-      elf_append_u8(code, 0x5e);
-      elf_append_u8(code, 0x5f);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 1);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x05);
-      elf_append_u8(code, 0x50);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xf8);
+      z_x64_emit_mov_rdx_from_rax(code);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_pop_reg64(code, 7);
+      z_x64_emit_mov_eax_u32(code, 1);
+      z_x64_emit_syscall(code);
+      z_x64_emit_push_rax(code);
+      z_x64_emit_mov_rax_from_rdi(code);
       elf_emit_close_rax_fd(code);
-      elf_append_u8(code, 0x58);
-      size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, open_fail, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xc7);
-      elf_append_u8(code, 0xc0);
-      elf_append_u32(code, 0xffffffffu);
-      elf_patch_rel32(code, end, code->len);
+      z_x64_emit_pop_rax(code);
+      size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, open_fail, code->len);
+      z_x64_emit_mov_reg_i32(code, 0, -1);
+      z_x64_patch_rel32(code, end, code->len);
       return true;
     }
+    default: return elf_diag(diag, "direct ELF64 filesystem value kind is invalid for this helper", value->line, value->column, "invalid filesystem value");
+  }
+}
+
+static bool elf_emit_json_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
+    case IR_VALUE_JSON_PARSE_BYTES:
+      return elf_emit_json_parse_bytes_call(code, fun, value, ctx, diag);
+    case IR_VALUE_JSON_VALIDATE_BYTES:
+      if (!elf_emit_json_parse_bytes_call(code, fun, value, ctx, diag)) return false;
+      z_x64_emit_cmp_reg_i8(code, 0, 0, true);
+      z_x64_emit_setcc_al_to_bool(code, 0x9d);
+      return true;
+    case IR_VALUE_JSON_STREAM_TOKENS_BYTES: {
+      if (!elf_emit_json_parse_bytes_call(code, fun, value, ctx, diag)) return false;
+      z_x64_emit_test_rax_rax(code, true);
+      size_t ok = z_x64_emit_jcc32_placeholder(code, 0x89);
+      z_x64_emit_xor_rax_rax(code);
+      z_x64_patch_rel32(code, ok, code->len);
+      return true;
+    }
+    default: return elf_diag(diag, "direct ELF64 runtime value kind is invalid for this helper", value->line, value->column, "invalid runtime value");
+  }
+}
+
+static bool elf_emit_http_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
+    case IR_VALUE_HTTP_FETCH: {
+      if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->right, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_value(code, fun, value->index, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      z_x64_emit_pop_reg64(code, 8);
+      z_x64_emit_pop_reg64(code, 1);
+      z_x64_emit_pop_reg64(code, 2);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_pop_reg64(code, 7);
+      size_t patch = z_x64_emit_call32_placeholder(code);
+      return z_elf_record_value_runtime_patch(ctx, ELF_RUNTIME_HTTP_FETCH, patch, diag, value);
+    }
+    case IR_VALUE_HTTP_RESULT_OK: case IR_VALUE_HTTP_RESULT_STATUS: case IR_VALUE_HTTP_RESULT_BODY_LEN: case IR_VALUE_HTTP_RESULT_ERROR:
+    case IR_VALUE_HTTP_HEADER_FOUND: case IR_VALUE_HTTP_HEADER_OFFSET: case IR_VALUE_HTTP_HEADER_LEN: {
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      z_x64_emit_pop_reg64(code, 7);
+      size_t patch = z_x64_emit_call32_placeholder(code);
+      return z_elf_record_value_runtime_patch(ctx, elf_runtime_helper_for_value(value->kind), patch, diag, value);
+    }
+    case IR_VALUE_HTTP_RESPONSE_LEN: case IR_VALUE_HTTP_RESPONSE_HEADERS_LEN: case IR_VALUE_HTTP_RESPONSE_BODY_OFFSET: {
+      if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_pop_reg64(code, 7);
+      size_t patch = z_x64_emit_call32_placeholder(code);
+      return z_elf_record_value_runtime_patch(ctx, elf_runtime_helper_for_value(value->kind), patch, diag, value);
+    }
+    case IR_VALUE_HTTP_HEADER_VALUE: {
+      if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      if (!elf_emit_byte_view_len(code, fun, value->right, ctx, diag)) return false;
+      elf_emit_push_rax(code);
+      z_x64_emit_pop_reg64(code, 1);
+      z_x64_emit_pop_reg64(code, 2);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_pop_reg64(code, 7);
+      size_t patch = z_x64_emit_call32_placeholder(code);
+      return z_elf_record_value_runtime_patch(ctx, ELF_RUNTIME_HTTP_HEADER_VALUE, patch, diag, value);
+    }
+    default: return elf_diag(diag, "direct ELF64 runtime value kind is invalid for this helper", value->line, value->column, "invalid runtime value");
+  }
+}
+
+static bool elf_emit_core_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
+    case IR_VALUE_BOOL:
+    case IR_VALUE_INT:
+      if (elf_type_is_i64(value->type)) z_x64_emit_mov_rax_u64(code, (uint64_t)value->int_value);
+      else z_x64_emit_mov_eax_u32(code, (uint32_t)value->int_value);
+      return true;
+    case IR_VALUE_LOCAL:
+      if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 local index is out of range", value->line, value->column, "invalid local");
+      if (fun->locals[value->local_index].is_array) return elf_diag(diag, "direct ELF64 cannot use fixed array locals as scalar values", value->line, value->column, "array local");
+      elf_emit_load_local_rax(code, fun, value->local_index);
+      return true;
+    case IR_VALUE_BINARY: {
+      bool wide = elf_type_is_i64(value->type);
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      z_x64_emit_push_rax(code);
+      if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+      z_x64_emit_mov_rcx_from_rax(code, wide);
+      z_x64_emit_pop_rax(code);
+      if (value->binary_op == IR_BIN_ADD) {
+        z_x64_emit_add_rax_rcx(code, wide);
+      } else if (value->binary_op == IR_BIN_SUB) {
+        z_x64_emit_sub_rax_rcx(code, wide);
+      } else if (value->binary_op == IR_BIN_MUL) {
+        z_x64_emit_imul_rax_rcx(code, wide);
+      } else if (value->binary_op == IR_BIN_AND) {
+        z_x64_emit_and_rax_rcx(code, wide);
+      } else if (value->binary_op == IR_BIN_OR) {
+        z_x64_emit_or_rax_rcx(code, wide);
+      } else if (value->binary_op == IR_BIN_DIV) {
+        z_x64_emit_div_rax_rcx(code, wide, elf_type_is_unsigned(value->type), false);
+      } else if (value->binary_op == IR_BIN_MOD) {
+        z_x64_emit_div_rax_rcx(code, wide, elf_type_is_unsigned(value->type), true);
+      } else {
+        return elf_diag(diag, "direct ELF64 binary operator is unsupported", value->line, value->column, "unsupported operator");
+      }
+      return true;
+    }
+    case IR_VALUE_COMPARE: {
+      if (!value->left || !value->right || !elf_type_is_supported_scalar(value->left->type) || value->left->type != value->right->type) return elf_diag(diag, "direct ELF64 comparison operands must have the same supported integer type", value->line, value->column, "unsupported comparison");
+      bool wide = elf_type_is_i64(value->left->type);
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      z_x64_emit_push_rax(code);
+      if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
+      z_x64_emit_mov_rcx_from_rax(code, wide);
+      z_x64_emit_pop_rax(code);
+      z_x64_emit_cmp_rax_rcx_to_bool(code, elf_setcc_opcode(value->compare_op, elf_type_is_unsigned(value->left->type)), wide);
+      return true;
+    }
+    case IR_VALUE_CALL: {
+      static const unsigned param_regs[] = {7, 6, 2, 1, 8, 9};
+      if (value->arg_len > 6) return elf_diag(diag, "direct ELF64 call supports at most six arguments", value->line, value->column, "too many arguments");
+      for (size_t i = 0; i < value->arg_len; i++) {
+        if (!elf_emit_value(code, fun, value->args[i], ctx, diag)) return false;
+        elf_emit_push_rax(code);
+      }
+      for (size_t i = value->arg_len; i > 0; i--) z_x64_emit_pop_reg64(code, param_regs[i - 1]);
+      size_t patch = z_x64_emit_call32_placeholder(code);
+      return z_elf_record_call_patch(ctx, patch, value->callee_index, diag, value);
+    }
+    default: return elf_diag(diag, "direct ELF64 core value kind is invalid for this helper", value->line, value->column, "invalid core value");
+  }
+}
+
+static bool elf_emit_host_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
+    case IR_VALUE_ARGS_LEN:
+      if (ctx && ctx->seed_main_process_args) {
+        z_x64_emit_push_reg64(code, 14);
+        z_x64_emit_pop_reg64(code, 0);
+        return true;
+      }
+      z_x64_emit_load_reg_ptr_reg(code, 0, 15, true);
+      return true;
+    case IR_VALUE_TIME_WALL_SECONDS:
+      z_x64_emit_xor_rdi_rdi(code);
+      z_x64_emit_mov_eax_u32(code, 201);
+      z_x64_emit_syscall(code);
+      return true;
+    case IR_VALUE_TIME_MONOTONIC:
+      z_x64_emit_sub_rsp(code, 16);
+      z_x64_emit_mov_reg_u32(code, 7, 1);
+      z_x64_emit_mov_rsi_from_rsp(code);
+      z_x64_emit_mov_eax_u32(code, 228);
+      z_x64_emit_syscall(code);
+      z_x64_emit_load_rsp_offset_reg(code, 0, 0, true);
+      z_x64_emit_imul_reg_i32(code, 0, 1000000000, true);
+      z_x64_emit_add_rax_rsp_offset(code, 8);
+      z_x64_emit_add_rsp(code, 16);
+      return true;
+    case IR_VALUE_TIME_AS_MS:
+      if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
+      z_x64_emit_mov_reg_i32(code, 1, 1000000);
+      z_x64_emit_div_rax_rcx(code, true, false, false);
+      return true;
+    case IR_VALUE_RAND_NEXT_U32:
+      if (value->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 std.rand.nextU32 local is out of range", value->line, value->column, "invalid RandSource");
+      elf_emit_load_local_rax(code, fun, value->local_index);
+      z_x64_emit_imul_reg_i32(code, 0, 1664525, false);
+      z_x64_emit_add_rax_u32(code, 1013904223u, false);
+      elf_emit_store_local_from_reg(code, fun, value->local_index, 0);
+      return true;
+    case IR_VALUE_RAND_ENTROPY_U32:
+      z_x64_emit_xor_rdi_rdi(code);
+      z_x64_emit_mov_eax_u32(code, 201);
+      z_x64_emit_syscall(code);
+      z_x64_append_u8(code, 0x35);
+      z_x64_append_u32(code, 0x9e3779b9u);
+      return true;
+    default: return elf_diag(diag, "direct ELF64 host value kind is invalid for this helper", value->line, value->column, "invalid host value");
+  }
+}
+
+static bool elf_emit_stateful_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
     case IR_VALUE_MAYBE_HAS:
       if (value->local_index >= fun->local_len ||
           (fun->locals[value->local_index].type != IR_TYPE_MAYBE_BYTE_VIEW && fun->locals[value->local_index].type != IR_TYPE_MAYBE_SCALAR)) {
@@ -1317,8 +958,7 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       if (value->local_index >= fun->local_len || fun->locals[value->local_index].type != IR_TYPE_MAYBE_SCALAR) return elf_diag(diag, "direct ELF64 maybe scalar value requires a Maybe scalar local", value->line, value->column, "invalid maybe value");
       elf_emit_load_local_slot_rax(code, &fun->locals[value->local_index], 8);
       return true;
-    case IR_VALUE_VEC_LEN:
-    case IR_VALUE_VEC_CAPACITY:
+    case IR_VALUE_VEC_LEN: case IR_VALUE_VEC_CAPACITY:
       if (value->local_index >= fun->local_len || fun->locals[value->local_index].type != IR_TYPE_VEC) return elf_diag(diag, "direct ELF64 Vec helper requires a Vec local", value->line, value->column, "invalid Vec local");
       elf_emit_load_local_slot_reg(code, &fun->locals[value->local_index], value->kind == IR_VALUE_VEC_LEN ? 8 : 12, 0, false);
       return true;
@@ -1327,49 +967,38 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       const IrLocal *local = &fun->locals[value->local_index];
       elf_emit_load_local_slot_reg(code, local, 8, 0, false);
       elf_emit_load_local_slot_reg(code, local, 12, 1, false);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc8);
-      size_t ok_patch = elf_emit_jcc32_placeholder(code, 0x82);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 0);
-      size_t end_patch = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, ok_patch, code->len);
-      elf_append_u8(code, 0x50);
+      z_x64_emit_cmp_rax_rcx(code, false);
+      size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x82);
+      z_x64_emit_mov_eax_u32(code, 0);
+      size_t end_patch = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, ok_patch, code->len);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x59);
+      z_x64_emit_pop_reg64(code, 1);
       elf_emit_load_local_slot_reg(code, local, 0, 2, true);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x01);
-      elf_append_u8(code, 0xca);
-      elf_append_u8(code, 0x88);
-      elf_append_u8(code, 0x02);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc8);
-      elf_append_u8(code, 0x83);
-      elf_append_u8(code, 0xc0);
-      elf_append_u8(code, 0x01);
+      z_x64_emit_add_rdx_rcx(code, true);
+      z_x64_emit_store_ptr_reg8_from_reg(code, 2, 0);
+      z_x64_emit_mov_eax_from_ecx(code);
+      z_x64_emit_add_reg_i8(code, 0, 1, false);
       elf_emit_store_local_slot_reg(code, local, 8, 0, false);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 1);
-      elf_patch_rel32(code, end_patch, code->len);
+      z_x64_emit_mov_eax_u32(code, 1);
+      z_x64_patch_rel32(code, end_patch, code->len);
       return true;
     }
     case IR_VALUE_CHECK: {
       if (!value->left || value->left->type != IR_TYPE_I64) return elf_diag(diag, "direct ELF64 check requires a packed fallible call result", value->line, value->column, "non-fallible value");
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
       elf_emit_error_condition_from_rax(code);
-      size_t ok_patch = elf_emit_jcc32_placeholder(code, 0x84);
+      size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x84);
       if (elf_function_propagates_to_process_exit(fun)) {
-        elf_emit_epilogue(code);
+        elf_emit_epilogue(code, fun, ctx);
       } else {
-        elf_append_u8(code, 0xb8);
-        elf_append_u32(code, 1);
-        elf_emit_epilogue(code);
+        z_x64_emit_mov_eax_u32(code, 1);
+        elf_emit_epilogue(code, fun, ctx);
       }
-      elf_patch_rel32(code, ok_patch, code->len);
+      z_x64_patch_rel32(code, ok_patch, code->len);
       if (!elf_type_is_i64(value->type)) {
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
+        z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
       }
       return true;
     }
@@ -1379,32 +1008,32 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
       }
       if (!elf_emit_value(code, fun, value->left, ctx, diag)) return false;
       elf_emit_error_condition_from_rax(code);
-      size_t success_patch = elf_emit_jcc32_placeholder(code, 0x84);
+      size_t success_patch = z_x64_emit_jcc32_placeholder(code, 0x84);
       if (!elf_emit_value(code, fun, value->right, ctx, diag)) return false;
-      size_t end_patch = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, success_patch, code->len);
+      size_t end_patch = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, success_patch, code->len);
       if (!elf_type_is_i64(value->type)) {
-        elf_append_u8(code, 0x89);
-        elf_append_u8(code, 0xc0);
+        z_x64_emit_mov_reg_from_reg(code, 0, 0, false);
       }
-      elf_patch_rel32(code, end_patch, code->len);
+      z_x64_patch_rel32(code, end_patch, code->len);
       return true;
     }
+    default: return elf_diag(diag, "direct ELF64 stateful value kind is invalid for this helper", value->line, value->column, "invalid stateful value");
+  }
+}
+
+static bool elf_emit_memory_access_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
     case IR_VALUE_INDEX_LOAD: {
       if (value->array_index >= fun->local_len) return elf_diag(diag, "direct ELF64 indexed load array is out of range", value->line, value->column, "invalid array local");
       const IrLocal *local = &fun->locals[value->array_index];
       if (!elf_emit_bounds_checked_address(code, fun, local, value->index, ctx, diag)) return false;
       if (local->element_type == IR_TYPE_U8) {
-        elf_append_u8(code, 0x0f);
-        elf_append_u8(code, 0xb6);
-        elf_append_u8(code, 0x00);
+        z_x64_emit_movzx_reg32_ptr_reg_u8(code, 0, 0);
       } else if (elf_type_is_i64(local->element_type)) {
-        elf_append_u8(code, 0x48);
-        elf_append_u8(code, 0x8b);
-        elf_append_u8(code, 0x00);
+        z_x64_emit_load_reg_ptr_reg(code, 0, 0, true);
       } else {
-        elf_append_u8(code, 0x8b);
-        elf_append_u8(code, 0x00);
+        z_x64_emit_load_reg_ptr_reg(code, 0, 0, false);
       }
       return true;
     }
@@ -1418,201 +1047,184 @@ static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *val
     case IR_VALUE_BYTE_VIEW_LEN: {
       return elf_emit_byte_view_len(code, fun, value->left, ctx, diag);
     }
+    default: return elf_diag(diag, "direct ELF64 memory value kind is invalid for this helper", value->line, value->column, "invalid memory value");
+  }
+}
+
+static bool elf_emit_byte_bulk_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
     case IR_VALUE_CRC32_BYTES: {
       if (!value->left) return elf_diag(diag, "direct ELF64 CRC32 requires a byte view", value->line, value->column, "missing byte view");
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc1);
-      elf_append_u8(code, 0x5e);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 0xffffffffu);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xc9);
+      z_x64_emit_mov_r9_from_rax(code);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_mov_eax_u32(code, 0xffffffffu);
+      z_x64_emit_xor_ecx_ecx(code);
       size_t byte_loop = code->len;
-      elf_append_u8(code, 0x4c);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc9);
-      size_t done = elf_emit_jcc32_placeholder(code, 0x83);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0xb6);
-      elf_append_u8(code, 0x14);
-      elf_append_u8(code, 0x0e);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xd0);
-      elf_append_u8(code, 0x41);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 8);
+      z_x64_emit_cmp_reg_reg(code, 1, 9, true);
+      size_t done = z_x64_emit_jcc32_placeholder(code, 0x83);
+      z_x64_emit_movzx_reg32_base_index_u8(code, 2, 6, 1);
+      z_x64_emit_xor_reg_from_reg(code, 0, 2, false);
+      z_x64_emit_mov_reg_u32(code, 8, 8);
       size_t bit_loop = code->len;
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
-      elf_append_u8(code, 0x83);
-      elf_append_u8(code, 0xe2);
-      elf_append_u8(code, 1);
-      elf_append_u8(code, 0xf7);
-      elf_append_u8(code, 0xda);
-      elf_append_u8(code, 0x81);
-      elf_append_u8(code, 0xe2);
-      elf_append_u32(code, 0xedb88320u);
-      elf_append_u8(code, 0xd1);
-      elf_append_u8(code, 0xe8);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xd0);
-      elf_append_u8(code, 0x41);
-      elf_append_u8(code, 0xff);
-      elf_append_u8(code, 0xc8);
-      size_t bit_back = elf_emit_jcc32_placeholder(code, 0x85);
-      elf_patch_rel32(code, bit_back, bit_loop);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xff);
-      elf_append_u8(code, 0xc1);
-      size_t byte_back = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, byte_back, byte_loop);
-      elf_patch_rel32(code, done, code->len);
-      elf_append_u8(code, 0x35);
-      elf_append_u32(code, 0xffffffffu);
+      z_x64_emit_mov_reg_from_reg(code, 2, 0, false);
+      z_x64_emit_and_reg_i8(code, 2, 1, false);
+      z_x64_emit_neg_reg(code, 2, false);
+      z_x64_emit_and_reg_u32(code, 2, 0xedb88320u, false);
+      z_x64_emit_shr_reg_one(code, 0, false);
+      z_x64_emit_xor_reg_from_reg(code, 0, 2, false);
+      z_x64_emit_dec_r8d(code);
+      size_t bit_back = z_x64_emit_jcc32_placeholder(code, 0x85);
+      z_x64_patch_rel32(code, bit_back, bit_loop);
+      z_x64_emit_inc_rcx(code);
+      size_t byte_back = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, byte_back, byte_loop);
+      z_x64_patch_rel32(code, done, code->len);
+      z_x64_append_u8(code, 0x35);
+      z_x64_append_u32(code, 0xffffffffu);
       return true;
     }
     case IR_VALUE_BYTE_COPY: {
       if (!value->left || !value->right) return elf_diag(diag, "direct ELF64 byte copy requires source and destination byte views", value->line, value->column, "missing byte view");
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x5f);
-      elf_append_u8(code, 0x59);
-      elf_append_u8(code, 0x5e);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc8);
-      size_t keep_dst_len = elf_emit_jcc32_placeholder(code, 0x86);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc8);
-      elf_patch_rel32(code, keep_dst_len, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
-      elf_append_u8(code, 0x45);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_pop_reg64(code, 7);
+      z_x64_emit_pop_reg64(code, 1);
+      z_x64_emit_pop_reg64(code, 6);
+      z_x64_emit_cmp_rax_rcx(code, true);
+      size_t keep_dst_len = z_x64_emit_jcc32_placeholder(code, 0x86);
+      z_x64_emit_mov_rax_from_rcx(code);
+      z_x64_patch_rel32(code, keep_dst_len, code->len);
+      z_x64_emit_mov_rdx_from_rax(code);
+      z_x64_emit_xor_r8d_r8d(code);
       size_t loop = code->len;
-      elf_append_u8(code, 0x4c);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc2);
-      size_t done = elf_emit_jcc32_placeholder(code, 0x86);
-      elf_append_u8(code, 0x42);
-      elf_append_u8(code, 0x8a);
-      elf_append_u8(code, 0x1c);
-      elf_append_u8(code, 0x06);
-      elf_append_u8(code, 0x42);
-      elf_append_u8(code, 0x88);
-      elf_append_u8(code, 0x1c);
-      elf_append_u8(code, 0x07);
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0xff);
-      elf_append_u8(code, 0xc0);
-      size_t back = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, back, loop);
-      elf_patch_rel32(code, done, code->len);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xd0);
+      z_x64_emit_cmp_reg_reg(code, 2, 8, true);
+      size_t done = z_x64_emit_jcc32_placeholder(code, 0x86);
+      z_x64_emit_load_reg8_base_index(code, 3, 6, 8);
+      z_x64_emit_store_base_index_reg8(code, 7, 8, 3);
+      z_x64_emit_inc_r8(code);
+      size_t back = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, back, loop);
+      z_x64_patch_rel32(code, done, code->len);
+      z_x64_emit_mov_rax_from_rdx(code);
       return true;
     }
     case IR_VALUE_BYTE_VIEW_EQ: {
       if (!value->left || !value->right) return elf_diag(diag, "direct ELF64 byte-view equality requires two byte views", value->line, value->column, "missing byte view");
       if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x59);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc1);
-      size_t same_len = elf_emit_jcc32_placeholder(code, 0x84);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 0);
-      size_t end = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, same_len, code->len);
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc2);
+      z_x64_emit_pop_reg64(code, 1);
+      z_x64_emit_cmp_reg_reg(code, 1, 0, false);
+      size_t same_len = z_x64_emit_jcc32_placeholder(code, 0x84);
+      z_x64_emit_mov_eax_u32(code, 0);
+      size_t end = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, same_len, code->len);
+      z_x64_emit_mov_reg_from_rax(code, 10, true);
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc0);
+      z_x64_emit_mov_reg_from_rax(code, 8, true);
       if (!elf_emit_byte_view_ptr(code, fun, value->right, ctx, diag)) return false;
-      elf_append_u8(code, 0x49);
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc1);
-      elf_append_u8(code, 0x31);
-      elf_append_u8(code, 0xc9);
+      z_x64_emit_mov_r9_from_rax(code);
+      z_x64_emit_xor_ecx_ecx(code);
       size_t loop = code->len;
-      elf_append_u8(code, 0x4c);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xd1);
-      size_t equal = elf_emit_jcc32_placeholder(code, 0x83);
-      elf_append_u8(code, 0x41);
-      elf_append_u8(code, 0x8a);
-      elf_append_u8(code, 0x04);
-      elf_append_u8(code, 0x08);
-      elf_append_u8(code, 0x41);
-      elf_append_u8(code, 0x38);
-      elf_append_u8(code, 0x04);
-      elf_append_u8(code, 0x09);
-      size_t mismatch = elf_emit_jcc32_placeholder(code, 0x85);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0xff);
-      elf_append_u8(code, 0xc1);
-      size_t back = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, back, loop);
-      elf_patch_rel32(code, mismatch, code->len);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 0);
-      size_t after_false = elf_emit_jmp32_placeholder(code, 0xe9);
-      elf_patch_rel32(code, equal, code->len);
-      elf_append_u8(code, 0xb8);
-      elf_append_u32(code, 1);
-      elf_patch_rel32(code, after_false, code->len);
-      elf_patch_rel32(code, end, code->len);
+      z_x64_emit_cmp_reg_reg(code, 1, 10, true);
+      size_t equal = z_x64_emit_jcc32_placeholder(code, 0x83);
+      z_x64_emit_load_reg8_base_index(code, 0, 8, 1);
+      z_x64_emit_cmp_base_index_reg8(code, 9, 1, 0);
+      size_t mismatch = z_x64_emit_jcc32_placeholder(code, 0x85);
+      z_x64_emit_inc_rcx(code);
+      size_t back = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, back, loop);
+      z_x64_patch_rel32(code, mismatch, code->len);
+      z_x64_emit_mov_eax_u32(code, 0);
+      size_t after_false = z_x64_emit_jmp32_placeholder(code, 0xe9);
+      z_x64_patch_rel32(code, equal, code->len);
+      z_x64_emit_mov_eax_u32(code, 1);
+      z_x64_patch_rel32(code, after_false, code->len);
+      z_x64_patch_rel32(code, end, code->len);
       return true;
     }
+    default: return elf_diag(diag, "direct ELF64 byte value kind is invalid for this helper", value->line, value->column, "invalid byte value");
+  }
+}
+
+static bool elf_emit_byte_index_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (value->kind) {
     case IR_VALUE_BYTE_VIEW_INDEX_LOAD: {
       unsigned const_index = 0;
       unsigned char byte = 0;
       if (elf_const_u32_value(value->index, &const_index) &&
           elf_byte_view_const_byte(ctx ? ctx->ir : NULL, fun, value->left, const_index, &byte)) {
-        elf_append_u8(code, 0xb8);
-        elf_append_u32(code, byte);
+        z_x64_emit_mov_eax_u32(code, byte);
         return true;
       }
       if (!value->index || !elf_emit_value(code, fun, value->index, ctx, diag)) return false;
-      elf_append_u8(code, 0x50);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_len(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x89);
-      elf_append_u8(code, 0xc1);
-      elf_append_u8(code, 0x58);
-      elf_append_u8(code, 0x39);
-      elf_append_u8(code, 0xc8);
-      size_t ok_patch = elf_emit_jcc32_placeholder(code, 0x82);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0x0b);
-      elf_patch_rel32(code, ok_patch, code->len);
-      elf_append_u8(code, 0x50);
+      z_x64_emit_mov_rcx_from_rax(code, false);
+      z_x64_emit_pop_rax(code);
+      z_x64_emit_cmp_rax_rcx(code, false);
+      size_t ok_patch = z_x64_emit_jcc32_placeholder(code, 0x82);
+      z_x64_emit_ud2(code);
+      z_x64_patch_rel32(code, ok_patch, code->len);
+      z_x64_emit_push_rax(code);
       if (!elf_emit_byte_view_ptr(code, fun, value->left, ctx, diag)) return false;
-      elf_append_u8(code, 0x59);
-      elf_append_u8(code, 0x48);
-      elf_append_u8(code, 0x01);
-      elf_append_u8(code, 0xc8);
-      elf_append_u8(code, 0x0f);
-      elf_append_u8(code, 0xb6);
-      elf_append_u8(code, 0x00);
+      z_x64_emit_pop_reg64(code, 1);
+      z_x64_emit_add_rax_rcx(code, true);
+      z_x64_emit_movzx_reg32_ptr_reg_u8(code, 0, 0);
       return true;
     }
+    default: return elf_diag(diag, "direct ELF64 byte-index value kind is invalid for this helper", value->line, value->column, "invalid byte-index value");
+  }
+}
+
+static bool elf_emit_value(ZBuf *code, const IrFunction *fun, const IrValue *value, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!value) return elf_diag(diag, "direct ELF64 expression is missing", 1, 1, "missing expression");
+  if (!elf_type_is_supported_scalar(value->type) && !((value->kind == IR_VALUE_CALL || value->kind == IR_VALUE_CHECK) && value->type == IR_TYPE_VOID) &&
+      value->kind != IR_VALUE_MAYBE_HAS && value->kind != IR_VALUE_VEC_LEN && value->kind != IR_VALUE_VEC_CAPACITY &&
+      value->kind != IR_VALUE_VEC_PUSH && value->kind != IR_VALUE_ARGS_LEN &&
+      value->type != IR_TYPE_MAYBE_SCALAR && value->kind != IR_VALUE_FS_CLOSE_FILE) {
+    return elf_diag(diag, "direct ELF64 object backend currently supports only primitive integer values", value->line, value->column, elf_type_name(value->type));
+  }
+  switch (value->kind) {
+    case IR_VALUE_BOOL: case IR_VALUE_INT: case IR_VALUE_LOCAL: case IR_VALUE_BINARY: case IR_VALUE_COMPARE: case IR_VALUE_CALL:
+      return elf_emit_core_value(code, fun, value, ctx, diag);
+    case IR_VALUE_JSON_PARSE_BYTES: case IR_VALUE_JSON_VALIDATE_BYTES: case IR_VALUE_JSON_STREAM_TOKENS_BYTES:
+      return elf_emit_json_value(code, fun, value, ctx, diag);
+    case IR_VALUE_HTTP_FETCH: case IR_VALUE_HTTP_RESULT_OK: case IR_VALUE_HTTP_RESULT_STATUS: case IR_VALUE_HTTP_RESULT_BODY_LEN: case IR_VALUE_HTTP_RESULT_ERROR:
+    case IR_VALUE_HTTP_HEADER_FOUND: case IR_VALUE_HTTP_HEADER_OFFSET: case IR_VALUE_HTTP_HEADER_LEN: case IR_VALUE_HTTP_RESPONSE_LEN:
+    case IR_VALUE_HTTP_RESPONSE_HEADERS_LEN: case IR_VALUE_HTTP_RESPONSE_BODY_OFFSET: case IR_VALUE_HTTP_HEADER_VALUE:
+      return elf_emit_http_value(code, fun, value, ctx, diag);
+    case IR_VALUE_ARGS_LEN: case IR_VALUE_TIME_WALL_SECONDS: case IR_VALUE_TIME_MONOTONIC: case IR_VALUE_TIME_AS_MS:
+    case IR_VALUE_RAND_NEXT_U32: case IR_VALUE_RAND_ENTROPY_U32:
+      return elf_emit_host_value(code, fun, value, ctx, diag);
+    case IR_VALUE_FS_HOST: case IR_VALUE_FS_OPEN: case IR_VALUE_FS_CREATE: case IR_VALUE_FS_CLOSE_FILE: case IR_VALUE_FS_EXISTS:
+    case IR_VALUE_FS_IS_DIR: case IR_VALUE_FS_REMOVE: case IR_VALUE_FS_REMOVE_DIR: case IR_VALUE_FS_MAKE_DIR: case IR_VALUE_FS_RENAME:
+      return elf_emit_fs_basic_value(code, fun, value, ctx, diag);
+    case IR_VALUE_FS_DIR_ENTRY_COUNT:
+      return elf_emit_fs_dir_entry_count_value(code, fun, value, ctx, diag);
+    case IR_VALUE_FS_ATOMIC_WRITE:
+      return elf_emit_fs_atomic_write_value(code, fun, value, ctx, diag);
+    case IR_VALUE_FS_FILE_LEN: case IR_VALUE_FS_READ_FILE: case IR_VALUE_FS_WRITE_ALL_FILE:
+      return elf_emit_fs_file_handle_value(code, fun, value, ctx, diag);
+    case IR_VALUE_FS_READ_PATH: case IR_VALUE_FS_READ_BYTES_PATH: case IR_VALUE_FS_WRITE_PATH: case IR_VALUE_FS_WRITE_BYTES_PATH:
+      return elf_emit_fs_path_io_value(code, fun, value, ctx, diag);
+    case IR_VALUE_MAYBE_HAS: case IR_VALUE_MAYBE_VALUE: case IR_VALUE_VEC_LEN: case IR_VALUE_VEC_CAPACITY:
+    case IR_VALUE_VEC_PUSH: case IR_VALUE_CHECK: case IR_VALUE_RESCUE:
+      return elf_emit_stateful_value(code, fun, value, ctx, diag);
+    case IR_VALUE_INDEX_LOAD: case IR_VALUE_FIELD_LOAD: case IR_VALUE_BYTE_VIEW_LEN:
+      return elf_emit_memory_access_value(code, fun, value, ctx, diag);
+    case IR_VALUE_CRC32_BYTES: case IR_VALUE_BYTE_COPY: case IR_VALUE_BYTE_VIEW_EQ:
+      return elf_emit_byte_bulk_value(code, fun, value, ctx, diag);
+    case IR_VALUE_BYTE_VIEW_INDEX_LOAD:
+      return elf_emit_byte_index_value(code, fun, value, ctx, diag);
     default:
       return elf_diag(diag, "direct ELF64 value kind is unsupported", value->line, value->column, "unsupported value");
   }
@@ -1651,145 +1263,107 @@ static bool elf_emit_instrs(ZBuf *text, const IrFunction *fun, const IrInstr *in
 static bool elf_emit_world_write(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
   if (!instr || !instr->value) return elf_diag(diag, "direct ELF64 World write requires bytes", instr ? instr->line : 1, instr ? instr->column : 1, "missing byte view");
   if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
-  elf_append_u8(text, 0x50);
+  z_x64_emit_push_rax(text);
   if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
-  elf_append_u8(text, 0x50);
-  elf_emit_pop_reg64(text, 2);
-  elf_emit_pop_reg64(text, 6);
-  elf_append_u8(text, 0xbf);
-  elf_append_u32(text, instr->field_offset == 2 ? 2 : 1);
-  elf_append_u8(text, 0xb8);
-  elf_append_u32(text, 1);
-  elf_append_u8(text, 0x0f);
-  elf_append_u8(text, 0x05);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x85);
-  elf_append_u8(text, 0xc0);
-  size_t ok_patch = elf_emit_jcc32_placeholder(text, 0x89);
-  elf_append_u8(text, 0x0f);
-  elf_append_u8(text, 0x0b);
-  elf_patch_rel32(text, ok_patch, text->len);
+  z_x64_emit_push_rax(text);
+  z_x64_emit_pop_reg64(text, 2);
+  z_x64_emit_pop_reg64(text, 6);
+  z_x64_emit_mov_reg_u32(text, 7, instr->field_offset == 2 ? 2 : 1);
+  z_x64_emit_mov_eax_u32(text, 1);
+  z_x64_emit_syscall(text);
+  z_x64_emit_test_rax_rax(text, true);
+  size_t ok_patch = z_x64_emit_jcc32_placeholder(text, 0x89);
+  z_x64_emit_ud2(text);
+  z_x64_patch_rel32(text, ok_patch, text->len);
   return true;
 }
 
 static bool elf_emit_args_get_to_local(ZBuf *text, const IrFunction *fun, const IrValue *value, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
   if (!value || !value->left) return elf_diag(diag, "direct ELF64 std.args.get requires an index", value ? value->line : 1, value ? value->column : 1, "missing index");
   if (!elf_emit_value(text, fun, value->left, ctx, diag)) return false;
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x3b);
-  elf_append_u8(text, 0x07);
-  size_t in_range = elf_emit_jcc32_placeholder(text, 0x82);
+  if (ctx && ctx->seed_main_process_args) {
+    z_x64_emit_push_reg64(text, 14);
+    z_x64_emit_pop_reg64(text, 1);
+    z_x64_emit_cmp_rax_rcx(text, true);
+  } else {
+    z_x64_emit_cmp_reg_ptr_reg(text, 0, 15, true);
+  }
+  size_t in_range = z_x64_emit_jcc32_placeholder(text, 0x82);
   elf_emit_maybe_clear(text, local);
-  size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
-  elf_patch_rel32(text, in_range, text->len);
+  size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, in_range, text->len);
 
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x8b);
-  elf_append_u8(text, 0x44);
-  elf_append_u8(text, 0xc7);
-  elf_append_u8(text, 0x08);
-  elf_append_u8(text, 0x50);
+  if (ctx && ctx->seed_main_process_args) {
+    z_x64_emit_load_base_index_scale_disp_reg(text, 0, 15, 0, 8, 0, true);
+  } else {
+    z_x64_emit_load_base_index_scale_disp_reg(text, 0, 15, 0, 8, 8, true);
+  }
+  z_x64_emit_push_rax(text);
   elf_emit_strlen_rax_to_ecx(text);
-  elf_append_u8(text, 0xb8);
-  elf_append_u32(text, 1);
+  z_x64_emit_mov_eax_u32(text, 1);
   elf_emit_store_local_slot_reg(text, local, 0, 0, false);
-  elf_append_u8(text, 0x58);
+  z_x64_emit_pop_rax(text);
   elf_emit_store_local_slot_rax(text, local, 8);
   elf_emit_store_local_slot_reg(text, local, 16, 1, false);
-  elf_patch_rel32(text, end, text->len);
+  z_x64_patch_rel32(text, end, text->len);
   return true;
 }
 
 static bool elf_emit_env_get_to_local(ZBuf *text, const IrFunction *fun, const IrValue *value, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
   if (!value || !value->left) return elf_diag(diag, "direct ELF64 std.env.get requires a key", value ? value->line : 1, value ? value->column : 1, "missing key");
   if (!elf_emit_byte_view_ptr(text, fun, value->left, ctx, diag)) return false;
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xc1);
+  z_x64_emit_mov_r9_from_rax(text);
   if (!elf_emit_byte_view_len(text, fun, value->left, ctx, diag)) return false;
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xc2);
+  z_x64_emit_mov_reg_from_reg(text, 10, 0, true);
 
-  elf_append_u8(text, 0x4d);
-  elf_append_u8(text, 0x8b);
-  elf_append_u8(text, 0x07);
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x83);
-  elf_append_u8(text, 0xc0);
-  elf_append_u8(text, 0x02);
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0xc1);
-  elf_append_u8(text, 0xe0);
-  elf_append_u8(text, 0x03);
-  elf_append_u8(text, 0x4d);
-  elf_append_u8(text, 0x01);
-  elf_append_u8(text, 0xf8);
+  if (ctx && ctx->seed_main_process_args) {
+    z_x64_emit_push_reg64(text, 13);
+    z_x64_emit_pop_reg64(text, 8);
+  } else {
+    z_x64_emit_load_reg_ptr_reg(text, 8, 15, true);
+    z_x64_emit_add_reg_i8(text, 8, 2, true);
+    z_x64_emit_shl_reg_imm8(text, 8, 3, true);
+    z_x64_emit_add_reg_reg(text, 8, 15, true);
+  }
 
   size_t env_loop = text->len;
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x8b);
-  elf_append_u8(text, 0x18);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x85);
-  elf_append_u8(text, 0xdb);
-  size_t none = elf_emit_jcc32_placeholder(text, 0x84);
-  elf_append_u8(text, 0x31);
-  elf_append_u8(text, 0xc9);
+  z_x64_emit_load_reg_ptr_reg(text, 3, 8, true);
+  z_x64_emit_test_reg_reg(text, 3, true);
+  size_t none = z_x64_emit_jcc32_placeholder(text, 0x84);
+  z_x64_emit_xor_ecx_ecx(text);
 
   size_t compare_loop = text->len;
-  elf_append_u8(text, 0x4c);
-  elf_append_u8(text, 0x39);
-  elf_append_u8(text, 0xd1);
-  size_t key_done = elf_emit_jcc32_placeholder(text, 0x83);
-  elf_append_u8(text, 0x41);
-  elf_append_u8(text, 0x8a);
-  elf_append_u8(text, 0x04);
-  elf_append_u8(text, 0x09);
-  elf_append_u8(text, 0x38);
-  elf_append_u8(text, 0x04);
-  elf_append_u8(text, 0x0b);
-  size_t next = elf_emit_jcc32_placeholder(text, 0x85);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0xff);
-  elf_append_u8(text, 0xc1);
-  size_t compare_back = elf_emit_jmp32_placeholder(text, 0xe9);
-  elf_patch_rel32(text, compare_back, compare_loop);
+  z_x64_emit_cmp_reg_reg(text, 1, 10, true);
+  size_t key_done = z_x64_emit_jcc32_placeholder(text, 0x83);
+  z_x64_emit_load_reg8_base_index(text, 0, 9, 1);
+  z_x64_emit_cmp_base_index_reg8(text, 3, 1, 0);
+  size_t next = z_x64_emit_jcc32_placeholder(text, 0x85);
+  z_x64_emit_inc_rcx(text);
+  size_t compare_back = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, compare_back, compare_loop);
 
-  elf_patch_rel32(text, key_done, text->len);
-  elf_append_u8(text, 0x42);
-  elf_append_u8(text, 0x80);
-  elf_append_u8(text, 0x3c);
-  elf_append_u8(text, 0x13);
-  elf_append_u8(text, 0x3d);
-  size_t next_after_key = elf_emit_jcc32_placeholder(text, 0x85);
-  elf_append_u8(text, 0x4a);
-  elf_append_u8(text, 0x8d);
-  elf_append_u8(text, 0x44);
-  elf_append_u8(text, 0x13);
-  elf_append_u8(text, 0x01);
-  elf_append_u8(text, 0x50);
+  z_x64_patch_rel32(text, key_done, text->len);
+  z_x64_emit_cmp_base_index_u8(text, 3, 10, 0x3d);
+  size_t next_after_key = z_x64_emit_jcc32_placeholder(text, 0x85);
+  z_x64_emit_lea_base_index_scale_disp_reg(text, 0, 3, 10, 1, 1);
+  z_x64_emit_push_rax(text);
   elf_emit_strlen_rax_to_ecx(text);
-  elf_append_u8(text, 0xb8);
-  elf_append_u32(text, 1);
+  z_x64_emit_mov_eax_u32(text, 1);
   elf_emit_store_local_slot_reg(text, local, 0, 0, false);
-  elf_append_u8(text, 0x58);
+  z_x64_emit_pop_rax(text);
   elf_emit_store_local_slot_rax(text, local, 8);
   elf_emit_store_local_slot_reg(text, local, 16, 1, false);
-  size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
+  size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
 
-  elf_patch_rel32(text, next, text->len);
-  elf_patch_rel32(text, next_after_key, text->len);
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x83);
-  elf_append_u8(text, 0xc0);
-  elf_append_u8(text, 0x08);
-  size_t loop_back = elf_emit_jmp32_placeholder(text, 0xe9);
-  elf_patch_rel32(text, loop_back, env_loop);
+  z_x64_patch_rel32(text, next, text->len);
+  z_x64_patch_rel32(text, next_after_key, text->len);
+  z_x64_emit_add_reg_i8(text, 8, 8, true);
+  size_t loop_back = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, loop_back, env_loop);
 
-  elf_patch_rel32(text, none, text->len);
+  z_x64_patch_rel32(text, none, text->len);
   elf_emit_maybe_clear(text, local);
-  elf_patch_rel32(text, end, text->len);
+  z_x64_patch_rel32(text, end, text->len);
   return true;
 }
 
@@ -1812,403 +1386,357 @@ static bool elf_emit_read_all_or_raise_to_local(ZBuf *text, const IrFunction *fu
   const IrLocal *local = &fun->locals[instr->local_index];
   const IrLocal *alloc = &fun->locals[value->local_index];
   if (!elf_emit_openat_path(text, fun, value->left, 0, 0, ctx, diag)) return false;
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x85);
-  elf_append_u8(text, 0xc0);
+  z_x64_emit_test_rax_rax(text, true);
   size_t open_fail = elf_emit_js_placeholder(text);
 
-  elf_append_u8(text, 0x50);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xc7);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x31);
-  elf_append_u8(text, 0xf6);
-  elf_append_u8(text, 0xba);
-  elf_append_u32(text, 2);
-  elf_append_u8(text, 0xb8);
-  elf_append_u32(text, 8);
-  elf_append_u8(text, 0x0f);
-  elf_append_u8(text, 0x05);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x85);
-  elf_append_u8(text, 0xc0);
+  z_x64_emit_push_rax(text);
+  z_x64_emit_mov_rdi_from_rax(text);
+  z_x64_emit_xor_reg_reg(text, 6, true);
+  z_x64_emit_mov_reg_u32(text, 2, 2);
+  z_x64_emit_mov_eax_u32(text, 8);
+  z_x64_emit_syscall(text);
+  z_x64_emit_test_rax_rax(text, true);
   size_t tell_fail = elf_emit_js_placeholder(text);
   if (value->right) {
-    elf_append_u8(text, 0x50);
+    z_x64_emit_push_rax(text);
     if (!elf_emit_value(text, fun, value->right, ctx, diag)) return false;
-    elf_append_u8(text, 0x59);
-    elf_append_u8(text, 0x48);
-    elf_append_u8(text, 0x39);
-    elf_append_u8(text, 0xc1);
-    size_t size_ok = elf_emit_jcc32_placeholder(text, 0x83);
-    elf_append_u8(text, 0x58);
+    z_x64_emit_pop_reg64(text, 1);
+    z_x64_emit_cmp_reg_reg(text, 1, 0, true);
+    size_t size_ok = z_x64_emit_jcc32_placeholder(text, 0x83);
+    z_x64_emit_pop_rax(text);
     elf_emit_close_rax_fd(text);
     elf_emit_packed_error_rax(text, IR_ERROR_TOO_LARGE);
     if (!fun->raises) {
-      elf_append_u8(text, 0xb8);
-      elf_append_u32(text, 1);
+      z_x64_emit_mov_eax_u32(text, 1);
     }
-    elf_emit_epilogue(text);
-    elf_patch_rel32(text, size_ok, text->len);
+    elf_emit_epilogue(text, fun, ctx);
+    z_x64_patch_rel32(text, size_ok, text->len);
   }
-  elf_append_u8(text, 0x58);
+  z_x64_emit_pop_rax(text);
 
-  elf_append_u8(text, 0x50);
-  elf_append_u8(text, 0x50);
+  z_x64_emit_push_rax(text);
+  z_x64_emit_push_rax(text);
   elf_emit_load_local_slot_reg(text, alloc, 0, 6, true);
   elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x01);
-  elf_append_u8(text, 0xce);
+  z_x64_emit_add_reg_reg(text, 6, 1, true);
   elf_emit_load_local_slot_reg(text, alloc, 8, 2, false);
-  elf_append_u8(text, 0x29);
-  elf_append_u8(text, 0xca);
+  z_x64_emit_sub_reg_reg(text, 2, 1, false);
   if (value->right) {
     if (!elf_emit_value(text, fun, value->right, ctx, diag)) return false;
-    elf_append_u8(text, 0x39);
-    elf_append_u8(text, 0xc2);
-    size_t keep_capacity = elf_emit_jcc32_placeholder(text, 0x86);
-    elf_append_u8(text, 0x89);
-    elf_append_u8(text, 0xc2);
-    elf_patch_rel32(text, keep_capacity, text->len);
+    z_x64_emit_cmp_reg_reg(text, 2, 0, false);
+    size_t keep_capacity = z_x64_emit_jcc32_placeholder(text, 0x86);
+    z_x64_emit_mov_reg_from_reg(text, 2, 0, false);
+    z_x64_patch_rel32(text, keep_capacity, text->len);
   }
-  elf_append_u8(text, 0x5f);
-  elf_append_u8(text, 0x31);
-  elf_append_u8(text, 0xc0);
-  elf_append_u8(text, 0x0f);
-  elf_append_u8(text, 0x05);
-  elf_append_u8(text, 0x50);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x8b);
-  elf_append_u8(text, 0x44);
-  elf_append_u8(text, 0x24);
-  elf_append_u8(text, 0x08);
+  z_x64_emit_pop_reg64(text, 7);
+  z_x64_emit_xor_eax_eax(text);
+  z_x64_emit_syscall(text);
+  z_x64_emit_push_rax(text);
+  z_x64_emit_load_rsp_offset_reg(text, 0, 8, true);
   elf_emit_close_rax_fd(text);
-  elf_append_u8(text, 0x58);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x83);
-  elf_append_u8(text, 0xc4);
-  elf_append_u8(text, 0x08);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x85);
-  elf_append_u8(text, 0xc0);
+  z_x64_emit_pop_rax(text);
+  z_x64_emit_add_rsp(text, 8);
+  z_x64_emit_test_rax_rax(text, true);
   size_t read_fail = elf_emit_js_placeholder(text);
 
-  elf_append_u8(text, 0x50);
+  z_x64_emit_push_rax(text);
   elf_emit_load_local_slot_rax(text, alloc, 0);
   elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x01);
-  elf_append_u8(text, 0xc8);
+  z_x64_emit_add_rax_rcx(text, true);
   elf_emit_store_local_slot_rax(text, local, 0);
-  elf_append_u8(text, 0x58);
+  z_x64_emit_pop_rax(text);
   elf_emit_store_local_slot_rax(text, local, 8);
   elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
-  elf_append_u8(text, 0x01);
-  elf_append_u8(text, 0xc8);
+  z_x64_emit_add_rax_rcx(text, false);
   elf_emit_store_local_slot_reg(text, alloc, 12, 0, false);
-  size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
+  size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
 
-  elf_patch_rel32(text, open_fail, text->len);
+  z_x64_patch_rel32(text, open_fail, text->len);
   elf_emit_packed_error_rax(text, IR_ERROR_NOT_FOUND);
   if (!fun->raises) {
-    elf_append_u8(text, 0xb8);
-    elf_append_u32(text, 1);
+    z_x64_emit_mov_eax_u32(text, 1);
   }
-  elf_emit_epilogue(text);
+  elf_emit_epilogue(text, fun, ctx);
 
-  elf_patch_rel32(text, tell_fail, text->len);
-  elf_append_u8(text, 0x58);
+  z_x64_patch_rel32(text, tell_fail, text->len);
+  z_x64_emit_pop_rax(text);
   elf_emit_close_rax_fd(text);
   elf_emit_packed_error_rax(text, IR_ERROR_IO);
   if (!fun->raises) {
-    elf_append_u8(text, 0xb8);
-    elf_append_u32(text, 1);
+    z_x64_emit_mov_eax_u32(text, 1);
   }
-  elf_emit_epilogue(text);
+  elf_emit_epilogue(text, fun, ctx);
 
-  elf_patch_rel32(text, read_fail, text->len);
+  z_x64_patch_rel32(text, read_fail, text->len);
   elf_emit_packed_error_rax(text, IR_ERROR_IO);
   if (!fun->raises) {
-    elf_append_u8(text, 0xb8);
-    elf_append_u32(text, 1);
+    z_x64_emit_mov_eax_u32(text, 1);
   }
-  elf_emit_epilogue(text);
-  elf_patch_rel32(text, end, text->len);
+  elf_emit_epilogue(text, fun, ctx);
+  z_x64_patch_rel32(text, end, text->len);
   return true;
 }
 
-static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
-  if (instr->kind == IR_INSTR_WORLD_WRITE) {
-    return elf_emit_world_write(text, fun, instr, ctx, diag);
-  }
- if (instr->kind == IR_INSTR_LOCAL_SET) {
-    if (instr->local_index < fun->local_len && fun->locals[instr->local_index].type == IR_TYPE_BYTE_VIEW) {
-      const IrLocal *local = &fun->locals[instr->local_index];
-      if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_FS_READ_ALL) {
-        return elf_emit_read_all_or_raise_to_local(text, fun, instr, ctx, diag);
-      }
-      if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
-      elf_emit_store_local_slot_rax(text, local, 0);
-      if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
-      elf_emit_store_local_slot_rax(text, local, 8);
-      return true;
-    }
-    if (instr->local_index < fun->local_len && fun->locals[instr->local_index].type == IR_TYPE_ALLOC) {
-      const IrLocal *local = &fun->locals[instr->local_index];
-      if (!instr->value || instr->value->kind != IR_VALUE_FIXED_BUF_ALLOC) return elf_diag(diag, "direct ELF64 FixedBufAlloc local requires std.mem.fixedBufAlloc", instr->line, instr->column, "unsupported allocator initializer");
-      if (!elf_emit_byte_view_ptr(text, fun, instr->value->left, ctx, diag)) return false;
-      elf_emit_store_local_slot_rax(text, local, 0);
-      if (!elf_emit_byte_view_len(text, fun, instr->value->left, ctx, diag)) return false;
-      elf_emit_store_local_slot_reg(text, local, 8, 0, false);
-      elf_append_u8(text, 0xb8);
-      elf_append_u32(text, 0);
-      elf_emit_store_local_slot_reg(text, local, 12, 0, false);
-      return true;
-    }
-    if (instr->local_index < fun->local_len && fun->locals[instr->local_index].type == IR_TYPE_VEC) {
-      const IrLocal *local = &fun->locals[instr->local_index];
-      if (!instr->value || instr->value->kind != IR_VALUE_VEC_INIT) return elf_diag(diag, "direct ELF64 Vec local requires std.mem.vec", instr->line, instr->column, "unsupported Vec initializer");
-      if (!elf_emit_byte_view_ptr(text, fun, instr->value->left, ctx, diag)) return false;
-      elf_emit_store_local_slot_rax(text, local, 0);
-      elf_append_u8(text, 0xb8);
-      elf_append_u32(text, 0);
-      elf_emit_store_local_slot_reg(text, local, 8, 0, false);
-      if (!elf_emit_byte_view_len(text, fun, instr->value->left, ctx, diag)) return false;
-      elf_emit_store_local_slot_reg(text, local, 12, 0, false);
-      return true;
-    }
-    if (instr->local_index < fun->local_len && fun->locals[instr->local_index].type == IR_TYPE_MAYBE_BYTE_VIEW) {
-      const IrLocal *local = &fun->locals[instr->local_index];
-      if (instr->value && instr->value->kind == IR_VALUE_FS_TEMP_NAME) {
-        const IrValue *buf = instr->value->left;
-        const IrValue *prefix = instr->value->right;
-        if (!buf || buf->kind != IR_VALUE_ARRAY_BYTE_VIEW || buf->array_index >= fun->local_len) {
-          return elf_diag(diag, "direct ELF64 std.fs.tempName requires a caller-provided fixed byte buffer", instr->line, instr->column, "unsupported temp buffer");
-        }
-        const IrLocal *buf_local = &fun->locals[buf->array_index];
-        if (!buf_local->is_array || buf_local->element_type != IR_TYPE_U8) {
-          return elf_diag(diag, "direct ELF64 std.fs.tempName buffer must be [N]u8", instr->line, instr->column, "non-byte temp buffer");
-        }
-        unsigned prefix_len = 0;
-        if (!elf_byte_view_const_len(fun, prefix, &prefix_len)) {
-          return elf_diag(diag, "direct ELF64 std.fs.tempName currently requires a literal prefix", instr->line, instr->column, "dynamic prefix");
-        }
-        unsigned char last = 0;
-        if (prefix_len > 0 && elf_byte_view_const_byte(ctx ? ctx->ir : NULL, fun, prefix, prefix_len - 1, &last) && last == 0) prefix_len--;
-        unsigned total_len = prefix_len + 4;
-        if (buf_local->array_len <= total_len) {
-          elf_emit_maybe_clear(text, local);
-          return true;
-        }
-        elf_emit_lea_array_base_rax(text, buf_local);
-        for (unsigned i = 0; i < prefix_len; i++) {
-          unsigned char byte = 0;
-          if (!elf_byte_view_const_byte(ctx ? ctx->ir : NULL, fun, prefix, i, &byte)) {
-            return elf_diag(diag, "direct ELF64 std.fs.tempName prefix byte is unavailable", instr->line, instr->column, "unavailable prefix");
-          }
-          elf_append_u8(text, 0xc6);
-          elf_append_u8(text, 0x80);
-          elf_append_u32(text, i);
-          elf_append_u8(text, byte);
-        }
-        const unsigned char suffix[] = {'-', 't', 'm', 'p', 0};
-        for (unsigned i = 0; i < sizeof(suffix); i++) {
-          elf_append_u8(text, 0xc6);
-          elf_append_u8(text, 0x80);
-          elf_append_u32(text, prefix_len + i);
-          elf_append_u8(text, suffix[i]);
-        }
-        elf_append_u8(text, 0x50);
-        elf_append_u8(text, 0xb8);
-        elf_append_u32(text, 1);
-        elf_emit_store_local_slot_reg(text, local, 0, 0, false);
-        elf_append_u8(text, 0x58);
-        elf_emit_store_local_slot_rax(text, local, 8);
-        elf_append_u8(text, 0xb8);
-        elf_append_u32(text, total_len);
-        elf_emit_store_local_slot_reg(text, local, 16, 0, false);
-        return true;
-      }
-      if (instr->value && instr->value->kind == IR_VALUE_ARGS_GET) {
-        return elf_emit_args_get_to_local(text, fun, instr->value, local, ctx, diag);
-      }
-      if (instr->value && instr->value->kind == IR_VALUE_ENV_GET) {
-        return elf_emit_env_get_to_local(text, fun, instr->value, local, ctx, diag);
-      }
-      if (instr->value && instr->value->kind == IR_VALUE_FS_READ_ALL) {
-        if (instr->value->local_index >= fun->local_len || fun->locals[instr->value->local_index].type != IR_TYPE_ALLOC) return elf_diag(diag, "direct ELF64 std.fs.readAll allocator is invalid", instr->line, instr->column, "invalid allocator");
-        const IrLocal *alloc = &fun->locals[instr->value->local_index];
-        if (!elf_emit_openat_path(text, fun, instr->value->left, 0, 0, ctx, diag)) return false;
-        elf_append_u8(text, 0x48);
-        elf_append_u8(text, 0x85);
-        elf_append_u8(text, 0xc0);
-        size_t open_fail = elf_emit_js_placeholder(text);
-        elf_append_u8(text, 0x50);
-        elf_emit_load_local_slot_reg(text, alloc, 0, 6, true);
-        elf_emit_load_local_slot_reg(text, alloc, 8, 2, false);
-        elf_append_u8(text, 0x5f);
-        elf_append_u8(text, 0x31);
-        elf_append_u8(text, 0xc0);
-        elf_append_u8(text, 0x0f);
-        elf_append_u8(text, 0x05);
-        elf_append_u8(text, 0x50);
-        elf_emit_load_local_rax(text, fun, instr->value->local_index);
-        (void)alloc;
-        elf_append_u8(text, 0x48);
-        elf_append_u8(text, 0x89);
-        elf_append_u8(text, 0xf8);
-        elf_emit_close_rax_fd(text);
-        elf_append_u8(text, 0x58);
-        elf_append_u8(text, 0x48);
-        elf_append_u8(text, 0x85);
-        elf_append_u8(text, 0xc0);
-        size_t read_fail = elf_emit_js_placeholder(text);
-        elf_append_u8(text, 0x50);
-        elf_append_u8(text, 0xb8);
-        elf_append_u32(text, 1);
-        elf_emit_store_local_slot_reg(text, local, 0, 0, false);
-        elf_emit_load_local_slot_reg(text, alloc, 0, 0, true);
-        elf_emit_store_local_slot_reg(text, local, 8, 0, true);
-        elf_append_u8(text, 0x58);
-        elf_emit_store_local_slot_reg(text, local, 16, 0, false);
-        elf_emit_store_local_slot_reg(text, alloc, 12, 0, false);
-        size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
-        elf_patch_rel32(text, open_fail, text->len);
-        elf_patch_rel32(text, read_fail, text->len);
-        elf_emit_maybe_clear(text, local);
-        elf_patch_rel32(text, end, text->len);
-        return true;
-      }
-      if (!instr->value || instr->value->kind != IR_VALUE_ALLOC_BYTES || instr->value->local_index >= fun->local_len || fun->locals[instr->value->local_index].type != IR_TYPE_ALLOC) return elf_diag(diag, "direct ELF64 allocation source is invalid", instr->line, instr->column, "invalid allocation");
-      const IrLocal *alloc = &fun->locals[instr->value->local_index];
-      if (!elf_emit_value(text, fun, instr->value->left, ctx, diag)) return false;
-      elf_append_u8(text, 0x50);
-      elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
-      elf_emit_load_local_slot_reg(text, alloc, 0, 2, true);
-      elf_append_u8(text, 0x48);
-      elf_append_u8(text, 0x01);
-      elf_append_u8(text, 0xca);
-      elf_append_u8(text, 0xb8);
-      elf_append_u32(text, 1);
-      elf_emit_store_local_slot_reg(text, local, 0, 0, false);
-      elf_emit_store_local_slot_reg(text, local, 8, 2, true);
-      elf_append_u8(text, 0x58);
-      elf_emit_store_local_slot_reg(text, local, 16, 0, false);
-      elf_append_u8(text, 0x01);
-      elf_append_u8(text, 0xc1);
-      elf_emit_store_local_slot_reg(text, alloc, 12, 1, false);
-      return true;
-    }
-    if (instr->local_index < fun->local_len && fun->locals[instr->local_index].type == IR_TYPE_MAYBE_SCALAR) {
-      const IrLocal *local = &fun->locals[instr->local_index];
-      if (!instr->value) return elf_diag(diag, "direct ELF64 Maybe scalar initializer is missing", instr->line, instr->column, "missing maybe value");
-      if (instr->value->kind == IR_VALUE_MAYBE_SCALAR_LITERAL) {
-        elf_append_u8(text, 0xb8);
-        elf_append_u32(text, instr->value->data_len ? 1u : 0u);
-        elf_emit_store_local_slot_reg(text, local, 0, 0, false);
-        elf_append_u8(text, 0xb8);
-        elf_append_u32(text, (uint32_t)instr->value->int_value);
-        elf_emit_store_local_slot_reg(text, local, 8, 0, true);
-        return true;
-      }
-      if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-      elf_append_u8(text, 0x48);
-      elf_append_u8(text, 0x85);
-      elf_append_u8(text, 0xc0);
-      size_t fail = elf_emit_js_placeholder(text);
-      elf_emit_maybe_scalar_store_rax(text, local);
-      size_t end = elf_emit_jmp32_placeholder(text, 0xe9);
-      elf_patch_rel32(text, fail, text->len);
-      elf_emit_maybe_scalar_clear(text, local);
-      elf_patch_rel32(text, end, text->len);
-      return true;
-    }
-    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    elf_emit_store_local_from_reg(text, fun, instr->local_index, 0);
+static bool elf_emit_byte_view_local_set(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (instr->value && instr->value->kind == IR_VALUE_CHECK && instr->value->left && instr->value->left->kind == IR_VALUE_FS_READ_ALL) return elf_emit_read_all_or_raise_to_local(text, fun, instr, ctx, diag);
+  if (!elf_emit_byte_view_ptr(text, fun, instr->value, ctx, diag)) return false;
+  elf_emit_store_local_slot_rax(text, local, 0);
+  if (!elf_emit_byte_view_len(text, fun, instr->value, ctx, diag)) return false;
+  elf_emit_store_local_slot_rax(text, local, 8);
+  return true;
+}
+
+static bool elf_emit_alloc_local_set(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!instr->value || instr->value->kind != IR_VALUE_FIXED_BUF_ALLOC) return elf_diag(diag, "direct ELF64 FixedBufAlloc local requires std.mem.fixedBufAlloc", instr->line, instr->column, "unsupported allocator initializer");
+  if (!elf_emit_byte_view_ptr(text, fun, instr->value->left, ctx, diag)) return false;
+  elf_emit_store_local_slot_rax(text, local, 0);
+  if (!elf_emit_byte_view_len(text, fun, instr->value->left, ctx, diag)) return false;
+  elf_emit_store_local_slot_reg(text, local, 8, 0, false);
+  z_x64_emit_mov_eax_u32(text, 0);
+  elf_emit_store_local_slot_reg(text, local, 12, 0, false);
+  return true;
+}
+
+static bool elf_emit_vec_local_set(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!instr->value || instr->value->kind != IR_VALUE_VEC_INIT) return elf_diag(diag, "direct ELF64 Vec local requires std.mem.vec", instr->line, instr->column, "unsupported Vec initializer");
+  if (!elf_emit_byte_view_ptr(text, fun, instr->value->left, ctx, diag)) return false;
+  elf_emit_store_local_slot_rax(text, local, 0);
+  z_x64_emit_mov_eax_u32(text, 0);
+  elf_emit_store_local_slot_reg(text, local, 8, 0, false);
+  if (!elf_emit_byte_view_len(text, fun, instr->value->left, ctx, diag)) return false;
+  elf_emit_store_local_slot_reg(text, local, 12, 0, false);
+  return true;
+}
+
+static bool elf_emit_temp_name_to_local(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrValue *buf = instr->value->left;
+  const IrValue *prefix = instr->value->right;
+  if (!buf || buf->kind != IR_VALUE_ARRAY_BYTE_VIEW || buf->array_index >= fun->local_len) return elf_diag(diag, "direct ELF64 std.fs.tempName requires a caller-provided fixed byte buffer", instr->line, instr->column, "unsupported temp buffer");
+  const IrLocal *buf_local = &fun->locals[buf->array_index];
+  if (!buf_local->is_array || buf_local->element_type != IR_TYPE_U8) return elf_diag(diag, "direct ELF64 std.fs.tempName buffer must be [N]u8", instr->line, instr->column, "non-byte temp buffer");
+  unsigned prefix_len = 0;
+  if (!elf_byte_view_const_len(fun, prefix, &prefix_len)) return elf_diag(diag, "direct ELF64 std.fs.tempName currently requires a literal prefix", instr->line, instr->column, "dynamic prefix");
+  unsigned char last = 0;
+  if (prefix_len > 0 && elf_byte_view_const_byte(ctx ? ctx->ir : NULL, fun, prefix, prefix_len - 1, &last) && last == 0) prefix_len--;
+  unsigned total_len = prefix_len + 4;
+  if (buf_local->array_len <= total_len) {
+    elf_emit_maybe_clear(text, local);
     return true;
   }
+  elf_emit_lea_array_base_rax(text, buf_local);
+  for (unsigned i = 0; i < prefix_len; i++) {
+    unsigned char byte = 0;
+    if (!elf_byte_view_const_byte(ctx ? ctx->ir : NULL, fun, prefix, i, &byte)) return elf_diag(diag, "direct ELF64 std.fs.tempName prefix byte is unavailable", instr->line, instr->column, "unavailable prefix");
+    z_x64_emit_mov_ptr_reg_disp_u8(text, 0, i, byte);
+  }
+  const unsigned char suffix[] = {'-', 't', 'm', 'p', 0};
+  for (unsigned i = 0; i < sizeof(suffix); i++) z_x64_emit_mov_ptr_reg_disp_u8(text, 0, prefix_len + i, suffix[i]);
+  z_x64_emit_push_rax(text);
+  z_x64_emit_mov_eax_u32(text, 1);
+  elf_emit_store_local_slot_reg(text, local, 0, 0, false);
+  z_x64_emit_pop_rax(text);
+  elf_emit_store_local_slot_rax(text, local, 8);
+  z_x64_emit_mov_eax_u32(text, total_len);
+  elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+  return true;
+}
+
+static bool elf_emit_fs_read_all_to_local(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrValue *value = instr->value;
+  if (value->local_index >= fun->local_len || fun->locals[value->local_index].type != IR_TYPE_ALLOC) return elf_diag(diag, "direct ELF64 std.fs.readAll allocator is invalid", instr->line, instr->column, "invalid allocator");
+  const IrLocal *alloc = &fun->locals[value->local_index];
+  if (!elf_emit_openat_path(text, fun, value->left, 0, 0, ctx, diag)) return false;
+  z_x64_emit_test_rax_rax(text, true);
+  size_t open_fail = elf_emit_js_placeholder(text);
+  z_x64_emit_push_rax(text);
+  elf_emit_load_local_slot_reg(text, alloc, 0, 6, true);
+  elf_emit_load_local_slot_reg(text, alloc, 8, 2, false);
+  z_x64_emit_pop_reg64(text, 7);
+  z_x64_emit_xor_eax_eax(text);
+  z_x64_emit_syscall(text);
+  z_x64_emit_push_rax(text);
+  elf_emit_load_local_rax(text, fun, value->local_index);
+  z_x64_emit_mov_rax_from_rdi(text);
+  elf_emit_close_rax_fd(text);
+  z_x64_emit_pop_rax(text);
+  z_x64_emit_test_rax_rax(text, true);
+  size_t read_fail = elf_emit_js_placeholder(text);
+  z_x64_emit_push_rax(text);
+  z_x64_emit_mov_eax_u32(text, 1);
+  elf_emit_store_local_slot_reg(text, local, 0, 0, false);
+  elf_emit_load_local_slot_reg(text, alloc, 0, 0, true);
+  elf_emit_store_local_slot_reg(text, local, 8, 0, true);
+  z_x64_emit_pop_rax(text);
+  elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+  elf_emit_store_local_slot_reg(text, alloc, 12, 0, false);
+  size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, open_fail, text->len);
+  z_x64_patch_rel32(text, read_fail, text->len);
+  elf_emit_maybe_clear(text, local);
+  z_x64_patch_rel32(text, end, text->len);
+  return true;
+}
+
+static bool elf_emit_alloc_bytes_to_local(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrValue *value = instr->value;
+  if (!value || value->kind != IR_VALUE_ALLOC_BYTES || value->local_index >= fun->local_len || fun->locals[value->local_index].type != IR_TYPE_ALLOC) return elf_diag(diag, "direct ELF64 allocation source is invalid", instr->line, instr->column, "invalid allocation");
+  const IrLocal *alloc = &fun->locals[value->local_index];
+  if (!elf_emit_value(text, fun, value->left, ctx, diag)) return false;
+  z_x64_emit_push_rax(text);
+  elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
+  elf_emit_load_local_slot_reg(text, alloc, 0, 2, true);
+  z_x64_emit_add_rdx_rcx(text, true);
+  z_x64_emit_mov_eax_u32(text, 1);
+  elf_emit_store_local_slot_reg(text, local, 0, 0, false);
+  elf_emit_store_local_slot_reg(text, local, 8, 2, true);
+  z_x64_emit_pop_rax(text);
+  elf_emit_store_local_slot_reg(text, local, 16, 0, false);
+  z_x64_emit_add_reg_reg(text, 1, 0, false);
+  elf_emit_store_local_slot_reg(text, alloc, 12, 1, false);
+  return true;
+}
+
+static bool elf_emit_maybe_byte_view_local_set(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (instr->value && instr->value->kind == IR_VALUE_FS_TEMP_NAME) return elf_emit_temp_name_to_local(text, fun, instr, local, ctx, diag);
+  if (instr->value && instr->value->kind == IR_VALUE_ARGS_GET) return elf_emit_args_get_to_local(text, fun, instr->value, local, ctx, diag);
+  if (instr->value && instr->value->kind == IR_VALUE_ENV_GET) return elf_emit_env_get_to_local(text, fun, instr->value, local, ctx, diag);
+  if (instr->value && instr->value->kind == IR_VALUE_FS_READ_ALL) return elf_emit_fs_read_all_to_local(text, fun, instr, local, ctx, diag);
+  return elf_emit_alloc_bytes_to_local(text, fun, instr, local, ctx, diag);
+}
+
+static bool elf_emit_maybe_scalar_local_set(ZBuf *text, const IrFunction *fun, const IrInstr *instr, const IrLocal *local, ElfEmitContext *ctx, ZDiag *diag) {
+  if (!instr->value) return elf_diag(diag, "direct ELF64 Maybe scalar initializer is missing", instr->line, instr->column, "missing maybe value");
+  if (instr->value->kind == IR_VALUE_MAYBE_SCALAR_LITERAL) {
+    z_x64_emit_mov_eax_u32(text, instr->value->data_len ? 1u : 0u);
+    elf_emit_store_local_slot_reg(text, local, 0, 0, false);
+    z_x64_emit_mov_eax_u32(text, (uint32_t)instr->value->int_value);
+    elf_emit_store_local_slot_reg(text, local, 8, 0, true);
+    return true;
+  }
+  if (instr->value->kind == IR_VALUE_JSON_PARSE_BYTES) {
+    if (instr->value->local_index >= fun->local_len || fun->locals[instr->value->local_index].type != IR_TYPE_ALLOC) return elf_diag(diag, "direct ELF64 JSON parse allocator is invalid", instr->line, instr->column, "invalid allocator");
+    const IrLocal *alloc = &fun->locals[instr->value->local_index];
+    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+    z_x64_emit_test_rax_rax(text, true);
+    size_t fail = elf_emit_js_placeholder(text);
+    z_x64_emit_push_rax(text);
+    elf_emit_load_local_slot_reg(text, alloc, 12, 1, false);
+    z_x64_emit_add_reg_reg(text, 1, 0, false);
+    elf_emit_load_local_slot_reg(text, alloc, 8, 2, false);
+    z_x64_emit_cmp_reg_reg(text, 1, 2, false);
+    size_t overflow = z_x64_emit_jcc32_placeholder(text, 0x87);
+    z_x64_emit_pop_rax(text);
+    elf_emit_maybe_scalar_store_rax(text, local);
+    elf_emit_store_local_slot_reg(text, alloc, 12, 1, false);
+    size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
+    z_x64_patch_rel32(text, overflow, text->len);
+    z_x64_emit_pop_rax(text);
+    z_x64_patch_rel32(text, fail, text->len);
+    elf_emit_maybe_scalar_clear(text, local);
+    z_x64_patch_rel32(text, end, text->len);
+    return true;
+  }
+  if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+  z_x64_emit_test_rax_rax(text, true);
+  size_t fail = elf_emit_js_placeholder(text);
+  elf_emit_maybe_scalar_store_rax(text, local);
+  size_t end = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, fail, text->len);
+  elf_emit_maybe_scalar_clear(text, local);
+  z_x64_patch_rel32(text, end, text->len);
+  return true;
+}
+
+static bool elf_emit_local_set_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
+  const IrLocal *local = instr->local_index < fun->local_len ? &fun->locals[instr->local_index] : NULL;
+  if (local && local->type == IR_TYPE_BYTE_VIEW) return elf_emit_byte_view_local_set(text, fun, instr, local, ctx, diag);
+  if (local && local->type == IR_TYPE_ALLOC) return elf_emit_alloc_local_set(text, fun, instr, local, ctx, diag);
+  if (local && local->type == IR_TYPE_VEC) return elf_emit_vec_local_set(text, fun, instr, local, ctx, diag);
+  if (local && local->type == IR_TYPE_MAYBE_BYTE_VIEW) return elf_emit_maybe_byte_view_local_set(text, fun, instr, local, ctx, diag);
+  if (local && local->type == IR_TYPE_MAYBE_SCALAR) return elf_emit_maybe_scalar_local_set(text, fun, instr, local, ctx, diag);
+  if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+  elf_emit_store_local_from_reg(text, fun, instr->local_index, 0);
+  return true;
+}
+
+static bool elf_emit_store_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
   if (instr->kind == IR_INSTR_INDEX_STORE) {
     if (instr->array_index >= fun->local_len) return elf_diag(diag, "direct ELF64 indexed store array is out of range", instr->line, instr->column, "invalid array local");
     const IrLocal *local = &fun->locals[instr->array_index];
     if (!elf_emit_bounds_checked_address(text, fun, local, instr->index, ctx, diag)) return false;
-    elf_append_u8(text, 0x50);
+    z_x64_emit_push_rax(text);
     if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    elf_append_u8(text, 0x59);
-    if (local->element_type == IR_TYPE_U8) {
-      elf_append_u8(text, 0x88);
-      elf_append_u8(text, 0x01);
-    } else if (elf_type_is_i64(local->element_type)) {
-      elf_append_u8(text, 0x48);
-      elf_append_u8(text, 0x89);
-      elf_append_u8(text, 0x01);
-    } else {
-      elf_append_u8(text, 0x89);
-      elf_append_u8(text, 0x01);
-    }
+    z_x64_emit_pop_reg64(text, 1);
+    if (local->element_type == IR_TYPE_U8) z_x64_emit_store_ptr_reg8_from_reg(text, 1, 0);
+    else if (elf_type_is_i64(local->element_type)) z_x64_emit_store_ptr_reg_from_reg(text, 1, 0, true);
+    else z_x64_emit_store_ptr_reg_from_reg(text, 1, 0, false);
     return true;
   }
-  if (instr->kind == IR_INSTR_FIELD_STORE) {
-    if (instr->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 field store record is out of range", instr->line, instr->column, "invalid record local");
-    const IrLocal *local = &fun->locals[instr->local_index];
-    if (!local->is_record) return elf_diag(diag, "direct ELF64 field store requires record local", instr->line, instr->column, "non-record local");
-    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    elf_emit_store_field_from_rax(text, local, instr->field_offset, instr->value ? instr->value->type : IR_TYPE_I32);
-    return true;
+  if (instr->local_index >= fun->local_len) return elf_diag(diag, "direct ELF64 field store record is out of range", instr->line, instr->column, "invalid record local");
+  const IrLocal *local = &fun->locals[instr->local_index];
+  if (!local->is_record) return elf_diag(diag, "direct ELF64 field store requires record local", instr->line, instr->column, "non-record local");
+  if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+  elf_emit_store_field_from_rax(text, local, instr->field_offset, instr->value ? instr->value->type : IR_TYPE_I32);
+  return true;
+}
+
+static bool elf_emit_terminal_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (instr->kind) {
+    case IR_INSTR_EXPR:
+      if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+      return true;
+    case IR_INSTR_RAISE:
+      if (!elf_function_propagates_to_process_exit(fun)) return elf_diag(diag, "direct ELF64 raise requires a fallible function context", instr->line, instr->column, "non-fallible context");
+      elf_emit_packed_error_rax(text, instr->error_code ? instr->error_code : IR_ERROR_UNKNOWN);
+      elf_emit_epilogue(text, fun, ctx);
+      return true;
+    case IR_INSTR_RETURN:
+      if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+      if (fun->raises && !instr->value) z_x64_emit_xor_rax_rax(text);
+      else if (fun->raises && instr->value && !elf_type_is_i64(instr->value->type)) z_x64_emit_mov_reg_from_reg(text, 0, 0, false);
+      elf_emit_epilogue(text, fun, ctx);
+      return true;
+    default:
+      return elf_diag(diag, "direct ELF64 terminal instruction kind is invalid for this helper", instr->line, instr->column, "invalid terminal instruction");
   }
-  if (instr->kind == IR_INSTR_EXPR) {
-    if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    return true;
-  }
-  if (instr->kind == IR_INSTR_RAISE) {
-    if (!elf_function_propagates_to_process_exit(fun)) return elf_diag(diag, "direct ELF64 raise requires a fallible function context", instr->line, instr->column, "non-fallible context");
-    elf_emit_packed_error_rax(text, instr->error_code ? instr->error_code : IR_ERROR_UNKNOWN);
-    elf_emit_epilogue(text);
-    return true;
-  }
-  if (instr->kind == IR_INSTR_RETURN) {
-    if (instr->value && !elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    if (fun->raises && !instr->value) {
-      elf_append_u8(text, 0x48);
-      elf_append_u8(text, 0x31);
-      elf_append_u8(text, 0xc0);
-    } else if (fun->raises && instr->value && !elf_type_is_i64(instr->value->type)) {
-      elf_append_u8(text, 0x89);
-      elf_append_u8(text, 0xc0);
-    }
-    elf_emit_epilogue(text);
-    return true;
-  }
+}
+
+static bool elf_emit_control_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
   if (instr->kind == IR_INSTR_IF) {
     if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    elf_append_u8(text, 0x85);
-    elf_append_u8(text, 0xc0);
-    size_t false_patch = elf_emit_jcc32_placeholder(text, 0x84);
+    z_x64_emit_test_rax_rax(text, false);
+    size_t false_patch = z_x64_emit_jcc32_placeholder(text, 0x84);
     if (!elf_emit_instrs(text, fun, instr->then_instrs, instr->then_len, ctx, diag)) return false;
     if (instr->else_len > 0) {
-      size_t end_patch = elf_emit_jmp32_placeholder(text, 0xe9);
-      elf_patch_rel32(text, false_patch, text->len);
+      size_t end_patch = z_x64_emit_jmp32_placeholder(text, 0xe9);
+      z_x64_patch_rel32(text, false_patch, text->len);
       if (!elf_emit_instrs(text, fun, instr->else_instrs, instr->else_len, ctx, diag)) return false;
-      elf_patch_rel32(text, end_patch, text->len);
+      z_x64_patch_rel32(text, end_patch, text->len);
     } else {
-      elf_patch_rel32(text, false_patch, text->len);
+      z_x64_patch_rel32(text, false_patch, text->len);
     }
     return true;
   }
-  if (instr->kind == IR_INSTR_WHILE) {
-    size_t loop_start = text->len;
-    if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
-    elf_append_u8(text, 0x85);
-    elf_append_u8(text, 0xc0);
-    size_t exit_patch = elf_emit_jcc32_placeholder(text, 0x84);
-    if (!elf_emit_instrs(text, fun, instr->then_instrs, instr->then_len, ctx, diag)) return false;
-    size_t back_patch = elf_emit_jmp32_placeholder(text, 0xe9);
-    elf_patch_rel32(text, back_patch, loop_start);
-    elf_patch_rel32(text, exit_patch, text->len);
-    return true;
+  size_t loop_start = text->len;
+  if (!elf_emit_value(text, fun, instr->value, ctx, diag)) return false;
+  z_x64_emit_test_rax_rax(text, false);
+  size_t exit_patch = z_x64_emit_jcc32_placeholder(text, 0x84);
+  if (!elf_emit_instrs(text, fun, instr->then_instrs, instr->then_len, ctx, diag)) return false;
+  size_t back_patch = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, back_patch, loop_start);
+  z_x64_patch_rel32(text, exit_patch, text->len);
+  return true;
+}
+
+static bool elf_emit_instr(ZBuf *text, const IrFunction *fun, const IrInstr *instr, ElfEmitContext *ctx, ZDiag *diag) {
+  switch (instr->kind) {
+    case IR_INSTR_WORLD_WRITE: return elf_emit_world_write(text, fun, instr, ctx, diag);
+    case IR_INSTR_LOCAL_SET: return elf_emit_local_set_instr(text, fun, instr, ctx, diag);
+    case IR_INSTR_INDEX_STORE: case IR_INSTR_FIELD_STORE: return elf_emit_store_instr(text, fun, instr, ctx, diag);
+    case IR_INSTR_EXPR: case IR_INSTR_RAISE: case IR_INSTR_RETURN: return elf_emit_terminal_instr(text, fun, instr, ctx, diag);
+    case IR_INSTR_IF: case IR_INSTR_WHILE: return elf_emit_control_instr(text, fun, instr, ctx, diag);
+    default: return elf_diag(diag, "direct ELF64 instruction kind is unsupported", instr->line, instr->column, "unsupported instruction");
   }
-  return elf_diag(diag, "direct ELF64 instruction kind is unsupported", instr->line, instr->column, "unsupported instruction");
 }
 
 static bool elf_emit_instrs(ZBuf *text, const IrFunction *fun, const IrInstr *instrs, size_t len, ElfEmitContext *ctx, ZDiag *diag) {
@@ -2220,50 +1748,32 @@ static bool elf_emit_instrs(ZBuf *text, const IrFunction *fun, const IrInstr *in
 
 static bool elf_emit_function_text(ZBuf *text, const IrFunction *fun, ElfEmitContext *ctx, ZDiag *diag) {
   static const unsigned param_regs[] = {7, 6, 2, 1, 8, 9};
-  elf_append_u8(text, 0x55);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xe5);
-  unsigned stack_size = (unsigned)elf_align(fun->frame_bytes, 16);
-  if (stack_size > 0) {
-    if (stack_size <= 127) {
-      elf_append_u8(text, 0x48);
-      elf_append_u8(text, 0x83);
-      elf_append_u8(text, 0xec);
-      elf_append_u8(text, stack_size);
-    } else {
-      elf_append_u8(text, 0x48);
-      elf_append_u8(text, 0x81);
-      elf_append_u8(text, 0xec);
-      elf_append_u32(text, stack_size);
-    }
+  bool seed_process_args = elf_function_seeds_process_args(fun, ctx);
+  unsigned base_stack_size = elf_base_stack_size(fun);
+  unsigned stack_size = elf_total_stack_size(fun, ctx);
+  z_x64_emit_prologue(text, stack_size);
+  if (seed_process_args) {
+    z_x64_emit_rbp_disp_reg(text, 0x89, 13, base_stack_size + 8, true);
+    z_x64_emit_rbp_disp_reg(text, 0x89, 14, base_stack_size + 16, true);
+    z_x64_emit_rbp_disp_reg(text, 0x89, 15, base_stack_size + 24, true);
+    z_x64_emit_push_reg64(text, 7);
+    z_x64_emit_pop_reg64(text, 14);
+    z_x64_emit_push_reg64(text, 6);
+    z_x64_emit_pop_reg64(text, 15);
+    z_x64_emit_push_reg64(text, 2);
+    z_x64_emit_pop_reg64(text, 13);
   }
   for (size_t i = 0; i < fun->param_count; i++) {
     if (i < 6) {
       elf_emit_store_local_from_reg(text, fun, (unsigned)i, param_regs[i]);
     } else {
-      elf_emit_load_rbp_positive_reg(text, 0, 16u + (unsigned)(i - 6u) * 8u, false);
+      z_x64_emit_load_rbp_positive_reg(text, 0, 16u + (unsigned)(i - 6u) * 8u, false);
       elf_emit_store_local_from_reg(text, fun, (unsigned)i, 0);
     }
   }
   if (!elf_emit_instrs(text, fun, fun->instrs, fun->instr_len, ctx, diag)) return false;
-  if (fun->instr_len == 0 || fun->instrs[fun->instr_len - 1].kind != IR_INSTR_RETURN) elf_emit_epilogue(text);
+  if (fun->instr_len == 0 || fun->instrs[fun->instr_len - 1].kind != IR_INSTR_RETURN) elf_emit_epilogue(text, fun, ctx);
   return true;
-}
-
-static void elf_append_symbol(ZBuf *symtab, uint32_t name, unsigned char info, uint16_t shndx, uint64_t value, uint64_t size) {
-  elf_append_u32(symtab, name);
-  elf_append_u8(symtab, info);
-  elf_append_u8(symtab, 0);
-  elf_append_u16(symtab, shndx);
-  elf_append_u64(symtab, value);
-  elf_append_u64(symtab, size);
-}
-
-static void elf_append_rela(ZBuf *rela, uint64_t offset, uint32_t sym, uint32_t type, int64_t addend) {
-  elf_append_u64(rela, offset);
-  elf_append_u64(rela, ((uint64_t)sym << 32) | type);
-  elf_append_u64(rela, (uint64_t)addend);
 }
 
 static unsigned elf_rodata_base_offset(const IrProgram *ir) {
@@ -2278,22 +1788,9 @@ static unsigned elf_rodata_base_offset(const IrProgram *ir) {
 static void elf_append_rodata(ZBuf *rodata, const IrProgram *ir, unsigned base_offset) {
   for (size_t i = 0; ir && i < ir->data_segment_len; i++) {
     const IrDataSegment *segment = &ir->data_segments[i];
-    elf_pad_to(rodata, segment->offset - base_offset);
-    elf_append_bytes(rodata, segment->bytes, segment->len);
+    z_elf_pad_to(rodata, segment->offset - base_offset);
+    z_elf_append_bytes(rodata, segment->bytes, segment->len);
   }
-}
-
-static void elf_append_section_header(ZBuf *out, uint32_t name, uint32_t type, uint64_t flags, uint64_t offset, uint64_t size, uint32_t link, uint32_t info, uint64_t align, uint64_t entsize) {
-  elf_append_u32(out, name);
-  elf_append_u32(out, type);
-  elf_append_u64(out, flags);
-  elf_append_u64(out, 0);
-  elf_append_u64(out, offset);
-  elf_append_u64(out, size);
-  elf_append_u32(out, link);
-  elf_append_u32(out, info);
-  elf_append_u64(out, align);
-  elf_append_u64(out, entsize);
 }
 
 bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
@@ -2312,25 +1809,23 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   ZBuf rela_text;
   ZBuf strtab;
   ZBuf symtab;
-  ZBuf shstrtab;
   zbuf_init(&text);
   zbuf_init(&rodata);
   zbuf_init(&rela_text);
   zbuf_init(&strtab);
   zbuf_init(&symtab);
-  zbuf_init(&shstrtab);
-  elf_append_u8(&strtab, 0);
-  elf_append_zeros(&symtab, 24);
+  z_elf_append_u8(&strtab, 0);
+  z_elf_append_zeros(&symtab, 24);
   bool has_rodata = ir->readonly_data_bytes > 0 || ir->data_segment_len > 0;
   unsigned rodata_base_offset = elf_rodata_base_offset(ir);
   if (has_rodata) {
     elf_append_rodata(&rodata, ir, rodata_base_offset);
-    elf_append_symbol(&symtab, 0, 0x03, 2, 0, 0);
+    z_elf_append_symbol(&symtab, 0, 0x03, 2, 0, 0);
   }
 
-  size_t *function_offsets = calloc(ir->function_len, sizeof(size_t));
-  size_t *function_sizes = calloc(ir->function_len, sizeof(size_t));
-  uint32_t *symbol_names = calloc(ir->function_len, sizeof(uint32_t));
+  size_t *function_offsets = z_checked_calloc(ir->function_len, sizeof(size_t));
+  size_t *function_sizes = z_checked_calloc(ir->function_len, sizeof(size_t));
+  uint32_t *symbol_names = z_checked_calloc(ir->function_len, sizeof(uint32_t));
   if (!function_offsets || !function_sizes || !symbol_names) {
     free(function_offsets);
     free(function_sizes);
@@ -2340,7 +1835,6 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
     zbuf_free(&rela_text);
     zbuf_free(&strtab);
     zbuf_free(&symtab);
-    zbuf_free(&shstrtab);
     return elf_diag(diag, "direct ELF64 object backend ran out of memory", 1, 1, "allocation failed");
   }
   ElfEmitContext ctx = {
@@ -2348,133 +1842,80 @@ bool z_emit_elf64_object_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
     .function_offsets = function_offsets,
     .function_count = ir->function_len,
     .emit_rodata_relocations = true,
+    .seed_main_process_args = true,
     .rodata_base_offset = rodata_base_offset
   };
 
   for (size_t i = 0; i < ir->function_len; i++) {
-    elf_pad_to(&text, elf_align(text.len, 16));
+    z_elf_pad_to(&text, z_elf_align(text.len, 16));
     function_offsets[i] = text.len;
     if (!elf_emit_function_text(&text, &ir->functions[i], &ctx, diag)) {
       free(function_offsets);
       free(function_sizes);
       free(symbol_names);
-      free(ctx.call_patches);
-      free(ctx.rodata_patches);
+      z_elf_emit_context_free(&ctx);
       zbuf_free(&text);
       zbuf_free(&rodata);
       zbuf_free(&rela_text);
       zbuf_free(&strtab);
       zbuf_free(&symtab);
-      zbuf_free(&shstrtab);
       return false;
     }
     function_sizes[i] = text.len - function_offsets[i];
     symbol_names[i] = (uint32_t)strtab.len;
     zbuf_append(&strtab, ir->functions[i].name);
-    elf_append_u8(&strtab, 0);
+    z_elf_append_u8(&strtab, 0);
   }
-  elf_patch_call_patches(&text, &ctx);
-  for (size_t i = 0; i < ctx.rodata_patch_len; i++) {
-    elf_append_rela(&rela_text, ctx.rodata_patches[i].patch_offset, 1, 1, ctx.rodata_patches[i].data_offset - ctx.rodata_base_offset);
+  uint32_t runtime_names[ELF_RUNTIME_HELPER_COUNT] = {0};
+  for (unsigned helper = 0; helper < ELF_RUNTIME_HELPER_COUNT; helper++) {
+    ElfRuntimeHelper runtime_helper = (ElfRuntimeHelper)helper;
+    if (z_elf_runtime_patch_count(&ctx, runtime_helper) == 0) continue;
+    runtime_names[helper] = (uint32_t)strtab.len;
+    zbuf_append(&strtab, z_elf_runtime_helper_symbol(runtime_helper));
+    z_elf_append_u8(&strtab, 0);
+  }
+  z_elf_patch_call_patches(&text, &ctx);
+  z_elf_append_rodata_relocations(&rela_text, &ctx, 1);
+  const uint32_t function_symbol_base = has_rodata ? 2u : 1u;
+  uint32_t next_runtime_symbol = function_symbol_base + (uint32_t)ir->function_len;
+  uint32_t runtime_symbols[ELF_RUNTIME_HELPER_COUNT] = {0};
+  for (unsigned helper = 0; helper < ELF_RUNTIME_HELPER_COUNT; helper++) {
+    ElfRuntimeHelper runtime_helper = (ElfRuntimeHelper)helper;
+    if (z_elf_runtime_patch_count(&ctx, runtime_helper) == 0) continue;
+    runtime_symbols[helper] = next_runtime_symbol++;
+    z_elf_append_runtime_relocations(&rela_text, &ctx, runtime_helper, runtime_symbols[helper]);
   }
 
   for (size_t i = 0; i < ir->function_len; i++) {
-    elf_append_symbol(&symtab, symbol_names[i], ir->functions[i].is_exported ? 0x12 : 0x02, 1, function_offsets[i], function_sizes[i]);
+    z_elf_append_symbol(&symtab, symbol_names[i], ir->functions[i].is_exported ? 0x12 : 0x02, 1, function_offsets[i], function_sizes[i]);
   }
-
-  elf_append_u8(&shstrtab, 0);
-  uint32_t sh_name_text = (uint32_t)shstrtab.len;
-  zbuf_append(&shstrtab, ".text");
-  elf_append_u8(&shstrtab, 0);
-  uint32_t sh_name_rodata = 0;
-  uint32_t sh_name_rela_text = 0;
-  if (has_rodata) {
-    sh_name_rodata = (uint32_t)shstrtab.len;
-    zbuf_append(&shstrtab, ".rodata");
-    elf_append_u8(&shstrtab, 0);
+  for (unsigned helper = 0; helper < ELF_RUNTIME_HELPER_COUNT; helper++) {
+    ElfRuntimeHelper runtime_helper = (ElfRuntimeHelper)helper;
+    if (z_elf_runtime_patch_count(&ctx, runtime_helper) == 0) continue;
+    z_elf_append_symbol(&symtab, runtime_names[helper], 0x12, 0, 0, 0);
   }
-  if (rela_text.len > 0) {
-    sh_name_rela_text = (uint32_t)shstrtab.len;
-    zbuf_append(&shstrtab, ".rela.text");
-    elf_append_u8(&shstrtab, 0);
-  }
-  uint32_t sh_name_symtab = (uint32_t)shstrtab.len;
-  zbuf_append(&shstrtab, ".symtab");
-  elf_append_u8(&shstrtab, 0);
-  uint32_t sh_name_strtab = (uint32_t)shstrtab.len;
-  zbuf_append(&shstrtab, ".strtab");
-  elf_append_u8(&shstrtab, 0);
-  uint32_t sh_name_shstrtab = (uint32_t)shstrtab.len;
-  zbuf_append(&shstrtab, ".shstrtab");
-  elf_append_u8(&shstrtab, 0);
-
-  const size_t ehdr_size = 64;
-  const size_t shnum = 5 + (has_rodata ? 1 : 0) + (rela_text.len > 0 ? 1 : 0);
-  const uint16_t symtab_shndx = (uint16_t)(2 + (has_rodata ? 1 : 0) + (rela_text.len > 0 ? 1 : 0));
-  const uint16_t strtab_shndx = (uint16_t)(symtab_shndx + 1);
-  const uint16_t shstrtab_shndx = (uint16_t)(strtab_shndx + 1);
-  size_t text_offset = elf_align(ehdr_size, 16);
-  size_t rodata_offset = has_rodata ? elf_align(text_offset + text.len, 8) : 0;
-  size_t rela_text_offset = rela_text.len > 0 ? elf_align((has_rodata ? rodata_offset + rodata.len : text_offset + text.len), 8) : 0;
-  size_t symtab_offset = elf_align((rela_text.len > 0 ? rela_text_offset + rela_text.len : (has_rodata ? rodata_offset + rodata.len : text_offset + text.len)), 8);
-  size_t strtab_offset = symtab_offset + symtab.len;
-  size_t shstrtab_offset = strtab_offset + strtab.len;
-  size_t shoff = elf_align(shstrtab_offset + shstrtab.len, 8);
-
-  zbuf_init(out);
-  const unsigned char ident[] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-  elf_append_bytes(out, ident, sizeof(ident));
-  elf_append_u16(out, 1);
-  elf_append_u16(out, 62);
-  elf_append_u32(out, 1);
-  elf_append_u64(out, 0);
-  elf_append_u64(out, 0);
-  elf_append_u64(out, shoff);
-  elf_append_u32(out, 0);
-  elf_append_u16(out, 64);
-  elf_append_u16(out, 0);
-  elf_append_u16(out, 0);
-  elf_append_u16(out, 64);
-  elf_append_u16(out, (uint16_t)shnum);
-  elf_append_u16(out, shstrtab_shndx);
-
-  elf_pad_to(out, text_offset);
-  elf_append_bytes(out, (const unsigned char *)text.data, text.len);
-  if (has_rodata) {
-    elf_pad_to(out, rodata_offset);
-    elf_append_bytes(out, (const unsigned char *)rodata.data, rodata.len);
-  }
-  if (rela_text.len > 0) {
-    elf_pad_to(out, rela_text_offset);
-    elf_append_bytes(out, (const unsigned char *)rela_text.data, rela_text.len);
-  }
-  elf_pad_to(out, symtab_offset);
-  elf_append_bytes(out, (const unsigned char *)symtab.data, symtab.len);
-  elf_pad_to(out, strtab_offset);
-  elf_append_bytes(out, (const unsigned char *)strtab.data, strtab.len);
-  elf_pad_to(out, shstrtab_offset);
-  elf_append_bytes(out, (const unsigned char *)shstrtab.data, shstrtab.len);
-  elf_pad_to(out, shoff);
-
-  elf_append_section_header(out, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-  elf_append_section_header(out, sh_name_text, 1, 0x6, text_offset, text.len, 0, 0, 16, 0);
-  if (has_rodata) elf_append_section_header(out, sh_name_rodata, 1, 0x2, rodata_offset, rodata.len, 0, 0, 8, 0);
-  if (rela_text.len > 0) elf_append_section_header(out, sh_name_rela_text, 4, 0, rela_text_offset, rela_text.len, symtab_shndx, 1, 8, 24);
-  elf_append_section_header(out, sh_name_symtab, 2, 0, symtab_offset, symtab.len, strtab_shndx, has_rodata ? 2 : 1, 8, 24);
-  elf_append_section_header(out, sh_name_strtab, 3, 0, strtab_offset, strtab.len, 0, 0, 1, 0);
-  elf_append_section_header(out, sh_name_shstrtab, 3, 0, shstrtab_offset, shstrtab.len, 0, 0, 1, 0);
+  ZElfObjectImage image = {
+    .machine = Z_ELF_MACHINE_X86_64,
+    .text = &text,
+    .text_align = 16,
+    .rodata = has_rodata ? &rodata : NULL,
+    .rodata_align = 8,
+    .rela_text = rela_text.len > 0 ? &rela_text : NULL,
+    .symtab = &symtab,
+    .strtab = &strtab,
+    .local_symbol_count = has_rodata ? 2 : 1
+  };
+  z_elf_write_object64(out, &image);
 
   free(function_offsets);
   free(function_sizes);
   free(symbol_names);
-  free(ctx.call_patches);
-  free(ctx.rodata_patches);
+  z_elf_emit_context_free(&ctx);
   zbuf_free(&text);
   zbuf_free(&rodata);
   zbuf_free(&rela_text);
   zbuf_free(&strtab);
   zbuf_free(&symtab);
-  zbuf_free(&shstrtab);
   return true;
 }
 
@@ -2509,31 +1950,19 @@ static const IrFunction *elf_find_executable_main(const IrProgram *ir, ZDiag *di
 }
 
 static size_t elf_emit_start_stub(ZBuf *text) {
-  elf_append_u8(text, 0x49);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xe7);
-  size_t patch = elf_emit_jmp32_placeholder(text, 0xe8);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xc1);
-  elf_append_u8(text, 0x48);
-  elf_append_u8(text, 0xc1);
-  elf_append_u8(text, 0xe9);
-  elf_append_u8(text, 32);
-  elf_append_u8(text, 0x85);
-  elf_append_u8(text, 0xc9);
-  size_t success_patch = elf_emit_jcc32_placeholder(text, 0x84);
-  elf_append_u8(text, 0xbf);
-  elf_append_u32(text, 1);
-  size_t exit_patch = elf_emit_jmp32_placeholder(text, 0xe9);
-  elf_patch_rel32(text, success_patch, text->len);
-  elf_append_u8(text, 0x89);
-  elf_append_u8(text, 0xc7);
-  elf_patch_rel32(text, exit_patch, text->len);
-  elf_append_u8(text, 0xb8);
-  elf_append_u32(text, 60);
-  elf_append_u8(text, 0x0f);
-  elf_append_u8(text, 0x05);
+  z_x64_emit_mov_reg_from_reg(text, 15, 4, true);
+  size_t patch = z_x64_emit_call32_placeholder(text);
+  z_x64_emit_mov_rcx_from_rax(text, true);
+  z_x64_emit_shr_rcx_imm8(text, 32);
+  z_x64_emit_test_ecx_ecx(text);
+  size_t success_patch = z_x64_emit_jcc32_placeholder(text, 0x84);
+  z_x64_emit_mov_reg_u32(text, 7, 1);
+  size_t exit_patch = z_x64_emit_jmp32_placeholder(text, 0xe9);
+  z_x64_patch_rel32(text, success_patch, text->len);
+  z_x64_emit_mov_reg_from_reg(text, 7, 0, false);
+  z_x64_patch_rel32(text, exit_patch, text->len);
+  z_x64_emit_mov_eax_u32(text, 60);
+  z_x64_emit_syscall(text);
   return patch;
 }
 
@@ -2552,7 +1981,6 @@ bool z_emit_elf64_exe_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   const size_t phdr_size = 56;
   const size_t text_offset = ehdr_size + phdr_size;
   const uint64_t entry_addr = base_addr + text_offset;
-  (void)entry_addr;
 
   ZBuf text;
   ZBuf rodata;
@@ -2562,8 +1990,8 @@ bool z_emit_elf64_exe_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
   unsigned rodata_base_offset = elf_rodata_base_offset(ir);
   if (has_rodata) elf_append_rodata(&rodata, ir, rodata_base_offset);
   size_t start_stub_len = 3 + 5 + 2 + 5 + 2;
-  size_t first_function_offset = elf_align(start_stub_len, 16);
-  size_t *function_offsets = calloc(ir->function_len, sizeof(size_t));
+  size_t first_function_offset = z_elf_align(start_stub_len, 16);
+  size_t *function_offsets = z_checked_calloc(ir->function_len, sizeof(size_t));
   if (!function_offsets) {
     zbuf_free(&text);
     zbuf_free(&rodata);
@@ -2576,62 +2004,44 @@ bool z_emit_elf64_exe_from_ir(const IrProgram *ir, ZBuf *out, ZDiag *diag) {
     .rodata_base_offset = rodata_base_offset
   };
   size_t start_call_patch = elf_emit_start_stub(&text);
-  elf_pad_to(&text, first_function_offset);
+  z_elf_pad_to(&text, first_function_offset);
   for (size_t i = 0; i < ir->function_len; i++) {
-    elf_pad_to(&text, elf_align(text.len, 16));
+    z_elf_pad_to(&text, z_elf_align(text.len, 16));
     function_offsets[i] = text.len;
     if (!elf_emit_function_text(&text, &ir->functions[i], &ctx, diag)) {
       free(function_offsets);
-      free(ctx.call_patches);
-      free(ctx.rodata_patches);
+      z_elf_emit_context_free(&ctx);
       zbuf_free(&text);
       zbuf_free(&rodata);
       return false;
     }
   }
-  elf_patch_rel32(&text, start_call_patch, function_offsets[main_index]);
-  elf_patch_call_patches(&text, &ctx);
-
-  size_t rodata_offset = has_rodata ? elf_align(text_offset + text.len, 8) : 0;
-  ctx.rodata_addr = has_rodata ? base_addr + rodata_offset : 0;
-  elf_patch_rodata_patches(&text, &ctx);
-  uint64_t file_size = has_rodata ? rodata_offset + rodata.len : text_offset + text.len;
-
-  zbuf_init(out);
-  const unsigned char ident[] = {0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-  elf_append_bytes(out, ident, sizeof(ident));
-  elf_append_u16(out, 2);
-  elf_append_u16(out, 62);
-  elf_append_u32(out, 1);
-  elf_append_u64(out, entry_addr);
-  elf_append_u64(out, ehdr_size);
-  elf_append_u64(out, 0);
-  elf_append_u32(out, 0);
-  elf_append_u16(out, 64);
-  elf_append_u16(out, 56);
-  elf_append_u16(out, 1);
-  elf_append_u16(out, 0);
-  elf_append_u16(out, 0);
-  elf_append_u16(out, 0);
-
-  elf_append_u32(out, 1);
-  elf_append_u32(out, 5);
-  elf_append_u64(out, 0);
-  elf_append_u64(out, base_addr);
-  elf_append_u64(out, base_addr);
-  elf_append_u64(out, file_size);
-  elf_append_u64(out, file_size);
-  elf_append_u64(out, 0x1000);
-
-  elf_pad_to(out, text_offset);
-  elf_append_bytes(out, (const unsigned char *)text.data, text.len);
-  if (has_rodata) {
-    elf_pad_to(out, rodata_offset);
-    elf_append_bytes(out, (const unsigned char *)rodata.data, rodata.len);
+  if (z_elf_has_runtime_patches(&ctx)) {
+    free(function_offsets);
+    z_elf_emit_context_free(&ctx);
+    zbuf_free(&text);
+    zbuf_free(&rodata);
+    return elf_diag(diag, "direct ELF64 executable runtime helpers require object emission and an explicit runtime link step", 1, 1, "use --emit obj and link zero_runtime.c");
   }
+  z_x64_patch_rel32(&text, start_call_patch, function_offsets[main_index]);
+  z_elf_patch_call_patches(&text, &ctx);
+
+  size_t rodata_offset = has_rodata ? z_elf_align(text_offset + text.len, 8) : 0;
+  ctx.rodata_addr = has_rodata ? base_addr + rodata_offset : 0;
+  z_elf_patch_rodata_patches(&text, &ctx);
+  ZElfExecutableImage image = {
+    .machine = Z_ELF_MACHINE_X86_64,
+    .base_addr = base_addr,
+    .entry_addr = entry_addr,
+    .text_offset = text_offset,
+    .text = &text,
+    .rodata = has_rodata ? &rodata : NULL,
+    .rodata_offset = rodata_offset,
+    .segment_align = 0x1000
+  };
+  z_elf_write_executable64(out, &image);
   free(function_offsets);
-  free(ctx.call_patches);
-  free(ctx.rodata_patches);
+  z_elf_emit_context_free(&ctx);
   zbuf_free(&text);
   zbuf_free(&rodata);
   return true;

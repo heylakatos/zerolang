@@ -1,0 +1,6 @@
+fn loop<T: Type> Void value T
+  loop<T> value
+
+pub fn main Void world World !
+  loop<i32> 1
+  check world.out.write "direct generic recursion ok\n"

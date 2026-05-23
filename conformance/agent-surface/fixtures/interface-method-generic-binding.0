@@ -1,0 +1,14 @@
+interface Id
+  fn id<X: Type> X x X
+
+type Identity
+  fn id<X: Type> X x X
+    ret x
+
+fn useId<F: Id, X: Type> X value X
+  ret F.id value
+
+pub fn main Void world World !
+  let value i32 useId<Identity, i32> 1
+  if == value 1
+    check world.out.write "interface method generic ok\n"

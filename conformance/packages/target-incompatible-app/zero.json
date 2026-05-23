@@ -5,7 +5,7 @@
     "target-webbits": {
       "path": "../target-webbits",
       "version": "0.1.0",
-      "targets": ["wasm32-web"]
+      "targets": ["win32-x64.exe"]
     }
   }
 }

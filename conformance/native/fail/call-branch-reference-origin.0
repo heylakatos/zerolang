@@ -1,0 +1,11 @@
+fn choose ref<i32> flag Bool left ref<i32> right ref<i32>
+  mut current left
+  if flag
+    set current right
+  ret current
+
+pub fn main Void flag Bool
+  mut x 1
+  let y 2
+  let current choose flag (&x) (&y)
+  set x 3

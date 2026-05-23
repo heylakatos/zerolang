@@ -1,0 +1,11 @@
+type Holder
+  value ref<i32>
+
+  fn storeLocal Void self mutref<Self>
+    let local 1
+    set self.value &local
+
+pub fn main Void
+  let fallback 0
+  mut holder Holder . value (&fallback)
+  holder.storeLocal()

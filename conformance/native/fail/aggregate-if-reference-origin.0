@@ -1,0 +1,10 @@
+type Box
+  value ref<i32>
+
+pub fn main Void flag Bool
+  mut x 1
+  let y 2
+  mut box Box Box . value (&x)
+  if flag
+    set box Box . value (&y)
+  set x 3

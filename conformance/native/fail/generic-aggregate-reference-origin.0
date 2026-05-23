@@ -1,0 +1,13 @@
+type Box
+  value ref<i32>
+
+fn id<T: Type> T value T
+  ret value
+
+pub fn main Void
+  mut x 1
+  let y 2
+  mut box Box Box . value (&x)
+  let copy Box id box
+  set box Box . value (&y)
+  set x 3

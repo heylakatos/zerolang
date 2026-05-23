@@ -1,0 +1,8 @@
+type Holder
+  value mutref<i32>
+
+pub fn main Void
+  mut x 1
+  mut holder Holder . value (&mut x)
+  let selected &mut holder
+  set selected.value &mut x

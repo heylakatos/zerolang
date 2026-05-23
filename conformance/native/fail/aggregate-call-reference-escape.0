@@ -1,0 +1,11 @@
+type Box
+  value ref<i32>
+
+fn make Box value ref<i32>
+  ret Box . value value
+
+pub fn leak Box
+  let x 1
+  ret make (&x)
+
+pub fn main Void

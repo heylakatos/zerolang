@@ -1,0 +1,10 @@
+type Tracked
+  value i32
+
+  fn drop Void self mutref<Self>
+    set self.value 0
+
+pub fn main Void world World !
+  let tracked owned<Tracked> Tracked . value 42
+  if == tracked.value 42
+    check world.out.write "owned drop backend unsupported current ok\n"
