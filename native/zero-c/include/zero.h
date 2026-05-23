@@ -49,23 +49,59 @@ typedef struct {
 } TokenVec;
 
 typedef enum {
+  // 标识符表达式：引用一个变量、参数、函数或类型名
+  // 例：world, x, main, Point
   EXPR_IDENT,
+  // 字符串字面量：双引号包裹的字节序列（lexer 已剥引号并解码 \n 转义）
+  // 例："hello", "hello\n"
   EXPR_STRING,
+  // 字符字面量：单引号包裹的单字节，AST 里以十进制 ASCII 字符串存储
+  // 例：'a', '\n', '\x41'
   EXPR_CHAR,
+  // 数字字面量：整数或浮点，允许下划线作位分隔符
+  // 例：42, 3.14, 1_000
   EXPR_NUMBER,
+  // 布尔字面量
+  // 例：true, false
   EXPR_BOOL,
+  // 空值字面量
+  // 例：null
   EXPR_NULL,
+  // 成员访问：通过 `.` 取字段或方法（可链式）
+  // 例：world.out, point.x, world.out.write
   EXPR_MEMBER,
+  // 下标访问：用 `[i]` 取容器元素
+  // 例：arr[0], bytes[i]
   EXPR_INDEX,
+  // 切片表达式：用 `[a..b]` 取连续区间，端点可省略
+  // 例：arr[1..5], bytes[..n], bytes[i..]
   EXPR_SLICE,
+  // 函数 / 方法调用，参数挂在 .args 上
+  // 例：add(1, 2), world.out.write("hi")
   EXPR_CALL,
+  // 二元运算：两个操作数 + 一个运算符（运算符字符串存在 .text）
+  // 例：1 + 2, a == b, x && y
   EXPR_BINARY,
+  // 类型转换：`as` 运算符把值转成另一类型
+  // 例：x as i64, byte as u32
   EXPR_CAST,
+  // 借用：`&` 取共享引用，`&mut` 取可变引用
+  // 例：&data, &mut data
   EXPR_BORROW,
+  // check 表达式：调用 fallible 函数并把错误向上传播
+  // 例：check world.out.write("hi")
   EXPR_CHECK,
+  // rescue 表达式：在表达式层捕获错误并提供后备值
+  // 例：open(path) rescue err { default_value }
   EXPR_RESCUE,
+  // 编译期 meta 表达式：用 meta 前缀让子表达式在编译期求值
+  // 例：meta target.os, meta fieldCount(Point)
   EXPR_META,
+  // shape 字面量：用 `Name { field: value, ... }` 形式构造一个 shape 实例
+  // 例：Point { x: 40, y: 2 }
   EXPR_SHAPE_LITERAL,
+  // 数组字面量：用 `[a, b, c]` 构造一个数组
+  // 例：[1, 2, 3], ["a", "b"]
   EXPR_ARRAY_LITERAL
 } ExprKind;
 
@@ -103,35 +139,106 @@ typedef struct {
   size_t cap;
 } TypeArgVec;
 
+/*
+ * Expr 是表达式 AST 节点，采用 tagged union 模式:
+ * 所有 ExprKind 共享同一个 struct，但每种 kind 只用其中一部分字段，其余字段保持零值。
+ * 读字段前必须看 .kind 来判断该字段当前是否有效。
+ * 默认所有字段由 parser 阶段填；标 [checker] 的字段由语义检查阶段后续填入。
+ */
 struct Expr {
+  // 表达式 kind, 决定下面哪些字段有意义
   ExprKind kind;
+  // 字符串 payload，含义随 .kind 变（仅下列 9 种 kind 会写，其他 kind 保持 NULL）：
+  // - EXPR_IDENT: 标识符名 ("world", "x")
+  // - EXPR_NUMBER: 字面量原文 ("42", "3.14")
+  // - EXPR_STRING: lexer 解码后的字节 (去引号, \n 已变 LF)
+  // - EXPR_CHAR: 十进制 ASCII 字符串 ("97" 表示 'a')
+  // - EXPR_MEMBER: 字段/方法名 (a.b 里的 "b")
+  // - EXPR_BINARY: 运算符字符串 ("+", "==", "&&")
+  // - EXPR_CAST: 目标类型名 (x as i64 里的 "i64")
+  // - EXPR_RESCUE: 捕获到的错误变量名
+  // - EXPR_SHAPE_LITERAL: shape 类型名 (Point { x: 40 } 里的 "Point")
   char *text;
+  // checker算出的类型字符串, parser 阶段为 NULL [checker]
+  // 例："i32", "Span<u8>", "Point"
   char *resolved_type;
+  // 此表达式参与所有权 move (如把 owned 值传给会消费它的函数) [checker]
+  // 例：consume(owned_value) 这个调用节点会被标 true
   bool moves_ownership;
+  // 仅 EXPR_BORROW 用: true 表示 &mut，false 表示 &
+  // 例：&mut data → true；&data → false
   bool mutable_borrow;
+  // 仅 EXPR_BOOL 用: 保存 true / false 字面量的实际值
   bool bool_value;
+  // 左子表达式，含义随 .kind 变：
+  // - EXPR_BINARY: 左操作数
+  // - EXPR_MEMBER: 被访问的对象（a.b 里的 a）
+  // - EXPR_INDEX/EXPR_SLICE: 被索引的容器
+  // - EXPR_CALL: 被调用者（fn 节点 / member 节点）
+  // - EXPR_CAST: 被转换的值
+  // - EXPR_BORROW/EXPR_CHECK/EXPR_META: 被作用的子表达式
+  // - EXPR_RESCUE: 主表达式 (可能失败的那个)
   Expr *left;
+  // 右子表达式，含义随 .kind 变：
+  // - EXPR_BINARY: 右操作数
+  // - EXPR_RESCUE: rescue 块里的 fallback 表达式
   Expr *right;
+  // 子表达式列表：
+  // - EXPR_CALL: 调用参数 (按出现顺序)
+  // - EXPR_SLICE: [start,end] 两项, 端点缺省时存 NULL ([..n] / [i..])
+  // - EXPR_INDEX: 索引子表达式
   ExprVec args;
+  // 调用点的显式泛型类型参数
+  // 例: add<i32>(1, 2) 里的 <i32>
   TypeArgVec type_args;
+  // 仅 EXPR_SHAPE_LITERAL 用: shape 字面量的字段初始化列表
+  // 例: Point { x: 40, y: 2 } 里的 [x=40, y=2]
   FieldInitVec fields;
+  // 表达式在源码里的起始行号 (1-based), 用于诊断定位
   int line;
+  // 表达式在源码里的起始列号 (1-based), 用于诊断定位
   int column;
 };
 
 typedef enum {
+  // 局部绑定声明，可带类型注解、初值，可选 mut 表示可变
+  // 例：let x: i32 = 42, let mut y = 0
   STMT_LET,
+  // 给已有可变绑定 / 字段赋值
+  // 例：x = 5, point.y = point.y + 1
   STMT_ASSIGN,
+  // 注册延迟执行：当前作用域退出前按 LIFO 顺序运行
+  // 例：defer file.close()
   STMT_DEFER,
+  // check 表达式作为独立语句使用，最常见的副作用调用场景
+  // 例：check world.out.write("hi")
   STMT_CHECK,
+  // 从函数返回，可带或不带返回值
+  // 例：return, return x + 1
   STMT_RETURN,
+  // 一个表达式作为语句（执行其副作用，丢弃结果）
+  // 例：do_work(), world.out.flush()
   STMT_EXPR,
+  // 条件分支，含 then / else 两个 body
+  // 例：if x == 0 { ... } else { ... }
   STMT_IF,
+  // 条件循环：条件为真时反复执行 body
+  // 例：while i < 10 { i = i + 1 }
   STMT_WHILE,
+  // 迭代循环：遍历区间或集合
+  // 例：for i in 0..10 { ... }
   STMT_FOR,
+  // 跳出当前最内层循环
+  // 例：break
   STMT_BREAK,
+  // 跳到当前循环的下一次迭代
+  // 例：continue
   STMT_CONTINUE,
+  // 模式匹配 / 多路分支，每个 arm 配一条 body
+  // 例：match mode { .fast { ... } .slow { ... } }
   STMT_MATCH,
+  // 主动抛出一个错误，沿 raises 路径向上传播
+  // 例：raise InvalidInput
   STMT_RAISE
 } StmtKind;
 
@@ -192,19 +299,45 @@ struct Stmt {
 };
 
 typedef struct {
+  // 函数名标识符（test 块用占位符如 "<test>"，真正的描述在 test_name）
+  // 例："main", "add", "answer"
   char *name;
+  // 仅 is_test == true 时有意义：test 块的描述字符串
+  // 例：test "addition works" { ... } 里的 "addition works"
   char *test_name;
+  // 返回类型的字符串表示；普通过程函数为 "Void"
+  // 例："Void", "i32", "Span<u8>"
   char *return_type;
+  // 泛型类型参数列表，每项是个 Param（name + 可选约束）
+  // 例：fun add<T>(a: T) -> T 里的 [T]
   ParamVec type_params;
+  // 普通参数列表，按出现顺序保存 name + type
+  // 例：fun add(a: i32, b: i32) -> i32 里的 [a:i32, b:i32]
   ParamVec params;
+  // 是否带 pub 修饰，决定是否对外可见
+  // 例：pub fun main(...) -> true; fun helper(...) -> false
   bool is_public;
+  // 函数是否可失败（签名上有 raises 关键字）
+  // 例：fun parse() -> i32 raises -> true
   bool raises;
+  // raises 是否带显式错误集合 `{ E1, E2, ... }`；false 表示未具名
+  // 例：raises { InvalidInput, Overflow } -> true；裸 raises -> false
   bool has_error_set;
+  // 当 has_error_set 为 true 时，列出的错误标签
+  // 例：raises { InvalidInput, Overflow } 里的 [InvalidInput, Overflow]
   ParamVec errors;
+  // 是否是 test 块（test "..." { ... }），而不是普通 fun
+  // 例：test "math works" { ... } -> true
   bool is_test;
+  // 是否带 `export c` 前缀，要求按 C ABI 暴露给外部
+  // 例：export c fun main(a: i32, b: i32) -> i32 -> true
   bool export_c;
+  // 函数体的语句列表（按源码顺序排列）
+  // 例：fun f() -> Void { stmt1 stmt2 } 里的 [stmt1, stmt2]
   StmtVec body;
+  // 函数声明在源码里的起始行号（1-based），用于诊断定位
   int line;
+  // 函数声明在源码里的起始列号（1-based），用于诊断定位
   int column;
 } Function;
 
@@ -315,14 +448,32 @@ typedef struct {
   size_t cap;
 } CImportVec;
 
+/* Program 是顶层 AST 节点：一个 .0 源文件（或一个包）parse 出来后，
+ * 各种顶层声明被分门别类放进下面 8 个 vec 中。每个 vec 按出现顺序保存。 */
 typedef struct {
+  // C 头文件外部导入（让 Zero 调 C 函数）
+  // 例：extern c "math.h" as cmath
   CImportVec c_imports;
+  // 顶层 const 常量声明（可带 pub）
+  // 例：const MAX: i32 = 100; pub const VERSION: String = "0.1"
   ConstVec consts;
+  // 类型别名声明（type X = Y）
+  // 例：type BytePair = Pair<u8, u8>
   TypeAliasVec aliases;
+  // 接口声明：一组方法签名的契约类型
+  // 例：interface Readable<T> { fun read(self: ref<Self>) -> T raises }
   InterfaceVec interfaces;
+  // shape 声明：struct 类型，定义字段布局
+  // 例：shape Point { x: i32, y: i32 }
   ShapeVec shapes;
+  // enum 声明：无 payload 的 tag 列表
+  // 例：enum Color { Red, Green, Blue }
   EnumVec enums;
+  // choice 声明：带可选 payload 的 sum type（类似 Rust enum / Swift enum）
+  // 例：choice Result { Ok(i32), Err(InvalidInput) }
   ChoiceVec choices;
+  // 顶层函数：普通 fun、pub fun、export c fun、test 块都进这里
+  // 例：pub fun main(world: World) -> Void raises { ... }
   FunctionVec functions;
 } Program;
 
